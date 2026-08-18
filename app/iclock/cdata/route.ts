@@ -2,32 +2,69 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { isWithinAttendanceSmsWindow } from '@/lib/attendance-window';
 
+// Helper to authenticate ZKTeco terminal
+async function authenticateDevice(req: NextRequest, sn: string | null) {
+  if (!sn || !sn.trim()) {
+    return { authenticated: false, reason: 'Missing device serial number (SN)' };
+  }
+
+  const cleanSn = sn.trim().toUpperCase();
+  const supabase = createAdminClient();
+
+  const { data: device, error } = await supabase
+    .from('devices')
+    .select('id, school_id, is_active, label')
+    .ilike('serial_number', cleanSn)
+    .maybeSingle();
+
+  if (error || !device) {
+    return { authenticated: false, reason: `Unregistered device serial number: ${cleanSn}` };
+  }
+
+  if (!device.is_active) {
+    return { authenticated: false, reason: `Device ${cleanSn} is deactivated in portal` };
+  }
+
+  // Check optional device token / secret if configured in environment
+  const expectedSecret = process.env.ZKTECO_DEVICE_SECRET;
+  if (expectedSecret) {
+    const { searchParams } = new URL(req.url);
+    const providedToken = 
+      req.headers.get('x-device-token') || 
+      req.headers.get('authorization')?.replace(/^Bearer\s+/i, '') || 
+      searchParams.get('token') || 
+      searchParams.get('push_token') || 
+      searchParams.get('PushToken');
+
+    if (!providedToken || providedToken !== expectedSecret) {
+      return { authenticated: false, reason: 'Invalid or missing device authentication token' };
+    }
+  }
+
+  return { authenticated: true, device, supabase };
+}
+
 // 1. Initial Handshake / Config Pull from Device
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const sn = searchParams.get('SN');
   
   console.log(`[ZKTeco ADMS] Init GET request from SN: ${sn}`);
-  console.log(`[ZKTeco ADMS] Query Params:`, Object.fromEntries(searchParams.entries()));
 
-  if (sn) {
-    const supabase = createAdminClient();
-    // Verify device exists in our registry and update heartbeat
-    const { data: device } = await supabase
-      .from('devices')
-      .select('id')
-      .eq('serial_number', sn)
-      .maybeSingle();
-      
-    if (device) {
-      await supabase
-        .from('devices')
-        .update({ last_seen_at: new Date().toISOString() })
-        .eq('id', device.id);
-    } else {
-      console.warn(`[ZKTeco ADMS] Unrecognized device SN: ${sn}. Please add it to the portal.`);
-    }
+  const authResult = await authenticateDevice(req, sn);
+  if (!authResult.authenticated || !authResult.device) {
+    console.warn(`[ZKTeco ADMS] Rejected GET from unrecognized device: ${sn}. Reason: ${authResult.reason}`);
+    return new NextResponse(`ERROR: ${authResult.reason}`, {
+      status: 401,
+      headers: { 'Content-Type': 'text/plain' }
+    });
   }
+
+  // Update device heartbeat
+  await authResult.supabase
+    .from('devices')
+    .update({ last_seen_at: new Date().toISOString() })
+    .eq('id', authResult.device.id);
 
   // The device expects a specific text configuration response to know the server is ready.
   // Standard ADMS parameters for F18 and similar legacy devices.
@@ -45,41 +82,29 @@ export async function POST(req: NextRequest) {
   const sn = searchParams.get('SN') || searchParams.get('sn') || req.headers.get('x-device-sn') || '';
   const table = (searchParams.get('table') || searchParams.get('TABLE') || '').toUpperCase();
 
+  const authResult = await authenticateDevice(req, sn);
+  if (!authResult.authenticated || !authResult.device) {
+    console.warn(`[ZKTeco ADMS] Rejected POST from device: ${sn}. Reason: ${authResult.reason}`);
+    return new NextResponse(`ERROR: ${authResult.reason}`, {
+      status: 401,
+      headers: { 'Content-Type': 'text/plain' }
+    });
+  }
+
+  const { device, supabase } = authResult;
   const rawBody = await req.text();
   console.log(`[ZKTeco ADMS] POST request from SN: ${sn}, Table: ${table}`);
-  console.log(`[ZKTeco ADMS] Payload:\n${rawBody}`);
 
-  const supabase = createAdminClient();
-
-  let device: { id: string; school_id: string } | null = null;
-
-  if (sn) {
-    const { data } = await supabase
-      .from('devices')
-      .select('id, school_id')
-      .ilike('serial_number', sn.trim())
-      .maybeSingle();
-     
-    device = data as any;
-
-    if (device) {
-      await supabase
-        .from('devices')
-        .update({ last_seen_at: new Date().toISOString() })
-        .eq('id', device.id);
-    }
-  }
+  // Update heartbeat on data push
+  await supabase
+    .from('devices')
+    .update({ last_seen_at: new Date().toISOString() })
+    .eq('id', device.id);
 
   // If this is an attendance log push (table=ATTLOG or attlog or body contains attendance records)
   const isAttLog = table === 'ATTLOG' || table === 'OPERLOG' || rawBody.includes('\t20') || /^\S+\s+\d{4}-\d{2}-\d{2}/m.test(rawBody);
 
-  if (isAttLog && sn) {
-    if (!device) {
-      console.warn(`[ZKTeco ADMS] Received ATTLOG for unknown device SN: ${sn}`);
-      // Acknowledge anyway so the device doesn't hang/infinitely retry
-      return new NextResponse('OK', { status: 200, headers: { 'Content-Type': 'text/plain' } });
-    }
-
+  if (isAttLog) {
     // Split lines from raw payload
     const lines = rawBody.split(/[\r\n]+/).map(line => line.trim()).filter(line => line.length > 0);
     
@@ -127,7 +152,32 @@ export async function POST(req: NextRequest) {
       const numericPin = cleanPin.replace(/^0+/, ''); // e.g. '00101' -> '101'
       const paddedPin4 = cleanPin.padStart(4, '0');
 
-      // Find user (teacher, student, staff, admin) by device_user_id mapped to this specific school
+      // Timestamp sanity validation (reject clock drifts > 24 hours in future or > 60 days in past)
+      let logDate: Date;
+      let isoString: string;
+      try {
+        if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(:\d{2})?$/.test(datetimeStr.trim())) {
+          isoString = new Date(datetimeStr.trim().replace(' ', 'T') + '+03:00').toISOString();
+          logDate = new Date(isoString);
+        } else {
+          logDate = new Date(datetimeStr);
+          isoString = logDate.toISOString();
+        }
+      } catch (e) {
+        console.warn(`[ZKTeco ADMS] Invalid timestamp format "${datetimeStr}", using server time.`);
+        logDate = new Date();
+        isoString = logDate.toISOString();
+      }
+
+      const nowTime = Date.now();
+      const timeDiff = Math.abs(logDate.getTime() - nowTime);
+      const sixtyDaysMs = 60 * 24 * 60 * 60 * 1000;
+      if (timeDiff > sixtyDaysMs) {
+        console.warn(`[ZKTeco ADMS] Discarding attendance entry with stale/invalid timestamp: ${datetimeStr} (PIN: ${cleanPin})`);
+        continue;
+      }
+
+      // Find user (teacher, student, staff, admin) strictly mapped to device.school_id
       let person: any = null;
 
       // 1. Exact match
@@ -151,7 +201,7 @@ export async function POST(req: NextRequest) {
         if (pNum) person = pNum;
       }
 
-      // 3. Fallback: Search all enrolled people in school
+      // 3. Fallback: Search all enrolled people strictly in this device's school
       if (!person) {
         const { data: pAll } = await supabase
           .from('people')
@@ -178,22 +228,6 @@ export async function POST(req: NextRequest) {
       }
           
       if (person) {
-        let isoString: string;
-        let logDate: Date;
-        try {
-          // If datetimeStr is 'YYYY-MM-DD HH:MM:SS', treat as Africa/Kampala time (+03:00)
-          if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(:\d{2})?$/.test(datetimeStr.trim())) {
-            isoString = new Date(datetimeStr.trim().replace(' ', 'T') + '+03:00').toISOString();
-            logDate = new Date(isoString);
-          } else {
-            logDate = new Date(datetimeStr);
-            isoString = logDate.toISOString();
-          }
-        } catch (e) {
-          logDate = new Date();
-          isoString = logDate.toISOString();
-        }
-
         // Check for duplicates (same person, same ISO timestamp)
         const { data: existingLog } = await supabase
           .from('attendance_logs')
@@ -246,7 +280,7 @@ export async function POST(req: NextRequest) {
             console.warn('[ZKTeco ADMS] Device log audit insert note:', dlErr);
           }
 
-          // Insert into school.attendance_logs (Supports teachers, students, admins)
+          // Insert into school.attendance_logs
           const { error: insErr } = await supabase
             .from('attendance_logs')
             .insert({

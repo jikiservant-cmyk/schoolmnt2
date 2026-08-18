@@ -21,41 +21,13 @@ async function resolveSchoolId(supabase: any, userId: string): Promise<string | 
       .eq('auth_user_id', userId)
       .maybeSingle();
 
-    if (staffData?.people?.school_id) {
-      return staffData.people.school_id;
+    const peopleObj = Array.isArray(staffData?.people) ? staffData.people[0] : staffData?.people;
+    const resolvedSchoolId = (peopleObj as any)?.school_id;
+    if (resolvedSchoolId) {
+      return resolvedSchoolId;
     }
   } catch (err) {
     console.warn('Error resolving via staff_users:', err);
-  }
-
-  // 3. Fallback to existing school record in the school schema
-  try {
-    const adminClient = createAdminClient();
-    const { data: school } = await adminClient
-      .from('schools')
-      .select('id')
-      .limit(1)
-      .maybeSingle();
-
-    if (school?.id) {
-      return school.id;
-    }
-
-    // 4. If no school exists at all, bootstrap default school
-    const { data: newSchool } = await adminClient
-      .from('schools')
-      .insert({
-        name: 'Meridian Academy',
-        attendance_mode: 'both',
-        timezone: 'Africa/Kampala',
-        settings: { late_after: '07:45', send_sms_on_present: true }
-      })
-      .select('id')
-      .single();
-
-    return newSchool?.id || null;
-  } catch (err) {
-    console.error('Error resolving fallback school:', err);
   }
 
   return null;

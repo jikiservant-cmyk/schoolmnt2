@@ -4,7 +4,18 @@ import { createClient } from '@/utils/supabase/server';
 import { createPublicAdminClient } from '@/utils/supabase/admin';
 import { revalidatePath } from 'next/cache';
 
-async function getEffectiveSchoolId(supabase: any, userId?: string) {
+async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
+  // 1. Try auth_school_id RPC
+  try {
+    const { data: rpcSchoolId } = await supabase.rpc('auth_school_id');
+    if (rpcSchoolId) {
+      return rpcSchoolId;
+    }
+  } catch (err) {
+    console.warn('RPC auth_school_id not available or failed:', err);
+  }
+
+  // 2. Try staff_users linked via person_id -> people(school_id)
   if (userId) {
     try {
       const { data: staffData } = await supabase
@@ -13,49 +24,14 @@ async function getEffectiveSchoolId(supabase: any, userId?: string) {
         .eq('auth_user_id', userId)
         .maybeSingle();
 
-      if (staffData?.people?.school_id) {
-        return staffData.people.school_id;
+      const peopleObj = Array.isArray(staffData?.people) ? staffData.people[0] : staffData?.people;
+      const resolvedSchoolId = (peopleObj as any)?.school_id;
+      if (resolvedSchoolId) {
+        return resolvedSchoolId;
       }
     } catch (err) {
-      console.error('Error resolving staff_users:', err);
+      console.error('Error resolving staff_users school context:', err);
     }
-  }
-
-  try {
-    const { data: recentLog } = await supabase
-      .from('attendance_logs')
-      .select('school_id')
-      .not('school_id', 'is', null)
-      .order('occurred_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (recentLog?.school_id) {
-      return recentLog.school_id;
-    }
-
-    const { data: personSchool } = await supabase
-      .from('people')
-      .select('school_id')
-      .not('school_id', 'is', null)
-      .limit(1)
-      .maybeSingle();
-
-    if (personSchool?.school_id) {
-      return personSchool.school_id;
-    }
-
-    const { data: school } = await supabase
-      .from('schools')
-      .select('id')
-      .limit(1)
-      .maybeSingle();
-
-    if (school?.id) {
-      return school.id;
-    }
-  } catch (err) {
-    console.error('Error resolving default school:', err);
   }
 
   return null;
@@ -64,136 +40,97 @@ async function getEffectiveSchoolId(supabase: any, userId?: string) {
 export async function getAttendanceData() {
   const supabase = await createClient();
   
-  const { data: userData } = await supabase.auth.getUser();
-  const schoolId = await getEffectiveSchoolId(supabase, userData?.user?.id);
+  const { data: userData, error: userErr } = await supabase.auth.getUser();
+  if (userErr || !userData?.user) {
+    return {
+      logs: [],
+      school: null,
+      classes: [],
+      people: [],
+      error: 'Not authenticated. Please log in.'
+    };
+  }
 
-  // 1. Get attendance logs (all recent logs with full people and class details)
+  const schoolId = await getEffectiveSchoolId(supabase, userData.user.id);
+  if (!schoolId) {
+    return {
+      logs: [],
+      school: null,
+      classes: [],
+      people: [],
+      error: 'Your account is not linked to an active school tenant.'
+    };
+  }
+
+  // 1. Get attendance logs strictly scoped to this school
   let logs: any[] = [];
-  if (schoolId) {
-    const { data, error } = await supabase
-      .from('attendance_logs')
-      .select(`
-        *,
-        people (
-          id,
-          full_name,
-          role,
-          class_id,
-          phone,
-          device_user_id,
-          school_id,
-          classes:class_id (
-            name
-          )
+  const { data: logsData, error: logsError } = await supabase
+    .from('attendance_logs')
+    .select(`
+      *,
+      people (
+        id,
+        full_name,
+        role,
+        class_id,
+        phone,
+        device_user_id,
+        school_id,
+        classes:class_id (
+          name
         )
-      `)
-      .eq('school_id', schoolId)
-      .order('occurred_at', { ascending: false })
-      .limit(500);
+      )
+    `)
+    .eq('school_id', schoolId)
+    .order('occurred_at', { ascending: false })
+    .limit(500);
 
-    if (!error && data && data.length > 0) {
-      logs = data;
-    }
-  }
-  
-  if (logs.length === 0) {
-    // Fallback: fetch all recent attendance logs regardless of school_id filter
-    const { data, error } = await supabase
-      .from('attendance_logs')
-      .select(`
-        *,
-        people:people (
-          id,
-          full_name,
-          role,
-          class_id,
-          phone,
-          device_user_id,
-          school_id,
-          classes:class_id (
-            name
-          )
-        )
-      `)
-      .order('occurred_at', { ascending: false })
-      .limit(500);
-
-    if (!error && data) {
-      logs = data;
-    }
+  if (!logsError && logsData) {
+    logs = logsData;
   }
 
-  // 2. Fetch classes
+  // 2. Fetch classes strictly scoped to this school
   let classes: any[] = [];
-  if (schoolId) {
-    const { data } = await supabase.from('classes').select('id, name').eq('school_id', schoolId).order('name');
-    if (data && data.length > 0) classes = data;
-  }
-  if (classes.length === 0) {
-    const { data } = await supabase.from('classes').select('id, name').order('name');
-    if (data) classes = data;
-  }
+  const { data: classData } = await supabase
+    .from('classes')
+    .select('id, name')
+    .eq('school_id', schoolId)
+    .order('name');
+  if (classData) classes = classData;
 
-  // 3. Fetch all registered people (students, teachers, support_staff, admins)
+  // 3. Fetch all registered people strictly scoped to this school
   let people: any[] = [];
-  if (schoolId) {
-    const { data } = await supabase.from('people').select(`
-        id,
-        full_name,
-        role,
-        class_id,
-        phone,
-        device_user_id,
-        is_active,
-        classes:class_id (
-          name
-        )
-      `).eq('school_id', schoolId).order('full_name');
-    if (data && data.length > 0) people = data;
-  }
-  if (people.length === 0) {
-    const { data } = await supabase.from('people').select(`
-        id,
-        full_name,
-        role,
-        class_id,
-        phone,
-        device_user_id,
-        is_active,
-        classes:class_id (
-          name
-        )
-      `).order('full_name');
-    if (data) people = data;
-  }
+  const { data: peopleData } = await supabase
+    .from('people')
+    .select(`
+      id,
+      full_name,
+      role,
+      class_id,
+      phone,
+      device_user_id,
+      is_active,
+      classes:class_id (
+        name
+      )
+    `)
+    .eq('school_id', schoolId)
+    .order('full_name');
+  if (peopleData) people = peopleData;
 
-  // 4. Fetch school details
+  // 4. Fetch school details strictly for this school
   let school: any = null;
-  if (schoolId) {
-    const { data } = await supabase
-      .from('schools')
-      .select('id, name, settings')
-      .eq('id', schoolId)
-      .maybeSingle();
+  const { data: schoolRecord } = await supabase
+    .from('schools')
+    .select('id, name, settings')
+    .eq('id', schoolId)
+    .maybeSingle();
 
-    if (data) {
-      school = data;
-    }
+  if (schoolRecord) {
+    school = schoolRecord;
   }
 
-  if (!school) {
-    const { data } = await supabase
-      .from('schools')
-      .select('id, name, settings')
-      .limit(1)
-      .maybeSingle();
-
-    if (data) {
-      school = data;
-    }
-  }
-
-  // Ensure balance is loaded from public.wallets table for accuracy
+  // Ensure balance is loaded from public.wallets table strictly for this tenant
   if (school?.id) {
     try {
       const publicAdmin = createPublicAdminClient();
@@ -233,6 +170,21 @@ export async function markTeacherAttendanceAction(
   }
 
   const schoolId = await getEffectiveSchoolId(supabase, userData.user.id);
+  if (!schoolId) {
+    return { error: 'No school tenant context found.' };
+  }
+
+  // Verify target teacher belongs to this school
+  const { data: targetPerson } = await supabase
+    .from('people')
+    .select('id, role, school_id')
+    .eq('id', personId)
+    .eq('school_id', schoolId)
+    .maybeSingle();
+
+  if (!targetPerson) {
+    return { error: 'Staff member does not belong to your school.' };
+  }
 
   try {
     const now = new Date();
@@ -279,28 +231,18 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   }
 
   const schoolId = await getEffectiveSchoolId(supabase, userData.user.id);
-
-  let school: any = null;
-  if (schoolId) {
-    const { data } = await supabase
-      .from('schools')
-      .select('id, settings')
-      .eq('id', schoolId)
-      .maybeSingle();
-    school = data;
+  if (!schoolId) {
+    return { error: 'No school context resolved for this account.' };
   }
 
-  if (!school) {
-    const { data } = await supabase
-      .from('schools')
-      .select('id, settings')
-      .limit(1)
-      .maybeSingle();
-    school = data;
-  }
+  const { data: school } = await supabase
+    .from('schools')
+    .select('id, settings')
+    .eq('id', schoolId)
+    .maybeSingle();
 
   if (!school) {
-    return { error: 'No school found to top up balance' };
+    return { error: 'School record not found.' };
   }
 
   // Strict lookup from public.tenants where id = school.id using public admin client (bypasses schema & RLS)

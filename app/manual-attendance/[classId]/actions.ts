@@ -1,6 +1,6 @@
 'use server';
 
-import { createAdminClient, createPublicAdminClient } from '@/utils/supabase/admin';
+import { createAdminClient } from '@/utils/supabase/admin';
 import { 
   isWithinAttendanceSmsWindow, 
   getAttendanceStatusForCheckIn,
@@ -20,9 +20,24 @@ export interface StudentAttendanceStatus {
   check_out_time: string | null;
 }
 
+// In-memory rate limiting map for teacher PIN attempts per class: classId -> { failedCount, lockedUntil }
+const pinAttemptStore = new Map<string, { failedCount: number; lockedUntil: number }>();
+
 export async function verifyTeacherPin(classId: string, pin: string) {
   const adminClient = createAdminClient();
   const cleanPin = pin.trim().toUpperCase();
+
+  // 0. Check rate-limiting & lockout
+  const now = Date.now();
+  const lockoutInfo = pinAttemptStore.get(classId);
+  if (lockoutInfo && lockoutInfo.lockedUntil > now) {
+    const remainingSeconds = Math.ceil((lockoutInfo.lockedUntil - now) / 1000);
+    const remainingMins = Math.ceil(remainingSeconds / 60);
+    return {
+      success: false,
+      error: `Too many incorrect attempts. PIN verification is locked for ${remainingMins} minute(s). Please contact your administrator.`
+    };
+  }
 
   // 1. Fetch class to get school_id
   const { data: cls, error: clsError } = await adminClient
@@ -69,16 +84,29 @@ export async function verifyTeacherPin(classId: string, pin: string) {
     }
   }
 
-  // Fallback check: if device_user_id (ZKTeco numeric ID) matches directly
   if (!matchedTeacher) {
-    matchedTeacher = teachers.find(t => 
-      t.device_user_id && (t.device_user_id.trim() === pin.trim() || t.device_user_id.trim().toUpperCase() === cleanPin)
-    );
+    // Record failed attempt
+    const current = pinAttemptStore.get(classId) || { failedCount: 0, lockedUntil: 0 };
+    current.failedCount += 1;
+    if (current.failedCount >= 5) {
+      current.lockedUntil = Date.now() + 10 * 60 * 1000; // 10 minutes lockout
+      pinAttemptStore.set(classId, current);
+      return {
+        success: false,
+        error: 'Too many incorrect attempts. Verification locked for 10 minutes for security.'
+      };
+    } else {
+      pinAttemptStore.set(classId, current);
+      const attemptsLeft = 5 - current.failedCount;
+      return {
+        success: false,
+        error: `Invalid Teacher Attendance PIN. (${attemptsLeft} attempt${attemptsLeft === 1 ? '' : 's'} remaining)`
+      };
+    }
   }
 
-  if (!matchedTeacher) {
-    return { success: false, error: 'Invalid Teacher Attendance PIN / Passcode.' };
-  }
+  // Clear failed attempts on success
+  pinAttemptStore.delete(classId);
 
   return { success: true, teacher: matchedTeacher };
 }
