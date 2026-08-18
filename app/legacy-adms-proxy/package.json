@@ -1,0 +1,10 @@
+{
+  "name": "zkteco-adms-proxy",
+  "version": "1.0.0",
+  "description": "A lightweight HTTP to HTTPS proxy for legacy ZKTeco F18 devices.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}

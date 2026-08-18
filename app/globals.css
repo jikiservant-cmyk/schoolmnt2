@@ -1,0 +1,100 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+:root {
+  --bg: #f7f7f8;
+  --white: #ffffff;
+  --ink: #171719;
+  --muted: #85858a;
+  --line: #e7e7ea;
+  --blue: #007aff;
+  --blue-soft: #edf5ff;
+  --green: #30b357;
+  --green-soft: #edf9f0;
+  --orange: #f5a30a;
+  --orange-soft: #fff5e7;
+  --red: #ef4444;
+  --red-soft: #fff0ef;
+}
+
+@theme {
+  --color-bg-main: #f7f7f8;
+  --color-card-bg: #ffffff;
+  --color-ink-primary: #171719;
+  --color-ink-secondary: #5e5e63;
+  --color-ink-muted: #85858a;
+  --color-border-line: #e7e7ea;
+  --color-border-line-hover: #dedee2;
+
+  --color-brand-blue: #007aff;
+  --color-brand-blue-accent: #1677ff;
+  --color-brand-green: #30b357;
+  --color-brand-green-accent: #2da94f;
+  --color-brand-orange: #f5a30a;
+  --color-brand-orange-accent: #e99500;
+  --color-brand-red: #ef4444;
+  --color-brand-red-accent: #eb453c;
+
+  /* Legacy aliases for subpages */
+  --color-meridian-deep: #f7f7f8;
+  --color-meridian-panel: #ffffff;
+  --color-meridian-panel-raised: #f3f3f5;
+  --color-meridian-border: #e7e7ea;
+  --color-meridian-gold: #007aff;
+  --color-meridian-gold-dim: #0062cc;
+  --color-meridian-text-1: #171719;
+  --color-meridian-text-2: #5e5e63;
+  --color-meridian-text-3: #85858a;
+  --color-meridian-gain: #30b357;
+  --color-meridian-loss: #ef4444;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  --font-serif: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+}
+
+body {
+  margin: 0;
+  background-color: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  min-height: 100vh;
+}
+
+/* Apple-style sleek scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d4d4d8;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #a1a1aa;
+}
+
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #000000 !important;
+  }
+  aside, nav, header, .no-print, [data-no-print="true"] {
+    display: none !important;
+  }
+  main {
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+  }
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+}
+
