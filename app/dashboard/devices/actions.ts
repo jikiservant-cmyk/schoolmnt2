@@ -112,11 +112,12 @@ export async function getDevicePushCandidatesAction(options: PushDeviceTargetOpt
     let schoolId: string | null = null;
     let schoolName = 'Connected School';
 
-    if (deviceSerialNumber) {
+    if (deviceSerialNumber && deviceSerialNumber.trim()) {
+      const cleanSerial = deviceSerialNumber.trim();
       const { data: deviceRecord } = await adminClient
         .from('devices')
         .select('id, serial_number, school_id, schools:school_id(name)')
-        .eq('serial_number', deviceSerialNumber)
+        .ilike('serial_number', cleanSerial)
         .maybeSingle();
 
       if (deviceRecord?.school_id) {
@@ -148,6 +149,7 @@ export async function getDevicePushCandidatesAction(options: PushDeviceTargetOpt
         classes:class_id(id, name)
       `)
       .eq('school_id', schoolId)
+      .neq('is_active', false)
       .order('full_name');
 
     if (category === 'teachers') {
@@ -211,11 +213,12 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
     let schoolName = 'Connected School';
 
     // 1. Resolve school from the target device to guarantee multi-tenant scoping
-    if (deviceSerialNumber) {
+    if (deviceSerialNumber && deviceSerialNumber.trim()) {
+      const cleanSerial = deviceSerialNumber.trim();
       const { data: deviceRecord } = await adminClient
         .from('devices')
         .select('id, serial_number, school_id, schools:school_id(name)')
-        .eq('serial_number', deviceSerialNumber)
+        .ilike('serial_number', cleanSerial)
         .maybeSingle();
 
       if (deviceRecord?.school_id) {
@@ -249,6 +252,7 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
         classes:class_id(id, name)
       `)
       .eq('school_id', schoolId)
+      .neq('is_active', false)
       .not('device_user_id', 'is', null)
       .order('full_name');
 
@@ -339,6 +343,146 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
   } catch (err: any) {
     console.error('Error pushing users to device:', err);
     return { error: err?.message || 'An unexpected error occurred during sync.' };
+  }
+}
+
+/**
+ * Automatically assigns sequential Biometric PINs (Device User IDs) to members missing a PIN and enqueues sync commands
+ */
+export async function autoAssignDevicePinsAction(options: PushDeviceTargetOptions) {
+  try {
+    const adminClient = createAdminClient();
+    const { deviceSerialNumber, category = 'all', classId } = options;
+
+    let schoolId: string | null = null;
+    let schoolName = 'Connected School';
+
+    if (deviceSerialNumber && deviceSerialNumber.trim()) {
+      const cleanSerial = deviceSerialNumber.trim();
+      const { data: deviceRecord } = await adminClient
+        .from('devices')
+        .select('id, serial_number, school_id, schools:school_id(name)')
+        .ilike('serial_number', cleanSerial)
+        .maybeSingle();
+
+      if (deviceRecord?.school_id) {
+        schoolId = deviceRecord.school_id;
+        schoolName = (deviceRecord.schools as any)?.name || schoolName;
+      }
+    }
+
+    if (!schoolId) {
+      const supabase = await createClient();
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        schoolId = await resolveSchoolId(supabase, user.id);
+      }
+    }
+
+    if (!schoolId) {
+      return { error: 'Could not determine school context.' };
+    }
+
+    // 1. Fetch all people in school to find highest existing numeric PIN
+    const { data: allSchoolPeople } = await adminClient
+      .from('people')
+      .select('device_user_id')
+      .eq('school_id', schoolId);
+
+    const existingPins = new Set<string>();
+    let maxNumericPin = 100;
+
+    (allSchoolPeople || []).forEach(p => {
+      if (p.device_user_id) {
+        existingPins.add(p.device_user_id.trim());
+        const num = parseInt(p.device_user_id.trim(), 10);
+        if (!isNaN(num) && num > maxNumericPin && num < 99999) {
+          maxNumericPin = num;
+        }
+      }
+    });
+
+    // 2. Query people missing PIN in the targeted category
+    let query = adminClient
+      .from('people')
+      .select(`
+        id,
+        full_name,
+        role,
+        device_user_id,
+        class_id,
+        classes:class_id(id, name)
+      `)
+      .eq('school_id', schoolId)
+      .is('device_user_id', null)
+      .neq('is_active', false)
+      .order('full_name');
+
+    if (category === 'teachers') {
+      query = query.in('role', ['teacher', 'admin']);
+    } else if (category === 'support_staff') {
+      query = query.eq('role', 'support_staff');
+    } else if (category === 'all_students') {
+      query = query.eq('role', 'student');
+    } else if (category === 'class' && classId) {
+      query = query.eq('role', 'student').eq('class_id', classId);
+    }
+
+    const { data: unassignedPeople, error: fetchErr } = await query;
+    if (fetchErr) {
+      return { error: fetchErr.message || 'Failed to fetch unassigned members.' };
+    }
+
+    if (!unassignedPeople || unassignedPeople.length === 0) {
+      return { success: true, count: 0, message: 'All selected members already have a biometric PIN assigned.' };
+    }
+
+    const { enqueueDeviceCommand } = await import('@/utils/zkteco/commandQueue');
+    const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
+
+    let currentPinNum = maxNumericPin;
+    let assignedCount = 0;
+
+    for (const p of unassignedPeople) {
+      // Find next free PIN
+      do {
+        currentPinNum++;
+      } while (existingPins.has(String(currentPinNum)));
+
+      const assignedPin = String(currentPinNum);
+      existingPins.add(assignedPin);
+
+      // Update in DB
+      await adminClient
+        .from('people')
+        .update({ device_user_id: assignedPin })
+        .eq('id', p.id);
+
+      // Enqueue sync command to terminal
+      const displayName = formatZKTecoDisplayName({
+        full_name: p.full_name,
+        role: p.role as any,
+        classes: p.classes as any
+      });
+
+      const pri = p.role === 'admin' ? 14 : 0;
+      const cmd = `DATA UPDATE userinfo PIN=${assignedPin}\tName=${displayName}\tPri=${pri}`;
+      await enqueueDeviceCommand(cmd, deviceSerialNumber);
+
+      assignedCount++;
+    }
+
+    revalidatePath('/dashboard/devices');
+    revalidatePath('/dashboard/people');
+
+    return {
+      success: true,
+      count: assignedCount,
+      message: `Assigned sequential PINs to ${assignedCount} members and enqueued display names to terminal.`
+    };
+  } catch (err: any) {
+    console.error('Error auto-assigning PINs:', err);
+    return { error: err?.message || 'Failed to auto-assign biometric PINs.' };
   }
 }
 

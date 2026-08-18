@@ -25,6 +25,7 @@ import { useRouter } from 'next/navigation';
 import { 
   pushUsersToDeviceAction, 
   getDevicePushCandidatesAction, 
+  autoAssignDevicePinsAction,
   PushDeviceTargetOptions 
 } from './actions';
 
@@ -146,6 +147,38 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
     setSelectedClassId(classId);
     if (selectedDevice) {
       loadCandidates(selectedDevice, 'class', classId);
+    }
+  }
+
+  // Auto-assign PINs to members missing PINs and push
+  async function handleAutoAssignAndPush() {
+    if (!selectedDevice) return;
+
+    setIsPushing(true);
+    setSyncStatus(null);
+
+    try {
+      const options: PushDeviceTargetOptions = {
+        deviceSerialNumber: selectedDevice.serial_number,
+        category: pushCategory,
+        classId: pushCategory === 'class' ? selectedClassId : undefined
+      };
+
+      const res = await autoAssignDevicePinsAction(options);
+
+      if (res.error) {
+        setSyncStatus({ msg: res.error, isError: true });
+      } else {
+        setSyncStatus({ 
+          msg: res.message || `Successfully assigned PINs and enqueued names to ${selectedDevice.label || selectedDevice.serial_number}!`,
+        });
+        // Reload candidates to reflect new PINs
+        await loadCandidates(selectedDevice, pushCategory, selectedClassId);
+      }
+    } catch (err: any) {
+      setSyncStatus({ msg: err.message || 'Failed to auto-assign and push names', isError: true });
+    } finally {
+      setIsPushing(false);
     }
   }
 
@@ -661,37 +694,53 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
             </div>
 
             {/* Modal Footer */}
-            <div className="p-4 border-t border-gray-100 flex items-center justify-between gap-3 bg-[#fbfbfc]">
+            <div className="p-4 border-t border-gray-100 flex flex-col sm:flex-row items-center justify-between gap-3 bg-[#fbfbfc]">
               <button
                 type="button"
                 onClick={() => setSelectedDevice(null)}
                 disabled={isPushing}
-                className="px-4 py-2 rounded-lg text-xs font-medium text-gray-600 hover:text-gray-800 hover:bg-gray-100 transition"
+                className="w-full sm:w-auto px-4 py-2 rounded-lg text-xs font-medium text-gray-600 hover:text-gray-800 hover:bg-gray-100 transition"
               >
                 Cancel
               </button>
 
-              <button
-                id="confirm-push-names-btn"
-                type="button"
-                onClick={handleExecutePush}
-                disabled={isPushing || isLoadingCandidates || (candidatesData?.withPinCount || 0) === 0}
-                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs font-bold bg-[#007aff] hover:bg-[#0062cc] text-white shadow-md transition disabled:opacity-50 active:scale-[0.98]"
-              >
-                {isPushing ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Sending to ADMS Queue...</span>
-                  </>
-                ) : (
-                  <>
-                    <Send className="w-4 h-4" />
-                    <span>
-                      Push {candidatesData?.withPinCount || 0} Name(s) to Screen
-                    </span>
-                  </>
+              <div className="flex flex-col sm:flex-row items-center gap-2 w-full sm:w-auto">
+                {candidatesData && candidatesData.withoutPinCount > 0 && (
+                  <button
+                    id="auto-assign-and-push-btn"
+                    type="button"
+                    onClick={handleAutoAssignAndPush}
+                    disabled={isPushing || isLoadingCandidates}
+                    className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white shadow-xs transition disabled:opacity-50 active:scale-[0.98]"
+                    title="Assign sequential biometric PINs to members missing PINs and push their names to the device"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Auto-assign PIN to ({candidatesData.withoutPinCount}) & Push</span>
+                  </button>
                 )}
-              </button>
+
+                <button
+                  id="confirm-push-names-btn"
+                  type="button"
+                  onClick={handleExecutePush}
+                  disabled={isPushing || isLoadingCandidates || (candidatesData?.withPinCount || 0) === 0}
+                  className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-lg text-xs font-bold bg-[#007aff] hover:bg-[#0062cc] text-white shadow-md transition disabled:opacity-50 active:scale-[0.98]"
+                >
+                  {isPushing ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Sending to ADMS Queue...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Send className="w-4 h-4" />
+                      <span>
+                        Push {candidatesData?.withPinCount || 0} Name(s) to Screen
+                      </span>
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
 
           </div>
