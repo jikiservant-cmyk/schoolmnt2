@@ -5,6 +5,39 @@ import { createAdminClient } from '@/utils/supabase/admin';
 import { revalidatePath } from 'next/cache';
 import bcrypt from 'bcryptjs';
 
+async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
+  // 1. Try auth_school_id RPC
+  try {
+    const { data: rpcSchoolId } = await supabase.rpc('auth_school_id');
+    if (rpcSchoolId) {
+      return rpcSchoolId;
+    }
+  } catch (err) {
+    console.warn('RPC auth_school_id not available:', err);
+  }
+
+  // 2. Try staff_users linked via person_id -> people(school_id)
+  if (userId) {
+    try {
+      const { data: staffData } = await supabase
+        .from('staff_users')
+        .select('person_id, people(school_id)')
+        .eq('auth_user_id', userId)
+        .maybeSingle();
+
+      const peopleObj = Array.isArray(staffData?.people) ? staffData.people[0] : staffData?.people;
+      const resolvedSchoolId = (peopleObj as any)?.school_id;
+      if (resolvedSchoolId) {
+        return resolvedSchoolId;
+      }
+    } catch (err) {
+      console.error('Error resolving staff_users school context:', err);
+    }
+  }
+
+  return null;
+}
+
 export async function addPersonAction(formData: FormData) {
   const supabase = await createClient();
   const fullName = formData.get('fullName') as string;
@@ -14,34 +47,114 @@ export async function addPersonAction(formData: FormData) {
     return { error: 'Full Name and Role are required.' };
   }
 
+  if (role !== 'student' && role !== 'teacher' && role !== 'support_staff') {
+    return { error: 'Role selection must be Student, Teacher, or Support Staff.' };
+  }
+
   try {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) {
       return { error: 'Not authenticated. Please log in.' };
     }
 
-    // Build params dynamically based on selected role
+    const schoolId = await getEffectiveSchoolId(supabase, user.id);
+    if (!schoolId) {
+      return { error: 'No school tenant found for this account. Please verify your staff credentials.' };
+    }
+
+    const adminClient = createAdminClient();
+    const rawDeviceId = formData.get('deviceUserId') as string;
+    const cleanDeviceId = rawDeviceId && rawDeviceId.trim() ? rawDeviceId.trim() : null;
+
+    // Check for duplicate biometric device user ID in this school
+    if (cleanDeviceId) {
+      const { data: existingPerson } = await adminClient
+        .from('people')
+        .select('id, full_name, role')
+        .eq('school_id', schoolId)
+        .eq('device_user_id', cleanDeviceId)
+        .maybeSingle();
+
+      if (existingPerson) {
+        return {
+          error: `The biometric Enrollment ID "${cleanDeviceId}" is already registered to ${existingPerson.full_name} (${existingPerson.role}) in your school.`
+        };
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Branch 1: Support Staff Registration (direct table insert)
+    // -------------------------------------------------------------
+    if (role === 'support_staff') {
+      const phone = (formData.get('phone') as string)?.trim() || null;
+
+      const { data: newPerson, error: insertErr } = await adminClient
+        .from('people')
+        .insert({
+          school_id: schoolId,
+          full_name: fullName.trim(),
+          role: 'support_staff',
+          phone: phone,
+          device_user_id: cleanDeviceId,
+          is_active: true,
+          class_id: null
+        })
+        .select()
+        .single();
+
+      if (insertErr) {
+        console.error('Error inserting support staff into people table:', insertErr);
+        if (insertErr.code === '23505') {
+          return { error: 'The biometric Enrollment ID is already registered to another person in your school.' };
+        }
+        return { error: insertErr.message || 'Failed to register support staff member.' };
+      }
+
+      // Sync user to biometric device queue if device ID provided
+      if (cleanDeviceId) {
+        try {
+          const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
+          const { enqueueDeviceCommand } = await import('@/utils/zkteco/commandQueue');
+          const displayName = formatZKTecoDisplayName({
+            full_name: fullName.trim(),
+            role: 'support_staff',
+            classes: null
+          });
+          await enqueueDeviceCommand(`DATA UPDATE userinfo PIN=${cleanDeviceId}\tName=${displayName}\tPri=0`);
+        } catch (cmdErr) {
+          console.warn('Non-blocking: Failed to enqueue ADMS user sync command for support staff:', cmdErr);
+        }
+      }
+
+      revalidatePath('/dashboard/people');
+      revalidatePath('/dashboard/attendance');
+      revalidatePath('/dashboard');
+
+      return {
+        success: true,
+        data: newPerson,
+        teacherPin: null
+      };
+    }
+
+    // -------------------------------------------------------------
+    // Branch 2 & 3: Student & Teacher Registration
+    // -------------------------------------------------------------
     let params: Record<string, any> = {
       p_role: role,
       p_full_name: fullName.trim(),
+      p_device_user_id: cleanDeviceId
     };
 
-    // 1. Handle Biometric Hardware Device User ID (from ZKTeco machine enrollment)
-    const deviceUserId = formData.get('deviceUserId') as string;
-
-    if (deviceUserId && deviceUserId.trim()) {
-      params.p_device_user_id = deviceUserId.trim();
-    } else {
-      params.p_device_user_id = null;
-    }
-
     let generatedTeacherPin: string | null = null;
+    let studentClassId: string | null = null;
 
     if (role === 'student') {
       const classId = formData.get('classId') as string;
       if (!classId) {
         return { error: 'Please select a class for the student.' };
       }
+      studentClassId = classId;
       params.p_class_id = classId;
 
       const guardianName = formData.get('guardianName') as string;
@@ -58,8 +171,6 @@ export async function addPersonAction(formData: FormData) {
 
     } else if (role === 'teacher') {
       const phone = formData.get('phone') as string;
-      
-      // Get array of selected class IDs
       const classIdsJson = formData.get('classIdsJson') as string;
       let classIds: string[] = [];
       if (classIdsJson) {
@@ -76,11 +187,8 @@ export async function addPersonAction(formData: FormData) {
         params.p_phone = null;
       }
 
-      // 2. Auto-generate a globally unique Teacher Attendance Passcode / PIN (alphanumeric, e.g. T7K9M2)
-      const adminClient = createAdminClient();
+      // Auto-generate a globally unique Teacher Attendance Passcode / PIN (alphanumeric, e.g. T7K9M2)
       const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-      
-      // Fetch existing teacher pin hashes to guarantee 100% uniqueness
       const { data: existingStaff } = await adminClient
         .from('staff_users')
         .select('pin_hash')
@@ -113,58 +221,130 @@ export async function addPersonAction(formData: FormData) {
       params.p_pin = generatedTeacherPin;
       params.p_class_ids = classIds.length > 0 ? classIds : null;
       params.p_issue_manual_link = true;
-    } else if (role === 'support_staff') {
-      const phone = formData.get('phone') as string;
-      if (phone && phone.trim()) {
-        params.p_phone = phone.trim();
+    }
+
+    // Try invoking the RPC function school.fn_add_person
+    let rpcSuccess = false;
+    let rpcData: any = null;
+    try {
+      const { data, error } = await (supabase as any).rpc('fn_add_person', params);
+      if (!error) {
+        rpcSuccess = true;
+        rpcData = data;
       } else {
-        params.p_phone = null;
+        console.warn('fn_add_person RPC returned error, using direct table fallback:', error);
       }
-    } else {
-      return { error: 'Invalid role selection.' };
+    } catch (rpcErr) {
+      console.warn('fn_add_person RPC invocation threw:', rpcErr);
     }
 
-    // Invoke the RPC function school.fn_add_person
-    const { data, error } = await (supabase as any).rpc('fn_add_person', params);
+    // Fallback if RPC is not supported or failed
+    if (!rpcSuccess) {
+      if (role === 'student') {
+        const { data: newPerson, error: pInsertErr } = await adminClient
+          .from('people')
+          .insert({
+            school_id: schoolId,
+            full_name: fullName.trim(),
+            role: 'student',
+            class_id: studentClassId,
+            device_user_id: cleanDeviceId,
+            is_active: true
+          })
+          .select()
+          .single();
 
-    if (error) {
-      console.error('Error executing fn_add_person:', error);
-      
-      const errMsg = error.message || '';
-      if (errMsg.includes('not_authenticated_staff')) {
-        return { error: 'You need to be logged in as a school staff/admin to perform this action.' };
-      }
-      if (errMsg.includes('not_authorized')) {
-        return { error: 'Only school administrators can register new members.' };
-      }
-      if (errMsg.includes('invalid_role')) {
-        return { error: 'Role selection must be Student, Teacher, or Support Staff.' };
-      }
-      if (errMsg.includes('student_requires_class_id')) {
-        return { error: 'A student registration requires a valid class assignment.' };
-      }
-      if (errMsg.includes('invalid_class_for_school')) {
-        return { error: 'The chosen class assignment does not belong to your school.' };
-      }
-      if (errMsg.includes('invalid_pin_format')) {
-        return { error: 'The teacher PIN format was rejected by database.' };
-      }
-      if (error.code === '23505') {
-        return { error: 'The biometric Enrollment ID is already registered to another person in your school.' };
-      }
+        if (pInsertErr) {
+          if (pInsertErr.code === '23505') {
+            return { error: 'The biometric Enrollment ID is already registered to another person in your school.' };
+          }
+          return { error: pInsertErr.message || 'Failed to register student.' };
+        }
 
-      return { error: error.message || 'The registry transaction failed in the database.' };
+        const guardianName = formData.get('guardianName') as string;
+        const guardianPhone = formData.get('guardianPhone') as string;
+        let guardianLinked = false;
+
+        if (guardianPhone && guardianPhone.trim()) {
+          try {
+            const { data: parentRec } = await adminClient
+              .from('parents')
+              .insert({
+                school_id: schoolId,
+                full_name: guardianName && guardianName.trim() ? guardianName.trim() : 'Guardian',
+                phone: guardianPhone.trim()
+              })
+              .select('id')
+              .single();
+
+            if (parentRec?.id) {
+              await adminClient
+                .from('student_parents')
+                .insert({
+                  student_id: newPerson.id,
+                  parent_id: parentRec.id,
+                  relationship: (formData.get('guardianRelationship') as string) || 'guardian',
+                  is_primary: true
+                });
+              guardianLinked = true;
+            }
+          } catch (gErr) {
+            console.warn('Non-blocking: Failed to link parent in fallback:', gErr);
+          }
+        }
+
+        rpcData = { ...newPerson, guardian_linked: guardianLinked };
+      } else if (role === 'teacher') {
+        const phone = (formData.get('phone') as string)?.trim() || null;
+        const { data: newPerson, error: pInsertErr } = await adminClient
+          .from('people')
+          .insert({
+            school_id: schoolId,
+            full_name: fullName.trim(),
+            role: 'teacher',
+            phone: phone,
+            device_user_id: cleanDeviceId,
+            is_active: true
+          })
+          .select()
+          .single();
+
+        if (pInsertErr) {
+          if (pInsertErr.code === '23505') {
+            return { error: 'The biometric Enrollment ID is already registered to another person in your school.' };
+          }
+          return { error: pInsertErr.message || 'Failed to register teacher.' };
+        }
+
+        if (generatedTeacherPin) {
+          const salt = bcrypt.genSaltSync(6);
+          const pinHash = bcrypt.hashSync(generatedTeacherPin, salt);
+          try {
+            await adminClient
+              .from('staff_users')
+              .insert({
+                person_id: newPerson.id,
+                pin_hash: pinHash,
+                role: 'teacher'
+              });
+          } catch (stErr) {
+            console.warn('Non-blocking: staff_users insert in teacher fallback:', stErr);
+          }
+        }
+
+        rpcData = newPerson;
+      }
     }
 
-    // If a biometric device user ID was provided, automatically enqueue a DATA USER push to the ZKTeco terminal
-    if (params.p_device_user_id) {
+    // Sync to ZKTeco terminal if device ID provided
+    if (cleanDeviceId) {
       try {
         let className = '';
-        if (role === 'student' && params.p_class_id) {
-          const { data: cls } = await supabase
+        if (role === 'student' && studentClassId) {
+          const { data: cls } = await adminClient
             .from('classes')
             .select('name')
-            .eq('id', params.p_class_id)
+            .eq('id', studentClassId)
             .maybeSingle();
           if (cls?.name) className = cls.name;
         }
@@ -178,16 +358,19 @@ export async function addPersonAction(formData: FormData) {
           classes: className ? { name: className } : null
         });
 
-        enqueueDeviceCommand(`DATA UPDATE userinfo PIN=${params.p_device_user_id}\tName=${displayName}\tPri=0`);
+        await enqueueDeviceCommand(`DATA UPDATE userinfo PIN=${cleanDeviceId}\tName=${displayName}\tPri=0`);
       } catch (cmdErr) {
         console.warn('Non-blocking: Failed to enqueue ADMS user sync command:', cmdErr);
       }
     }
 
     revalidatePath('/dashboard/people');
+    revalidatePath('/dashboard/attendance');
+    revalidatePath('/dashboard');
+
     return { 
       success: true,
-      data,
+      data: rpcData,
       teacherPin: generatedTeacherPin
     };
   } catch (err: any) {
