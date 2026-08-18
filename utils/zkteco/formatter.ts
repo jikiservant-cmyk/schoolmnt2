@@ -23,6 +23,14 @@ export function formatZKTecoDisplayName(person: PersonInfo): string {
     if (!formatted.toLowerCase().startsWith('tr.') && !formatted.toLowerCase().startsWith('teacher')) {
       formatted = `Tr. ${formatted}`;
     }
+  } else if (role === 'support_staff') {
+    if (!formatted.toLowerCase().startsWith('stf.') && !formatted.toLowerCase().startsWith('staff')) {
+      formatted = `Stf. ${formatted}`;
+    }
+  } else if (role === 'admin') {
+    if (!formatted.toLowerCase().startsWith('adm.') && !formatted.toLowerCase().startsWith('admin')) {
+      formatted = `Adm. ${formatted}`;
+    }
   } else if (role === 'student' && className) {
     formatted = `${formatted} (${className})`;
   }

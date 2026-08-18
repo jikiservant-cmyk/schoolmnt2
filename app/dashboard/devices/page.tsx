@@ -7,13 +7,20 @@ import Link from 'next/link';
 export default async function DevicesPage() {
   const supabase = await createClient();
 
-  // 1. Fetch registered physical devices
+  // 1. Fetch registered physical devices with school information
   const { data: devicesData } = await supabase
     .from('devices')
-    .select('*')
+    .select('*, schools:school_id(id, name)')
     .order('created_at', { ascending: false });
 
+  // 2. Fetch classes for class-by-class student push
+  const { data: classesData } = await supabase
+    .from('classes')
+    .select('id, name, school_id')
+    .order('name');
+
   const registeredDevices = devicesData || [];
+  const classesList = classesData || [];
 
   return (
     <div className="space-y-8 animate-fade-in">
@@ -58,7 +65,10 @@ export default async function DevicesPage() {
               </span>
             </div>
 
-            <DeviceLiveList devices={registeredDevices as any} />
+            <DeviceLiveList 
+              devices={registeredDevices as any} 
+              classes={classesList}
+            />
 
             <div className="mt-8 pt-4 border-t border-meridian-border/60 text-xs text-meridian-text-3 flex items-center gap-2">
               <ShieldCheck className="w-4 h-4 text-meridian-gold shrink-0" />

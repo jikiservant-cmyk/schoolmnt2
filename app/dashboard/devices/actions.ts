@@ -126,59 +126,255 @@ export async function addDeviceAction(formData: FormData) {
   }
 }
 
-export async function pushAllUsersToDeviceAction(deviceSerialNumber?: string) {
+export interface PushDeviceTargetOptions {
+  deviceSerialNumber?: string;
+  category: 'all' | 'teachers' | 'support_staff' | 'all_students' | 'class';
+  classId?: string;
+}
+
+export async function getDevicePushCandidatesAction(options: PushDeviceTargetOptions) {
   try {
     const adminClient = createAdminClient();
+    const { deviceSerialNumber, category, classId } = options;
 
-    // Fetch all people with a device_user_id (PIN) and their role/class info
-    const { data: people, error } = await adminClient
+    let schoolId: string | null = null;
+    let schoolName = 'Connected School';
+
+    if (deviceSerialNumber) {
+      const { data: deviceRecord } = await adminClient
+        .from('devices')
+        .select('id, serial_number, school_id, schools:school_id(name)')
+        .eq('serial_number', deviceSerialNumber)
+        .maybeSingle();
+
+      if (deviceRecord?.school_id) {
+        schoolId = deviceRecord.school_id;
+        schoolName = (deviceRecord.schools as any)?.name || schoolName;
+      }
+    }
+
+    if (!schoolId) {
+      const supabase = await createClient();
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        schoolId = await resolveSchoolId(supabase, user.id);
+      }
+    }
+
+    if (!schoolId) {
+      return { error: 'No school tenant found for this device.' };
+    }
+
+    let query = adminClient
       .from('people')
       .select(`
         id,
         full_name,
         role,
         device_user_id,
-        classes:class_id(name)
+        class_id,
+        classes:class_id(id, name)
       `)
-      .not('device_user_id', 'is', null);
+      .eq('school_id', schoolId)
+      .order('full_name');
+
+    if (category === 'teachers') {
+      query = query.in('role', ['teacher', 'admin']);
+    } else if (category === 'support_staff') {
+      query = query.eq('role', 'support_staff');
+    } else if (category === 'all_students') {
+      query = query.eq('role', 'student');
+    } else if (category === 'class') {
+      query = query.eq('role', 'student');
+      if (classId) {
+        query = query.eq('class_id', classId);
+      }
+    }
+
+    const { data: people, error } = await query;
+    if (error) {
+      console.error('Error fetching push candidates:', error);
+      return { error: error.message || 'Failed to fetch candidate people.' };
+    }
+
+    const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
+
+    const formattedCandidates = (people || []).map((p: any) => ({
+      id: p.id,
+      full_name: p.full_name,
+      role: p.role,
+      device_user_id: p.device_user_id,
+      className: p.classes?.name || null,
+      formattedName: formatZKTecoDisplayName({
+        full_name: p.full_name,
+        role: p.role,
+        classes: p.classes
+      })
+    }));
+
+    const withPin = formattedCandidates.filter(p => !!p.device_user_id);
+    const withoutPin = formattedCandidates.filter(p => !p.device_user_id);
+
+    return {
+      success: true,
+      schoolId,
+      schoolName,
+      totalCount: formattedCandidates.length,
+      withPinCount: withPin.length,
+      withoutPinCount: withoutPin.length,
+      candidates: formattedCandidates
+    };
+  } catch (err: any) {
+    console.error('Error in getDevicePushCandidatesAction:', err);
+    return { error: err?.message || 'Failed to calculate candidates.' };
+  }
+}
+
+export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) {
+  try {
+    const adminClient = createAdminClient();
+    const { deviceSerialNumber, category = 'all', classId } = options;
+
+    let schoolId: string | null = null;
+    let schoolName = 'Connected School';
+
+    // 1. Resolve school from the target device to guarantee multi-tenant scoping
+    if (deviceSerialNumber) {
+      const { data: deviceRecord } = await adminClient
+        .from('devices')
+        .select('id, serial_number, school_id, schools:school_id(name)')
+        .eq('serial_number', deviceSerialNumber)
+        .maybeSingle();
+
+      if (deviceRecord?.school_id) {
+        schoolId = deviceRecord.school_id;
+        schoolName = (deviceRecord.schools as any)?.name || schoolName;
+      }
+    }
+
+    // 2. Fallback to signed-in user's school if device has no explicit school_id
+    if (!schoolId) {
+      const supabase = await createClient();
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        schoolId = await resolveSchoolId(supabase, user.id);
+      }
+    }
+
+    if (!schoolId) {
+      return { error: 'Could not determine the school context for this device push.' };
+    }
+
+    // 3. Query people strictly scoped to this school_id
+    let query = adminClient
+      .from('people')
+      .select(`
+        id,
+        full_name,
+        role,
+        device_user_id,
+        class_id,
+        classes:class_id(id, name)
+      `)
+      .eq('school_id', schoolId)
+      .not('device_user_id', 'is', null)
+      .order('full_name');
+
+    let categoryLabel = 'All School Members';
+    let targetClassName: string | null = null;
+
+    if (category === 'teachers') {
+      query = query.in('role', ['teacher', 'admin']);
+      categoryLabel = 'Teachers & Faculty';
+    } else if (category === 'support_staff') {
+      query = query.eq('role', 'support_staff');
+      categoryLabel = 'Support Staff';
+    } else if (category === 'all_students') {
+      query = query.eq('role', 'student');
+      categoryLabel = 'All Students';
+    } else if (category === 'class') {
+      query = query.eq('role', 'student');
+      if (classId) {
+        query = query.eq('class_id', classId);
+        // Find class name for nice label
+        const { data: cls } = await adminClient
+          .from('classes')
+          .select('name')
+          .eq('id', classId)
+          .maybeSingle();
+        targetClassName = cls?.name || 'Selected Class';
+        categoryLabel = `Class "${targetClassName}" Students`;
+      } else {
+        categoryLabel = 'Class Students';
+      }
+    }
+
+    const { data: people, error } = await query;
 
     if (error) {
       console.error('Failed to fetch people for device sync:', error);
-      return { error: 'Failed to fetch enrolled people.' };
+      return { error: error.message || 'Failed to fetch enrolled people.' };
     }
 
     if (!people || people.length === 0) {
-      return { success: true, count: 0, message: 'No people have a Device User ID (PIN) configured.' };
+      return { 
+        success: true, 
+        count: 0, 
+        schoolName,
+        categoryLabel,
+        message: `No ${categoryLabel.toLowerCase()} with a Device User ID (PIN) found in ${schoolName}.` 
+      };
     }
 
     const { enqueueDeviceCommand } = await import('@/utils/zkteco/commandQueue');
     const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
 
     let queuedCount = 0;
+    const previewList: string[] = [];
+
     for (const p of people) {
-      if (!p.device_user_id) continue;
+      if (!p.device_user_id || !p.device_user_id.trim()) continue;
+      
       const displayName = formatZKTecoDisplayName({
         full_name: p.full_name,
         role: p.role as any,
         classes: p.classes as any
       });
 
-      // ZKTeco ADMS command to update user name on terminal
-      // DATA UPDATE userinfo PIN=7001\tName=John Doe (7A)\tPri=0
-      const pri = p.role === 'teacher' ? 0 : 0; // 0=Normal User, 14=Admin
-      const cmd = `DATA UPDATE userinfo PIN=${p.device_user_id}\tName=${displayName}\tPri=${pri}`;
-      enqueueDeviceCommand(cmd, deviceSerialNumber);
+      // ZKTeco ADMS command to update user info on terminal:
+      // DATA UPDATE userinfo PIN=201\tName=Tr. Denis Mpungu\tPri=0
+      const pri = p.role === 'admin' ? 14 : 0; // 0=Normal User, 14=Device Admin
+      const cmd = `DATA UPDATE userinfo PIN=${p.device_user_id.trim()}\tName=${displayName}\tPri=${pri}`;
+      
+      await enqueueDeviceCommand(cmd, deviceSerialNumber);
       queuedCount++;
+
+      if (previewList.length < 12) {
+        previewList.push(`${p.device_user_id}: ${displayName}`);
+      }
     }
+
+    revalidatePath('/dashboard/devices');
 
     return {
       success: true,
       count: queuedCount,
-      message: `Enqueued ${queuedCount} user profile & name sync commands to biometric terminal(s).`
+      schoolName,
+      categoryLabel,
+      previewList,
+      message: `Enqueued ${queuedCount} names (${categoryLabel}) to terminal screen for ${schoolName}.`
     };
   } catch (err: any) {
     console.error('Error pushing users to device:', err);
     return { error: err?.message || 'An unexpected error occurred during sync.' };
   }
+}
+
+// Backward-compatible alias
+export async function pushAllUsersToDeviceAction(deviceSerialNumber?: string) {
+  return pushUsersToDeviceAction({
+    deviceSerialNumber,
+    category: 'all'
+  });
 }
 
