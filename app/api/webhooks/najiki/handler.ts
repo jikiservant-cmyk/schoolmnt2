@@ -60,23 +60,81 @@ export async function handleNajikiWebhook(req: NextRequest) {
     }
 
     const publicAdmin = createPublicAdminClient();
+    const eventType = payload.event || payload.eventType;
+    const eventData = payload.data || payload; // fallback to root payload if data object is not present
 
-    if (payload.event === "payment.success" || payload.eventType === "payment.success") {
-      const schoolId = payload.school_id || payload.metadata?.schoolId || payload.tenantCode || payload.externalEntityId;
-      const amount = payload.amount || payload.metadata?.amount;
-      const txRef = payload.transaction_ref || payload.reference || payload.paymentIntentId || payload.idempotencyKey;
+    if (eventType === "payment.success") {
+      const schoolId = eventData.school_id || eventData.metadata?.schoolId || eventData.tenantCode || eventData.externalEntityId;
+      const amount = eventData.amount || eventData.metadata?.amount;
+      const txRef = eventData.transaction_ref || eventData.reference || eventData.paymentIntentId || eventData.idempotencyKey;
       
       if (schoolId && amount && txRef) {
-        await publicAdmin.rpc("credit_wallet", {
+        console.log(`[NaJiki Webhook] Crediting wallet for school ${schoolId} with amount ${amount}, ref: ${txRef}`);
+        const { data, error } = await publicAdmin.rpc("credit_wallet", {
           p_school_id: schoolId,
           p_amount: amount,
           p_tx_ref: txRef,
         });
+        
+        if (error) {
+          console.error('[NaJiki Webhook] Error calling credit_wallet:', error);
+          
+          // Fallback: If credit_wallet RPC doesn't exist, try a direct insert/update
+          if (error.message.includes('function "credit_wallet" does not exist') || error.code === '42883') {
+            console.log('[NaJiki Webhook] Attempting manual wallet credit fallback...');
+            
+            // 1. Get or create wallet for school
+            const { data: walletData, error: walletErr } = await publicAdmin
+              .from('wallets')
+              .select('id, balance')
+              .eq('school_id', schoolId)
+              .maybeSingle();
+              
+            if (walletErr) {
+              console.error('[NaJiki Webhook] Error fetching wallet:', walletErr);
+            } else {
+              let walletId = walletData?.id;
+              
+              if (!walletData) {
+                const { data: newWallet } = await publicAdmin
+                  .from('wallets')
+                  .insert({ school_id: schoolId, balance: amount })
+                  .select('id')
+                  .single();
+                walletId = newWallet?.id;
+              } else {
+                await publicAdmin
+                  .from('wallets')
+                  .update({ balance: (walletData.balance || 0) + Number(amount) })
+                  .eq('id', walletId);
+              }
+              
+              // 2. Record transaction
+              if (walletId) {
+                await publicAdmin.from('transactions').insert({
+                  wallet_id: walletId,
+                  amount: amount,
+                  type: 'credit',
+                  reference: txRef,
+                  status: 'completed'
+                });
+                console.log(`[NaJiki Webhook] Successfully credited wallet manually.`);
+              }
+            }
+          }
+          // Return an error so the webhook sender knows it failed
+          return NextResponse.json({ error: 'Failed to credit wallet', details: error.message }, { status: 500 });
+        } else {
+          console.log('[NaJiki Webhook] Successfully credited wallet via RPC:', data);
+        }
+      } else {
+        console.warn('[NaJiki Webhook] Missing required fields for payment.success', { schoolId, amount, txRef, eventData });
+        return NextResponse.json({ error: 'Missing required payment fields' }, { status: 400 });
       }
-    } else if (payload.event === "message.status" || payload.eventType === "SMS_DELIVERY_UPDATE") {
+    } else if (eventType === "message.status" || eventType === "SMS_DELIVERY_UPDATE") {
       // Handle both the simpler payload structure from user and existing one
-      const smsId = payload.messageId || payload.smsId || payload.id;
-      const rawStatus = (payload.status || '').toString().toUpperCase();
+      const smsId = eventData.messageId || eventData.smsId || eventData.id;
+      const rawStatus = (eventData.status || '').toString().toUpperCase();
       const status = (rawStatus === 'DELIVERED' || rawStatus === 'SENT' || rawStatus === 'SUCCESS') ? 'sent' : 'failed';
       
       if (smsId) {

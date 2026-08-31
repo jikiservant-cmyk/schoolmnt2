@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useMemo } from 'react';
-import { getAttendanceData, topUpBalance } from './actions';
+import { getAttendanceData, topUpBalance, getSchoolBalance } from './actions';
 import { 
   Clock, 
   Wallet, 
@@ -71,15 +71,21 @@ export default function AttendancePage() {
     let interval: NodeJS.Timeout | null = null;
     if (showTopUpModal && topUpStep === 'waiting') {
       interval = setInterval(async () => {
-        const data = await getAttendanceData();
-        if (data?.school?.settings) {
-          setSchool(data.school);
-          const currentBal = data.school.settings.balance || 0;
-          if (currentBal > initialBalance) {
-            setTopUpStep('success');
-            setTopUpMessage(`Payment received! New balance: ${currentBal.toLocaleString()} UGX`);
-            if (interval) clearInterval(interval);
+        try {
+          const result = await getSchoolBalance();
+          if (result && typeof result.balance === 'number') {
+            setSchool((prev: any) => ({
+              ...prev,
+              settings: { ...(prev?.settings || {}), balance: result.balance }
+            }));
+            if (result.balance > initialBalance) {
+              setTopUpStep('success');
+              setTopUpMessage(`Payment received! New balance: ${result.balance.toLocaleString()} UGX`);
+              if (interval) clearInterval(interval);
+            }
           }
+        } catch (e) {
+          console.error('Polling error', e);
         }
       }, 4000);
     }

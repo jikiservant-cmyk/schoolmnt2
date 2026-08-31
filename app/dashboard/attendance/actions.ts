@@ -1,5 +1,6 @@
 'use server';
 
+import crypto from 'crypto';
 import { createClient } from '@/utils/supabase/server';
 import { createPublicAdminClient } from '@/utils/supabase/admin';
 import { revalidatePath } from 'next/cache';
@@ -221,6 +222,29 @@ export async function markTeacherAttendanceAction(
   }
 }
 
+export async function getSchoolBalance() {
+  const supabase = await createClient();
+  const { data: userData, error: userError } = await supabase.auth.getUser();
+  if (userError || !userData?.user) return { error: 'Unauthorized' };
+
+  const schoolId = await getEffectiveSchoolId(supabase, userData.user.id);
+  if (!schoolId) return { error: 'No school tenant context found.' };
+
+  try {
+    const publicAdmin = createPublicAdminClient();
+    const { data: wallet } = await publicAdmin
+      .from('wallets')
+      .select('balance')
+      .eq('tenant_id', schoolId)
+      .maybeSingle();
+
+    return { balance: wallet?.balance !== null && wallet?.balance !== undefined ? Number(wallet.balance) : 0 };
+  } catch (err) {
+    console.error('Error fetching balance:', err);
+    return { error: 'Failed to fetch balance' };
+  }
+}
+
 export async function topUpBalance(amount: number, phoneNumber: string) {
   const supabase = await createClient();
   const publicAdmin = createPublicAdminClient();
@@ -308,8 +332,7 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   // Generate unique idempotency key
   const idempotencyKey = `sch_topup_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
 
-  const najikiDomain = process.env.NAJIKI_DOMAIN || 'api.najiki.com';
-  const najikiUrl = najikiDomain.startsWith('http') ? najikiDomain : `https://${najikiDomain}`;
+  const endpointUrl = process.env.NAJIKI_API_URL || 'https://najiki.vercel.app/api/payments';
   const apiKey = process.env.NAJIKI_API_KEY || 'test_key';
 
   const payload = {
@@ -328,7 +351,7 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   };
 
   try {
-    const response = await fetch(`${najikiUrl}/api/v1/payments/collect`, {
+    const response = await fetch(endpointUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -338,11 +361,24 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
       body: JSON.stringify(payload)
     });
 
-    const resData = await response.json();
+    let textData = '';
+    let resData: any = {};
+    try {
+      textData = await response.text();
+      if (textData) {
+        resData = JSON.parse(textData);
+      }
+    } catch (parseErr) {
+      console.error('[NaJiki API] Failed to parse JSON response. Raw text:', textData.substring(0, 200));
+      if (!response.ok) {
+         return { error: `Payment service returned an invalid response (Status ${response.status}). Please try again.` };
+      }
+    }
 
     if (!response.ok) {
+      console.error(`[NaJiki TopUp API] Failed with status ${response.status}`, resData);
       return { 
-        error: resData.message || 'Payment initiation failed. Please check your phone number and try again.' 
+        error: resData.message || resData.error || 'Payment initiation failed. Please check your phone number and try again.' 
       };
     }
 
