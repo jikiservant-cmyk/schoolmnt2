@@ -131,6 +131,17 @@ export default function Topbar({ adminName, initials, schoolName }: TopbarProps)
                   >
                     SMS Wallet & Billing
                   </Link>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUserDropdown(false);
+                      showToast('PWA mode is active. You can install via browser menu or the install banner.');
+                    }}
+                    className="w-full text-left px-3 py-2 hover:bg-[#f7f7f8] rounded-lg transition flex items-center justify-between text-[#007aff]"
+                  >
+                    <span>Install SmartSkoolz PWA</span>
+                    <span className="text-[9px] bg-[#edf5ff] px-1.5 py-0.5 rounded font-mono">PWA</span>
+                  </button>
                 </div>
                 <div className="pt-1 border-t border-[#f0f0f2]">
                   <form action="/api/logout" method="POST">

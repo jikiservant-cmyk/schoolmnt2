@@ -70,7 +70,7 @@ export default function AttendancePage() {
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
     if (showTopUpModal && topUpStep === 'waiting') {
-      interval = setInterval(async () => {
+      const checkBalanceNow = async () => {
         try {
           const result = await getSchoolBalance();
           if (result && typeof result.balance === 'number') {
@@ -87,7 +87,11 @@ export default function AttendancePage() {
         } catch (e) {
           console.error('Polling error', e);
         }
-      }, 4000);
+      };
+
+      // Check immediately, then poll every 2.5s
+      checkBalanceNow();
+      interval = setInterval(checkBalanceNow, 2500);
     }
     return () => {
       if (interval) clearInterval(interval);
@@ -829,9 +833,14 @@ export default function AttendancePage() {
                 </div>
 
                 <div>
-                  <label htmlFor="phone-number" className="block text-[11px] font-semibold text-[#171719] mb-1.5">
-                    Mobile Money Phone Number
-                  </label>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label htmlFor="phone-number" className="block text-[11px] font-semibold text-[#171719]">
+                      Mobile Money Phone Number
+                    </label>
+                    <span className="text-[10px] font-medium text-[#5e5e63] bg-[#f2f2f4] px-1.5 py-0.5 rounded">
+                      MTN & Airtel Uganda
+                    </span>
+                  </div>
                   <div className="relative">
                     <input
                       type="tel"
@@ -840,11 +849,11 @@ export default function AttendancePage() {
                       value={phoneNumber}
                       onChange={(e) => setPhoneNumber(e.target.value)}
                       className="block w-full px-3 py-2 border border-[#e1e1e5] rounded-[9px] bg-white text-[#171719] text-xs font-mono focus:border-[#007aff] focus:outline-none transition"
-                      placeholder="0770000000"
+                      placeholder="0770 000 000 or 0700 000 000"
                     />
                   </div>
-                  <p className="text-[10px] text-[#85858a] mt-1">
-                    You will receive a Mobile Money PIN prompt on your phone to complete payment.
+                  <p className="text-[10px] text-[#85858a] mt-1 flex items-center gap-1">
+                    <span>Supports 077/078/076 (MTN) and 070/075/074 (Airtel). PIN prompt will appear automatically.</span>
                   </p>
                 </div>
 

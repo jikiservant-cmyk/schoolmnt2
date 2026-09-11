@@ -109,7 +109,17 @@ export async function getDevicePushCandidatesAction(options: PushDeviceTargetOpt
     const adminClient = createAdminClient();
     const { deviceSerialNumber, category, classId } = options;
 
-    let schoolId: string | null = null;
+    const supabase = await createClient();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) {
+      return { error: 'Not authenticated.' };
+    }
+
+    const schoolId = await resolveSchoolId(supabase, user.id);
+    if (!schoolId) {
+      return { error: 'No school tenant found for the current user.' };
+    }
+
     let schoolName = 'Connected School';
 
     if (deviceSerialNumber && deviceSerialNumber.trim()) {
@@ -117,25 +127,15 @@ export async function getDevicePushCandidatesAction(options: PushDeviceTargetOpt
       const { data: deviceRecord } = await adminClient
         .from('devices')
         .select('id, serial_number, school_id, schools:school_id(name)')
+        .eq('school_id', schoolId)
         .ilike('serial_number', cleanSerial)
         .maybeSingle();
 
-      if (deviceRecord?.school_id) {
-        schoolId = deviceRecord.school_id;
-        schoolName = (deviceRecord.schools as any)?.name || schoolName;
+      if (!deviceRecord) {
+        return { error: 'Device not found or access denied.' };
       }
-    }
-
-    if (!schoolId) {
-      const supabase = await createClient();
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        schoolId = await resolveSchoolId(supabase, user.id);
-      }
-    }
-
-    if (!schoolId) {
-      return { error: 'No school tenant found for this device.' };
+      
+      schoolName = (deviceRecord.schools as any)?.name || schoolName;
     }
 
     let query = adminClient
@@ -209,7 +209,17 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
     const adminClient = createAdminClient();
     const { deviceSerialNumber, category = 'all', classId } = options;
 
-    let schoolId: string | null = null;
+    const supabase = await createClient();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) {
+      return { error: 'Not authenticated.' };
+    }
+
+    const schoolId = await resolveSchoolId(supabase, user.id);
+    if (!schoolId) {
+      return { error: 'Could not determine the school context for this device push.' };
+    }
+
     let schoolName = 'Connected School';
 
     // 1. Resolve school from the target device to guarantee multi-tenant scoping
@@ -218,26 +228,15 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       const { data: deviceRecord } = await adminClient
         .from('devices')
         .select('id, serial_number, school_id, schools:school_id(name)')
+        .eq('school_id', schoolId)
         .ilike('serial_number', cleanSerial)
         .maybeSingle();
 
-      if (deviceRecord?.school_id) {
-        schoolId = deviceRecord.school_id;
-        schoolName = (deviceRecord.schools as any)?.name || schoolName;
+      if (!deviceRecord) {
+        return { error: 'Device not found or access denied.' };
       }
-    }
-
-    // 2. Fallback to signed-in user's school if device has no explicit school_id
-    if (!schoolId) {
-      const supabase = await createClient();
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        schoolId = await resolveSchoolId(supabase, user.id);
-      }
-    }
-
-    if (!schoolId) {
-      return { error: 'Could not determine the school context for this device push.' };
+      
+      schoolName = (deviceRecord.schools as any)?.name || schoolName;
     }
 
     // 3. Query people strictly scoped to this school_id
@@ -354,7 +353,17 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
     const adminClient = createAdminClient();
     const { deviceSerialNumber, category = 'all', classId } = options;
 
-    let schoolId: string | null = null;
+    const supabase = await createClient();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) {
+      return { error: 'Not authenticated.' };
+    }
+
+    const schoolId = await resolveSchoolId(supabase, user.id);
+    if (!schoolId) {
+      return { error: 'Could not determine school context.' };
+    }
+
     let schoolName = 'Connected School';
 
     if (deviceSerialNumber && deviceSerialNumber.trim()) {
@@ -362,25 +371,15 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
       const { data: deviceRecord } = await adminClient
         .from('devices')
         .select('id, serial_number, school_id, schools:school_id(name)')
+        .eq('school_id', schoolId)
         .ilike('serial_number', cleanSerial)
         .maybeSingle();
 
-      if (deviceRecord?.school_id) {
-        schoolId = deviceRecord.school_id;
-        schoolName = (deviceRecord.schools as any)?.name || schoolName;
+      if (!deviceRecord) {
+        return { error: 'Device not found or access denied.' };
       }
-    }
-
-    if (!schoolId) {
-      const supabase = await createClient();
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        schoolId = await resolveSchoolId(supabase, user.id);
-      }
-    }
-
-    if (!schoolId) {
-      return { error: 'Could not determine school context.' };
+      
+      schoolName = (deviceRecord.schools as any)?.name || schoolName;
     }
 
     // 1. Fetch all people in school to find highest existing numeric PIN

@@ -28,12 +28,19 @@ export async function updateSession(request: NextRequest) {
           return request.cookies.getAll()
         },
         setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value, options }) => request.cookies.set(name, value))
+          cookiesToSet.forEach(({ name, value, options }) =>
+            request.cookies.set(name, value)
+          )
           supabaseResponse = NextResponse.next({
             request,
           })
           cookiesToSet.forEach(({ name, value, options }) =>
-            supabaseResponse.cookies.set(name, value, options)
+            supabaseResponse.cookies.set(name, value, {
+              ...options,
+              path: '/',
+              sameSite: 'none',
+              secure: true,
+            })
           )
         },
       },
@@ -54,14 +61,22 @@ export async function updateSession(request: NextRequest) {
   if (!user && (pathname.startsWith('/dashboard') || pathname.startsWith('/mark-attendance'))) {
     const url = request.nextUrl.clone()
     url.pathname = '/login'
-    return NextResponse.redirect(url)
+    const redirectResponse = NextResponse.redirect(url)
+    supabaseResponse.headers.getSetCookie().forEach((cookieStr) => {
+      redirectResponse.headers.append('Set-Cookie', cookieStr)
+    })
+    return redirectResponse
   }
 
   // Redirect authenticated user away from login/signup
-  if (user && (pathname === '/login' || pathname === '/signup')) {
+  if (user && (pathname === '/login' || pathname === '/signup' || pathname === '/')) {
     const url = request.nextUrl.clone()
     url.pathname = '/dashboard'
-    return NextResponse.redirect(url)
+    const redirectResponse = NextResponse.redirect(url)
+    supabaseResponse.headers.getSetCookie().forEach((cookieStr) => {
+      redirectResponse.headers.append('Set-Cookie', cookieStr)
+    })
+    return redirectResponse
   }
 
   // IMPORTANT: You *must* return the supabaseResponse object as it is. If you're

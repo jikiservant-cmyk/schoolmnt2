@@ -386,20 +386,26 @@ export async function resetTeacherPinAction(personId: string) {
     return { error: 'Not authenticated. Please log in.' };
   }
 
+  const schoolId = await getEffectiveSchoolId(supabase, user.id);
+  if (!schoolId) {
+    return { error: 'Failed to resolve your school context.' };
+  }
+
   try {
-    // 1. Verify target person is a teacher
-    const { data: person, error: pErr } = await supabase
+    // 1. Verify target person is a teacher and belongs to the caller's school
+    const adminClient = createAdminClient();
+    const { data: person, error: pErr } = await adminClient
       .from('people')
-      .select('id, full_name, role')
+      .select('id, full_name, role, school_id')
       .eq('id', personId)
+      .eq('school_id', schoolId)
       .single();
 
     if (pErr || !person || person.role !== 'teacher') {
-      return { error: 'Teacher record not found.' };
+      return { error: 'Teacher record not found or access denied.' };
     }
 
     // 2. Auto-generate a unique 6-character PIN (e.g. T7K9M2)
-    const adminClient = createAdminClient();
     const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
     const { data: existingStaff } = await adminClient
@@ -475,6 +481,11 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
     return { error: 'Not authenticated. Please log in.' };
   }
 
+  const schoolId = await getEffectiveSchoolId(supabase, user.id);
+  if (!schoolId) {
+    return { error: 'Failed to resolve your school context.' };
+  }
+
   try {
     const adminClient = createAdminClient();
     const cleanUid = deviceUserId && deviceUserId.trim() ? deviceUserId.trim() : null;
@@ -484,10 +495,11 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
       .from('people')
       .select('id, full_name, role, school_id, class_id, classes:class_id(name)')
       .eq('id', personId)
+      .eq('school_id', schoolId)
       .single();
 
     if (pErr || !person) {
-      return { error: 'Person record not found.' };
+      return { error: 'Person record not found or access denied.' };
     }
 
     // 2. If UID is being set, ensure it's not already used by another person in the same school

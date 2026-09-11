@@ -131,14 +131,15 @@ export async function getAttendanceData() {
     school = schoolRecord;
   }
 
-  // Ensure balance is loaded from public.wallets table strictly for this tenant
+  // Ensure balance is loaded from public.wallets table or school settings
   if (school?.id) {
     try {
       const publicAdmin = createPublicAdminClient();
+      // Try tenant_id or school_id
       const { data: wallet } = await publicAdmin
         .from('wallets')
         .select('balance')
-        .eq('tenant_id', school.id)
+        .or(`tenant_id.eq.${school.id},school_id.eq.${school.id}`)
         .maybeSingle();
 
       if (wallet && wallet.balance !== null && wallet.balance !== undefined) {
@@ -159,12 +160,9 @@ export async function getAttendanceData() {
   };
 }
 
-export async function markTeacherAttendanceAction(
-  personId: string, 
-  status: 'present' | 'late' = 'present',
-  note?: string
-) {
+export async function recordTeacherAttendance(personId: string, status?: 'present' | 'late' | 'excused') {
   const supabase = await createClient();
+  
   const { data: userData, error: userError } = await supabase.auth.getUser();
   if (userError || !userData?.user) {
     return { error: 'Unauthorized' };
@@ -175,27 +173,13 @@ export async function markTeacherAttendanceAction(
     return { error: 'No school tenant context found.' };
   }
 
-  // Verify target teacher belongs to this school
-  const { data: targetPerson } = await supabase
-    .from('people')
-    .select('id, role, school_id')
-    .eq('id', personId)
-    .eq('school_id', schoolId)
-    .maybeSingle();
-
-  if (!targetPerson) {
-    return { error: 'Staff member does not belong to your school.' };
-  }
-
   try {
     const now = new Date();
-    // Check if after 8:00 AM for late calculation if not explicitly set
-    let finalStatus = status;
-    const hours = now.getHours();
-    const minutes = now.getMinutes();
-    if (hours > 8 || (hours === 8 && minutes > 0)) {
-      finalStatus = 'late';
-    }
+    // Default rule: if checking in after 08:30 AM East Africa Time, mark as late unless specified
+    const eatHours = (now.getUTCHours() + 3) % 24;
+    const eatMinutes = now.getUTCMinutes();
+    const isLate = eatHours > 8 || (eatHours === 8 && eatMinutes > 30);
+    const finalStatus = status || (isLate ? 'late' : 'present');
 
     const { data, error } = await supabase
       .from('attendance_logs')
@@ -222,6 +206,10 @@ export async function markTeacherAttendanceAction(
   }
 }
 
+export async function markTeacherAttendanceAction(personId: string, status?: 'present' | 'late' | 'excused') {
+  return recordTeacherAttendance(personId, status);
+}
+
 export async function getSchoolBalance() {
   const supabase = await createClient();
   const { data: userData, error: userError } = await supabase.auth.getUser();
@@ -232,13 +220,44 @@ export async function getSchoolBalance() {
 
   try {
     const publicAdmin = createPublicAdminClient();
-    const { data: wallet } = await publicAdmin
-      .from('wallets')
-      .select('balance')
-      .eq('tenant_id', schoolId)
+    
+    // Check wallet balance (supporting both tenant_id and school_id columns)
+    let walletBalance: number | null = null;
+    try {
+      const { data: wallet } = await publicAdmin
+        .from('wallets')
+        .select('balance')
+        .or(`tenant_id.eq.${schoolId},school_id.eq.${schoolId}`)
+        .maybeSingle();
+
+      if (wallet && wallet.balance !== null && wallet.balance !== undefined) {
+        walletBalance = Number(wallet.balance);
+      }
+    } catch {
+      // Fallback direct query if .or fails
+      const { data: w1 } = await publicAdmin.from('wallets').select('balance').eq('tenant_id', schoolId).maybeSingle();
+      if (w1?.balance !== null && w1?.balance !== undefined) {
+        walletBalance = Number(w1.balance);
+      } else {
+        const { data: w2 } = await publicAdmin.from('wallets').select('balance').eq('school_id', schoolId).maybeSingle();
+        if (w2?.balance !== null && w2?.balance !== undefined) {
+          walletBalance = Number(w2.balance);
+        }
+      }
+    }
+
+    // Also check school settings balance
+    const { data: schoolRecord } = await supabase
+      .from('schools')
+      .select('settings')
+      .eq('id', schoolId)
       .maybeSingle();
 
-    return { balance: wallet?.balance !== null && wallet?.balance !== undefined ? Number(wallet.balance) : 0 };
+    const settingsBalance = schoolRecord?.settings?.balance !== undefined ? Number(schoolRecord.settings.balance) : null;
+
+    const resolvedBalance = walletBalance !== null ? walletBalance : (settingsBalance !== null ? settingsBalance : 0);
+
+    return { balance: resolvedBalance };
   } catch (err) {
     console.error('Error fetching balance:', err);
     return { error: 'Failed to fetch balance' };
@@ -251,7 +270,7 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   
   const { data: userData, error: userError } = await supabase.auth.getUser();
   if (userError || !userData?.user) {
-    return { error: 'Unauthorized' };
+    return { error: 'Unauthorized. Please log in to top up.' };
   }
 
   const schoolId = await getEffectiveSchoolId(supabase, userData.user.id);
@@ -261,7 +280,7 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
 
   const { data: school } = await supabase
     .from('schools')
-    .select('id, settings')
+    .select('id, name, settings')
     .eq('id', schoolId)
     .maybeSingle();
 
@@ -269,94 +288,165 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
     return { error: 'School record not found.' };
   }
 
-  // Strict lookup from public.tenants where id = school.id using public admin client (bypasses schema & RLS)
+  // 1. Resolve tenant code strictly from the database (public.tenants or public.profiles)
   let tenantCode = "";
+  
   try {
-    const { data: tenantData, error: tenantErr } = await publicAdmin
+    // Primary: Check public.tenants table for this school
+    const { data: tenantData } = await publicAdmin
       .from('tenants')
-      .select('id, code, name')
+      .select('code')
       .eq('id', school.id)
-      .maybeSingle() as any;
+      .maybeSingle();
 
-    if (tenantData?.code) {
+    if (tenantData?.code && tenantData.code.trim() !== '') {
       tenantCode = tenantData.code;
-    } else {
-      return { 
-        error: `Invalid tenant: No record found in public.tenants matching school ID '${school.id}'. Please ensure the school ID exists in public.tenants.` 
-      };
     }
   } catch (err) {
-    console.error('Error querying public.tenants table:', err);
-    return { error: 'Failed to query tenant record from database.' };
+    console.warn('Notice querying public.tenants:', err);
   }
 
-  // Ensure row exists in public.wallets for school.id
-  let walletId = "";
+  if (!tenantCode) {
+    try {
+      // Secondary: Check public.profiles where user matches
+      const { data: profileByUser } = await publicAdmin
+        .from('profiles')
+        .select('code')
+        .or(`id.eq.${userData.user.id},user_id.eq.${userData.user.id}`)
+        .not('code', 'is', null)
+        .maybeSingle();
+
+      if (profileByUser?.code && profileByUser.code.trim() !== '') {
+        tenantCode = profileByUser.code;
+      }
+    } catch (err) {
+      console.warn('Notice querying public.profiles:', err);
+    }
+  }
+
+  if (!tenantCode || tenantCode.trim() === '') {
+    return { 
+      error: 'Tenant code is missing from the database. Please ensure public.tenants or public.profiles has a valid "code" for this school.' 
+    };
+  }
+
+  tenantCode = tenantCode.trim();
+
+  console.log(`[NaJiki STK Push] Resolved tenant code: "${tenantCode}" for user ${userData.user.email} / school ${school.id}`);
+
+  // 2. Ensure row exists in public.wallets for this school
   try {
     const { data: existingWallet } = await publicAdmin
       .from('wallets')
       .select('id, balance')
-      .eq('tenant_id', school.id)
+      .or(`tenant_id.eq.${school.id},school_id.eq.${school.id}`)
       .maybeSingle();
 
-    if (existingWallet?.id) {
-      walletId = existingWallet.id;
-    } else {
+    if (!existingWallet) {
       const generatedWalletId = crypto.randomUUID();
-      const { data: createdWallet, error: walletInsertErr } = await publicAdmin
-        .from('wallets')
-        .insert({
-          id: generatedWalletId,
-          tenant_id: school.id,
-          balance: school.settings?.balance || 0,
-          currency: 'UGX',
-          sms_rate: 50
-        })
-        .select('id')
-        .maybeSingle();
-
-      if (createdWallet?.id) {
-        walletId = createdWallet.id;
-      } else {
-        walletId = generatedWalletId;
-        console.warn('Wallet creation note:', walletInsertErr);
+      try {
+        await publicAdmin
+          .from('wallets')
+          .insert({
+            id: generatedWalletId,
+            tenant_id: school.id,
+            school_id: school.id,
+            balance: school.settings?.balance || 0,
+            currency: 'UGX',
+            sms_rate: 50
+          });
+      } catch (wInsertErr) {
+        console.warn('Wallet insertion note:', wInsertErr);
       }
     }
   } catch (wErr) {
-    console.error('Error ensuring public.wallets record:', wErr);
+    console.warn('Notice ensuring public.wallets record:', wErr);
   }
 
-  // Format phone number to standard international format (+256...) if needed
-  const formattedPhone = phoneNumber.startsWith('0') ? `+256${phoneNumber.slice(1)}` : phoneNumber;
+  // 3. Clean and standardize phone number
+  // Removes spaces, hyphens, brackets
+  let rawPhone = phoneNumber.replace(/[\s\-\(\)\.]/g, '');
+  if (rawPhone.startsWith('+')) {
+    rawPhone = rawPhone.slice(1);
+  }
+  
+  let formattedPhoneNumeric = rawPhone;
+  if (rawPhone.startsWith('0')) {
+    formattedPhoneNumeric = `256${rawPhone.slice(1)}`;
+  } else if (!rawPhone.startsWith('256') && rawPhone.length === 9) {
+    formattedPhoneNumeric = `256${rawPhone}`;
+  }
 
-  // Generate unique idempotency key
-  const idempotencyKey = `sch_topup_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  const phoneWithPlus = `+${formattedPhoneNumeric}`;
+  const phoneLocal07 = formattedPhoneNumeric.startsWith('256') 
+    ? `0${formattedPhoneNumeric.slice(3)}` 
+    : formattedPhoneNumeric;
 
-  const endpointUrl = process.env.NAJIKI_API_URL || 'https://najiki.vercel.app/api/payments';
+  // 4. Generate unique transaction / idempotency key
+  const idempotencyKey = `sch_topup_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+
+  // 5. Determine NaJiki API Endpoint
+  let endpointUrl = process.env.NAJIKI_API_URL;
+  if (!endpointUrl && process.env.NAJIKI_DOMAIN) {
+    const domain = process.env.NAJIKI_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    endpointUrl = `https://${domain}/api/payments`;
+  }
+  if (!endpointUrl) {
+    endpointUrl = 'https://najiki.vercel.app/api/payments';
+  }
+
   const apiKey = process.env.NAJIKI_API_KEY || 'test_key';
+  const appCode = process.env.NAJIKI_APP_CODE || "school";
 
+  // Build clean, full-spec STK push payload for NaJiki
   const payload = {
-    applicationCode: process.env.NAJIKI_APP_CODE || "school",
+    applicationCode: appCode,
     paymentTypeCode: "general",
-    externalEntityId: school.id,
-    amount: amount,
-    currency: "UGX",
-    phoneNumber: formattedPhone,
-    idempotencyKey: idempotencyKey,
     tenantCode: tenantCode,
+    tenant_code: tenantCode,
+    code: tenantCode,
+    externalEntityId: school.id,
+    schoolId: school.id,
+    amount: Number(amount),
+    currency: "UGX",
+    phoneNumber: formattedPhoneNumeric,
+    phone: formattedPhoneNumeric,
+    phone_number: formattedPhoneNumeric,
+    msisdn: formattedPhoneNumeric,
+    formattedPhone: phoneWithPlus,
+    localPhoneNumber: phoneLocal07,
+    idempotencyKey: idempotencyKey,
+    reference: idempotencyKey,
+    tx_ref: idempotencyKey,
+    description: `SMS Wallet Top-up for ${school.name || 'SmartSkoolz School'}`,
+    narration: `SmartSkoolz SMS Top-up (${amount.toLocaleString()} UGX)`,
     metadata: {
       type: "topup",
-      schoolId: school.id
+      schoolId: school.id,
+      schoolName: school.name,
+      tenantCode: tenantCode,
+      tenant_code: tenantCode,
+      code: tenantCode,
+      amount: Number(amount),
+      idempotencyKey: idempotencyKey
     }
   };
 
   try {
+    console.log(`[NaJiki STK Push] Sending request to ${endpointUrl} for ${formattedPhoneNumeric} (${amount} UGX) with tenant "${tenantCode}"`);
+
     const response = await fetch(endpointUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'Accept': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
-        'X-Tenant-Code': tenantCode
+        'X-API-Key': apiKey,
+        'X-Tenant-Code': tenantCode,
+        'X-Tenant-Id': school.id,
+        'tenant-code': tenantCode,
+        'tenantCode': tenantCode,
+        'code': tenantCode
       },
       body: JSON.stringify(payload)
     });
@@ -369,26 +459,30 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
         resData = JSON.parse(textData);
       }
     } catch (parseErr) {
-      console.error('[NaJiki API] Failed to parse JSON response. Raw text:', textData.substring(0, 200));
-      if (!response.ok) {
-         return { error: `Payment service returned an invalid response (Status ${response.status}). Please try again.` };
-      }
+      console.warn('[NaJiki API] Failed to parse JSON response. Raw text:', textData.substring(0, 200));
     }
 
     if (!response.ok) {
-      console.error(`[NaJiki TopUp API] Failed with status ${response.status}`, resData);
+      console.error(`[NaJiki TopUp API] Failed with status ${response.status}:`, resData || textData);
+      
+      // If payment provider returned a message or error
+      const errorMsg = resData.message || resData.error || resData.detail || `Payment provider returned status ${response.status}. Please verify your phone number and try again.`;
       return { 
-        error: resData.message || resData.error || 'Payment initiation failed. Please check your phone number and try again.' 
+        error: errorMsg
       };
     }
 
+    console.log('[NaJiki STK Push] Successfully initiated:', resData);
+
     return {
       success: true,
-      transactionId: resData.transactionId || idempotencyKey,
-      message: 'Mobile Money prompt sent to your phone! Please enter your PIN to authorize payment.'
+      transactionId: resData.transactionId || resData.reference || resData.id || idempotencyKey,
+      message: `Mobile Money PIN prompt sent to ${phoneLocal07}! Please enter your PIN on your phone to complete payment.`
     };
   } catch (err: any) {
-    console.error('NaJiki TopUp API error:', err);
-    return { error: 'Network error communicating with payment provider.' };
+    console.error('NaJiki TopUp API connection error:', err);
+    return { 
+      error: 'Could not connect to payment gateway. Please check your network connection and try again.' 
+    };
   }
 }

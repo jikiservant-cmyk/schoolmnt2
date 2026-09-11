@@ -20,24 +20,15 @@ export interface StudentAttendanceStatus {
   check_out_time: string | null;
 }
 
-// In-memory rate limiting map for teacher PIN attempts per class: classId -> { failedCount, lockedUntil }
-const pinAttemptStore = new Map<string, { failedCount: number; lockedUntil: number }>();
+// Durable rate limiting via staff_users table
+// Requires migration: ALTER TABLE staff_users ADD COLUMN failed_attempts INT DEFAULT 0, ADD COLUMN locked_until TIMESTAMPTZ;
 
 export async function verifyTeacherPin(classId: string, pin: string) {
+  // Retain a short delay to mitigate pure brute-force velocity
+  await new Promise(resolve => setTimeout(resolve, 500));
+
   const adminClient = createAdminClient();
   const cleanPin = pin.trim().toUpperCase();
-
-  // 0. Check rate-limiting & lockout
-  const now = Date.now();
-  const lockoutInfo = pinAttemptStore.get(classId);
-  if (lockoutInfo && lockoutInfo.lockedUntil > now) {
-    const remainingSeconds = Math.ceil((lockoutInfo.lockedUntil - now) / 1000);
-    const remainingMins = Math.ceil(remainingSeconds / 60);
-    return {
-      success: false,
-      error: `Too many incorrect attempts. PIN verification is locked for ${remainingMins} minute(s). Please contact your administrator.`
-    };
-  }
 
   // 1. Fetch class to get school_id
   const { data: cls, error: clsError } = await adminClient
@@ -63,21 +54,37 @@ export async function verifyTeacherPin(classId: string, pin: string) {
     return { success: false, error: 'No active teachers found for this school.' };
   }
 
-  // 3. Fetch staff_users pin_hash records for these teachers
+  // 3. Fetch staff_users records for these teachers (now including lockout fields)
   const teacherIds = teachers.map(t => t.id);
   const { data: staffUsers } = await adminClient
     .from('staff_users')
-    .select('id, person_id, pin_hash')
+    .select('id, person_id, pin_hash, failed_attempts, locked_until')
     .in('person_id', teacherIds);
 
   let matchedTeacher = null;
+  let matchedStaffUser = null;
 
   if (staffUsers && staffUsers.length > 0) {
     for (const su of staffUsers) {
       if (su.pin_hash) {
+        // Check if this specific teacher's PIN is locked
+        if (su.locked_until && new Date(su.locked_until).getTime() > Date.now()) {
+          // If we matched the pin while locked, we still reject (preventing discovery of locked accounts)
+          const isMatch = bcrypt.compareSync(cleanPin, su.pin_hash) || bcrypt.compareSync(pin.trim(), su.pin_hash);
+          if (isMatch) {
+            const remainingMins = Math.ceil((new Date(su.locked_until).getTime() - Date.now()) / 60000);
+            return {
+              success: false,
+              error: `Too many incorrect attempts. Verification locked for ${remainingMins} minute(s).`
+            };
+          }
+          continue; // Skip verification for locked users if PIN doesn't match
+        }
+
         const isMatch = bcrypt.compareSync(cleanPin, su.pin_hash) || bcrypt.compareSync(pin.trim(), su.pin_hash);
         if (isMatch) {
           matchedTeacher = teachers.find(t => t.id === su.person_id);
+          matchedStaffUser = su;
           break;
         }
       }
@@ -85,28 +92,40 @@ export async function verifyTeacherPin(classId: string, pin: string) {
   }
 
   if (!matchedTeacher) {
-    // Record failed attempt
-    const current = pinAttemptStore.get(classId) || { failedCount: 0, lockedUntil: 0 };
-    current.failedCount += 1;
-    if (current.failedCount >= 5) {
-      current.lockedUntil = Date.now() + 10 * 60 * 1000; // 10 minutes lockout
-      pinAttemptStore.set(classId, current);
-      return {
-        success: false,
-        error: 'Too many incorrect attempts. Verification locked for 10 minutes for security.'
-      };
-    } else {
-      pinAttemptStore.set(classId, current);
-      const attemptsLeft = 5 - current.failedCount;
-      return {
-        success: false,
-        error: `Invalid Teacher Attendance PIN. (${attemptsLeft} attempt${attemptsLeft === 1 ? '' : 's'} remaining)`
-      };
+    // We don't know *which* teacher they were trying to guess, so we apply the failed attempt
+    // to ALL unlocked teachers in this class as a defensive measure.
+    // In a real system, the user should provide a Teacher ID + PIN to avoid penalizing everyone.
+    // For this design (PIN only), we increment failures globally for the school's teachers.
+    if (staffUsers && staffUsers.length > 0) {
+      const now = new Date();
+      for (const su of staffUsers) {
+        if (!su.locked_until || new Date(su.locked_until).getTime() <= now.getTime()) {
+          const newFailures = (su.failed_attempts || 0) + 1;
+          const updateData: any = { failed_attempts: newFailures };
+          
+          if (newFailures >= 5) {
+            updateData.locked_until = new Date(now.getTime() + 10 * 60 * 1000).toISOString(); // 10 min
+          }
+
+          // Fire and forget update
+          adminClient.from('staff_users').update(updateData).eq('id', su.id).then();
+        }
+      }
     }
+
+    return {
+      success: false,
+      error: 'Invalid Teacher Attendance PIN. Please try again.'
+    };
   }
 
-  // Clear failed attempts on success
-  pinAttemptStore.delete(classId);
+  // Clear failed attempts on success for the matched teacher
+  if (matchedStaffUser && ((matchedStaffUser.failed_attempts || 0) > 0 || matchedStaffUser.locked_until)) {
+    await adminClient
+      .from('staff_users')
+      .update({ failed_attempts: 0, locked_until: null })
+      .eq('id', matchedStaffUser.id);
+  }
 
   return { success: true, teacher: matchedTeacher };
 }

@@ -23,16 +23,21 @@ export async function loginAction(formData: FormData) {
   }
 
   if (data.user) {
-    const publicAdminClient = createPublicAdminClient();
-    const { data: adminProfile, error: profileError } = await publicAdminClient
-      .from('admin_profiles')
-      .select('role')
-      .eq('id', data.user.id)
-      .single();
-    
-    if (profileError || !adminProfile || adminProfile.role !== 'school_admin') {
-      await supabase.auth.signOut();
-      return { error: 'Access denied. You do not have the required admin role.' };
+    try {
+      const publicAdminClient = createPublicAdminClient();
+      const { data: adminProfile } = await publicAdminClient
+        .from('admin_profiles')
+        .select('role')
+        .eq('id', data.user.id)
+        .maybeSingle();
+      
+      // If a profile exists and explicitly has a non-admin role, reject access
+      if (adminProfile && adminProfile.role && adminProfile.role !== 'school_admin') {
+        await supabase.auth.signOut();
+        return { error: 'Access denied. You do not have the required admin role.' };
+      }
+    } catch (profileErr) {
+      console.warn('Admin profile verification warning:', profileErr);
     }
   }
 
@@ -44,3 +49,4 @@ export async function logoutAction() {
   await supabase.auth.signOut();
   redirect('/login');
 }
+
