@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/utils/supabase/admin';
-import { getPendingCommandsForDevice, markCommandProcessed } from '@/utils/zkteco/commandQueue';
 
 // Device polling for server commands (ADMS /iclock/getrequest)
 // Required config to prevent caching the polling endpoint
@@ -49,9 +48,6 @@ export async function GET(req: NextRequest) {
     .order('event_timestamp', { ascending: true })
     .limit(100);
 
-  // 3. Also check in-memory queue for this device
-  const memCmds = getPendingCommandsForDevice(cleanSn);
-
   const commandList: { id: string | number; text: string }[] = [];
   const processedLogIds: string[] = [];
 
@@ -67,18 +63,6 @@ export async function GET(req: NextRequest) {
         });
       }
     });
-  }
-
-  // Add memory queue commands (prevent duplicates)
-  for (const mc of memCmds) {
-    markCommandProcessed(mc.id);
-    const rawCmd = mc.command.trim();
-    if (rawCmd && !commandList.some(c => c.text === rawCmd)) {
-      commandList.push({
-        id: commandList.length + 1,
-        text: rawCmd
-      });
-    }
   }
 
   if (processedLogIds.length > 0) {

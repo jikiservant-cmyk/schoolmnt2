@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useMemo, useTransition } from 'react';
+import React, { useState, useMemo, useTransition, useEffect } from 'react';
 import Link from 'next/link';
 import { 
   Users, 
@@ -20,11 +20,13 @@ import {
   Edit2,
   Check,
   Loader2,
-  AlertCircle
+  AlertCircle,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import AddPersonForm from './AddPersonForm';
 import TeacherPinManager from './TeacherPinManager';
-import { updatePersonDeviceUserIdAction } from './actions';
+import { updatePersonDeviceUserIdAction, searchPeopleAction } from './actions';
 
 interface SchoolClass {
   id: string;
@@ -41,21 +43,37 @@ interface Person {
   is_active?: boolean | null;
 }
 
+interface PeopleCounts {
+  total: number;
+  students: number;
+  teachers: number;
+  supportStaff: number;
+  admins: number;
+  withBiometric: number;
+}
+
 interface PeopleDirectoryClientProps {
-  initialPeople: Person[];
   classes: SchoolClass[];
   initialRoleFilter?: string;
+  initialCounts: PeopleCounts;
 }
 
 export default function PeopleDirectoryClient({
-  initialPeople,
   classes,
-  initialRoleFilter = 'all'
+  initialRoleFilter = 'all',
+  initialCounts
 }: PeopleDirectoryClientProps) {
   const [searchTerm, setSearchTerm] = useState('');
   const [roleFilter, setRoleFilter] = useState<string>(initialRoleFilter);
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'inactive'>('all');
   const [showAddModal, setShowAddModal] = useState(false);
+  
+  // Data state
+  const [people, setPeople] = useState<Person[]>([]);
+  const [totalFilteredCount, setTotalFilteredCount] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
+  const [page, setPage] = useState(1);
+  const limit = 50;
 
   // Quick edit biometric UID modal
   const [editingPerson, setEditingPerson] = useState<Person | null>(null);
@@ -63,6 +81,79 @@ export default function PeopleDirectoryClient({
   const [isPending, startTransition] = useTransition();
   const [uidError, setUidError] = useState<string | null>(null);
   const [uidSuccess, setUidSuccess] = useState<string | null>(null);
+
+  // We move the fetch function inside useEffect to avoid dependencies or just define it above
+  useEffect(() => {
+    let active = true;
+    
+    const fetchFiltered = async () => {
+      setIsLoading(true);
+      try {
+        const res = await searchPeopleAction({
+          searchTerm,
+          roleFilter,
+          statusFilter,
+          page: 1, // When filters change, we explicitly fetch page 1
+          limit
+        });
+        if (active) {
+          if (res.success) {
+            setPeople(res.data);
+            setTotalFilteredCount(res.count);
+          }
+          // We can't synchronously call setPage(1) here and let another effect fire.
+          // Instead we just update the page state but skip the secondary effect fetching.
+          // Better yet, let's keep it simple: filter changes fetch page 1 directly.
+          if (page !== 1) {
+             setPage(1);
+          }
+        }
+      } catch (e) {
+        console.error(e);
+      } finally {
+        if (active) setIsLoading(false);
+      }
+    };
+    
+    fetchFiltered();
+    
+    return () => { active = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchTerm, roleFilter, statusFilter]);
+
+  useEffect(() => {
+    let active = true;
+    
+    // Only fetch if page > 1 or page changes without filter changing
+    // The filter effect handles page 1 resets
+    if (page === 1) return;
+    
+    const fetchPage = async () => {
+      setIsLoading(true);
+      try {
+        const res = await searchPeopleAction({
+          searchTerm,
+          roleFilter,
+          statusFilter,
+          page: page,
+          limit
+        });
+        if (active && res.success) {
+          setPeople(res.data);
+          setTotalFilteredCount(res.count);
+        }
+      } catch (e) {
+        console.error(e);
+      } finally {
+        if (active) setIsLoading(false);
+      }
+    };
+    
+    fetchPage();
+    
+    return () => { active = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
 
   const openEditUidModal = (person: Person) => {
     setEditingPerson(person);
@@ -103,43 +194,10 @@ export default function PeopleDirectoryClient({
     return map;
   }, [classes]);
 
-  // Counts
-  const counts = useMemo(() => {
-    const total = initialPeople.length;
-    const students = initialPeople.filter(p => p.role === 'student').length;
-    const teachers = initialPeople.filter(p => p.role === 'teacher').length;
-    const supportStaff = initialPeople.filter(p => p.role === 'support_staff').length;
-    const admins = initialPeople.filter(p => p.role === 'admin').length;
-    const withBiometric = initialPeople.filter(p => !!p.device_user_id).length;
-    return { total, students, teachers, supportStaff, admins, withBiometric };
-  }, [initialPeople]);
+  const counts = initialCounts;
+  const filteredPeople = people;
 
-  // Filtered people
-  const filteredPeople = useMemo(() => {
-    return initialPeople.filter(p => {
-      // Role filter
-      if (roleFilter !== 'all' && p.role !== roleFilter) {
-        return false;
-      }
-      // Status filter
-      if (statusFilter === 'active' && !p.is_active) return false;
-      if (statusFilter === 'inactive' && p.is_active) return false;
-
-      // Search query
-      if (searchTerm.trim()) {
-        const query = searchTerm.toLowerCase();
-        const nameMatch = p.full_name?.toLowerCase().includes(query);
-        const phoneMatch = p.phone?.toLowerCase().includes(query);
-        const uidMatch = p.device_user_id?.toLowerCase().includes(query);
-        const className = p.class_id ? classMap.get(p.class_id)?.toLowerCase() : '';
-        const classMatch = className?.includes(query);
-
-        return nameMatch || phoneMatch || uidMatch || classMatch;
-      }
-
-      return true;
-    });
-  }, [initialPeople, roleFilter, statusFilter, searchTerm, classMap]);
+  const totalPages = Math.ceil(totalFilteredCount / limit);
 
   return (
     <div className="space-y-6 pt-5 animate-fade-in">
@@ -516,11 +574,30 @@ export default function PeopleDirectoryClient({
         {/* Table Footer */}
         <div className="p-3.5 bg-[#fafafa] border-t border-[#f1f1f4] flex items-center justify-between text-xs text-[#85858a]">
           <div>
-            Showing <strong className="text-[#171719]">{filteredPeople.length}</strong> of{' '}
-            <strong className="text-[#171719]">{initialPeople.length}</strong> registered persons
+            Showing <strong className="text-[#171719]">{filteredPeople.length}</strong> on this page out of{' '}
+            <strong className="text-[#171719]">{totalFilteredCount}</strong> matching persons
           </div>
-          <div className="text-[11px] text-[#929297]">
-            Scroll horizontally to view all attributes
+          <div className="flex items-center gap-4">
+            {isLoading && <Loader2 className="w-4 h-4 animate-spin text-[#007aff]" />}
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setPage(p => Math.max(1, p - 1))}
+                disabled={page === 1 || isLoading}
+                className="p-1 rounded hover:bg-[#e7e7ea] disabled:opacity-50 transition cursor-pointer"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <span className="px-2 font-medium">Page {page} of {totalPages || 1}</span>
+              <button
+                type="button"
+                onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                disabled={page >= totalPages || isLoading}
+                className="p-1 rounded hover:bg-[#e7e7ea] disabled:opacity-50 transition cursor-pointer"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
           </div>
         </div>
 

@@ -474,6 +474,61 @@ export async function resetTeacherPinAction(personId: string) {
   }
 }
 
+export async function searchPeopleAction(params: {
+  searchTerm?: string;
+  roleFilter?: string;
+  statusFilter?: string;
+  page?: number;
+  limit?: number;
+}) {
+  const supabase = await createClient();
+  const { data: userData } = await supabase.auth.getUser();
+  if (!userData?.user) return { error: 'Unauthorized', data: [], count: 0 };
+
+  const schoolId = await getEffectiveSchoolId(supabase, userData.user.id);
+  if (!schoolId) return { error: 'No school tenant found', data: [], count: 0 };
+
+  let query = supabase
+    .from('people')
+    .select('id, full_name, role, class_id, device_user_id, phone, is_active', { count: 'exact' })
+    .eq('school_id', schoolId);
+
+  if (params.roleFilter && params.roleFilter !== 'all') {
+    query = query.eq('role', params.roleFilter);
+  }
+  
+  if (params.statusFilter === 'active') {
+    query = query.eq('is_active', true);
+  } else if (params.statusFilter === 'inactive') {
+    query = query.eq('is_active', false);
+  }
+
+  if (params.searchTerm && params.searchTerm.trim() !== '') {
+    const st = params.searchTerm.trim();
+    // ilike on full_name, phone, device_user_id
+    query = query.or(`full_name.ilike.%${st}%,phone.ilike.%${st}%,device_user_id.ilike.%${st}%`);
+  }
+
+  // order by full name
+  query = query.order('full_name', { ascending: true });
+
+  const page = params.page || 1;
+  const limit = params.limit || 50;
+  const from = (page - 1) * limit;
+  const to = from + limit - 1;
+
+  query = query.range(from, to);
+
+  const { data, count, error } = await query;
+  
+  if (error) {
+    console.error('searchPeopleAction error:', error);
+    return { error: error.message, data: [], count: 0 };
+  }
+
+  return { success: true, data: data || [], count: count || 0 };
+}
+
 export async function updatePersonDeviceUserIdAction(personId: string, deviceUserId: string | null) {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();

@@ -5,6 +5,7 @@ import {
   verifyTeacherPin, 
   getStudentsForClass, 
   submitClassAttendance,
+  getTeachersForClass,
   type StudentAttendanceStatus 
 } from './actions';
 import { 
@@ -30,9 +31,28 @@ export default function ManualAttendancePage() {
   const classId = params.classId as string;
 
   const [pin, setPin] = useState('');
+  const [selectedTeacherId, setSelectedTeacherId] = useState('');
+  const [availableTeachers, setAvailableTeachers] = useState<{ id: string; full_name: string }[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingTeachers, setLoadingTeachers] = useState(true);
   const [error, setError] = useState('');
   const [teacher, setTeacher] = useState<{ id: string; full_name: string } | null>(null);
+  
+  useEffect(() => {
+    async function loadTeachers() {
+      try {
+        const res = await getTeachersForClass(classId);
+        if (res.success && res.teachers) {
+          setAvailableTeachers(res.teachers);
+        }
+      } catch (err) {
+        console.error('Failed to load teachers', err);
+      } finally {
+        setLoadingTeachers(false);
+      }
+    }
+    loadTeachers();
+  }, [classId]);
   
   const [students, setStudents] = useState<StudentAttendanceStatus[]>([]);
   const [activeMode, setActiveMode] = useState<'check_in' | 'check_out'>('check_in');
@@ -95,13 +115,13 @@ export default function ManualAttendancePage() {
 
   const handlePinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!pin) return;
+    if (!pin || !selectedTeacherId) return;
     
     setLoading(true);
     setError('');
     
     try {
-      const res = await verifyTeacherPin(classId, pin);
+      const res = await verifyTeacherPin(classId, selectedTeacherId, pin);
       if (res.success && res.teacher) {
         setTeacher(res.teacher);
         await fetchStudents(true);
@@ -248,17 +268,41 @@ export default function ManualAttendancePage() {
           </div>
 
           <form onSubmit={handlePinSubmit} className="space-y-4">
-            <div>
-              <input
-                type="password"
-                placeholder="Enter your PIN..."
-                value={pin}
-                onChange={(e) => setPin(e.target.value)}
-                className="w-full bg-meridian-background border border-meridian-border rounded-xl px-4 py-3 text-center text-xl tracking-[0.5em] text-meridian-text-1 focus:outline-none focus:border-meridian-gold transition-colors"
-                maxLength={8}
-                autoFocus
-              />
-            </div>
+            {loadingTeachers ? (
+              <div className="flex justify-center p-4">
+                <Loader2 className="w-6 h-6 animate-spin text-meridian-gold" />
+              </div>
+            ) : availableTeachers.length === 0 ? (
+              <div className="text-center text-meridian-text-3 text-sm p-4 bg-meridian-background rounded-xl border border-meridian-border">
+                No active teachers found for this class.
+              </div>
+            ) : (
+              <>
+                <div>
+                  <select
+                    value={selectedTeacherId}
+                    onChange={(e) => setSelectedTeacherId(e.target.value)}
+                    className="w-full bg-meridian-background border border-meridian-border rounded-xl px-4 py-3 text-meridian-text-1 focus:outline-none focus:border-meridian-gold transition-colors"
+                  >
+                    <option value="" disabled>Select Teacher...</option>
+                    {availableTeachers.map(t => (
+                      <option key={t.id} value={t.id}>{t.full_name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <input
+                    type="password"
+                    placeholder="Enter your PIN..."
+                    value={pin}
+                    onChange={(e) => setPin(e.target.value)}
+                    className="w-full bg-meridian-background border border-meridian-border rounded-xl px-4 py-3 text-center text-xl tracking-[0.5em] text-meridian-text-1 focus:outline-none focus:border-meridian-gold transition-colors"
+                    maxLength={8}
+                    disabled={!selectedTeacherId}
+                  />
+                </div>
+              </>
+            )}
             
             {error && (
               <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-sm">
@@ -269,7 +313,7 @@ export default function ManualAttendancePage() {
 
             <button
               type="submit"
-              disabled={loading || !pin}
+              disabled={loading || !pin || !selectedTeacherId}
               className="w-full py-3 bg-meridian-gold text-meridian-background rounded-xl font-medium tracking-wide flex items-center justify-center gap-2 hover:bg-meridian-gold-dim transition disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : 'Authenticate'}

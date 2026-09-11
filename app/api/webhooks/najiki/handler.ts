@@ -157,86 +157,88 @@ export async function handleNajikiWebhook(req: NextRequest) {
         }
 
         // 2. Direct database update fallback (wallets + schools settings + transactions)
-        try {
-          // Find existing wallet by tenant_id or school_id
-          let { data: walletData } = await publicAdmin
-            .from('wallets')
-            .select('id, balance')
-            .or(`tenant_id.eq.${targetSchoolId},school_id.eq.${targetSchoolId}`)
-            .maybeSingle();
-
-          let walletId = walletData?.id;
-          const currentBal = Number(walletData?.balance || 0);
-          const newBal = currentBal + amount;
-
-          if (!walletData) {
-            const genId = crypto.randomUUID();
-            const { data: newWallet } = await publicAdmin
-              .from('wallets')
-              .insert({ 
-                id: genId,
-                school_id: targetSchoolId, 
-                tenant_id: targetSchoolId,
-                balance: amount,
-                currency: 'UGX',
-                sms_rate: 50
-              })
-              .select('id')
-              .maybeSingle();
-            walletId = newWallet?.id || genId;
-          } else {
-            await publicAdmin
-              .from('wallets')
-              .update({ balance: newBal })
-              .eq('id', walletId);
-          }
-
-          // 3. Keep schools.settings.balance in sync
+        if (!credited) {
           try {
-            const { data: schoolRecord } = await publicAdmin
-              .from('schools')
-              .select('id, settings')
-              .eq('id', targetSchoolId)
+            // Find existing wallet by tenant_id or school_id
+            let { data: walletData } = await publicAdmin
+              .from('wallets')
+              .select('id, balance')
+              .or(`tenant_id.eq.${targetSchoolId},school_id.eq.${targetSchoolId}`)
               .maybeSingle();
 
-            if (schoolRecord) {
-              const currentSettings = schoolRecord.settings || {};
-              await publicAdmin
-                .from('schools')
-                .update({
-                  settings: {
-                    ...currentSettings,
-                    balance: (Number(currentSettings.balance) || 0) + amount
-                  }
+            let walletId = walletData?.id;
+            const currentBal = Number(walletData?.balance || 0);
+            const newBal = currentBal + amount;
+
+            if (!walletData) {
+              const genId = crypto.randomUUID();
+              const { data: newWallet } = await publicAdmin
+                .from('wallets')
+                .insert({ 
+                  id: genId,
+                  school_id: targetSchoolId, 
+                  tenant_id: targetSchoolId,
+                  balance: amount,
+                  currency: 'UGX',
+                  sms_rate: 50
                 })
-                .eq('id', targetSchoolId);
+                .select('id')
+                .maybeSingle();
+              walletId = newWallet?.id || genId;
+            } else {
+              await publicAdmin
+                .from('wallets')
+                .update({ balance: newBal })
+                .eq('id', walletId);
             }
-          } catch (schErr) {
-            console.warn('[NaJiki Webhook] Notice updating schools.settings:', schErr);
-          }
 
-          // 4. Record transaction
-          if (walletId) {
+            // 3. Keep schools.settings.balance in sync
             try {
-              await publicAdmin.from('transactions').insert({
-                wallet_id: walletId,
-                amount: amount,
-                type: 'credit',
-                reference: txRef,
-                status: 'completed',
-                description: `NaJiki Mobile Money Top-up (+${amount.toLocaleString()} UGX)`
-              });
-            } catch (tErr) {
-              console.warn('[NaJiki Webhook] Notice inserting transactions row:', tErr);
-            }
-          }
+              const { data: schoolRecord } = await publicAdmin
+                .from('schools')
+                .select('id, settings')
+                .eq('id', targetSchoolId)
+                .maybeSingle();
 
-          credited = true;
-          console.log(`[NaJiki Webhook] Successfully credited wallet. New balance: ${newBal} UGX`);
-        } catch (dbErr) {
-          console.error('[NaJiki Webhook] Database fallback error:', dbErr);
-          if (!credited) {
-            return NextResponse.json({ error: 'Failed to credit wallet' }, { status: 500 });
+              if (schoolRecord) {
+                const currentSettings = schoolRecord.settings || {};
+                await publicAdmin
+                  .from('schools')
+                  .update({
+                    settings: {
+                      ...currentSettings,
+                      balance: (Number(currentSettings.balance) || 0) + amount
+                    }
+                  })
+                  .eq('id', targetSchoolId);
+              }
+            } catch (schErr) {
+              console.warn('[NaJiki Webhook] Notice updating schools.settings:', schErr);
+            }
+
+            // 4. Record transaction
+            if (walletId) {
+              try {
+                await publicAdmin.from('transactions').insert({
+                  wallet_id: walletId,
+                  amount: amount,
+                  type: 'credit',
+                  reference: txRef,
+                  status: 'completed',
+                  description: `NaJiki Mobile Money Top-up (+${amount.toLocaleString()} UGX)`
+                });
+              } catch (tErr) {
+                console.warn('[NaJiki Webhook] Notice inserting transactions row:', tErr);
+              }
+            }
+
+            credited = true;
+            console.log(`[NaJiki Webhook] Successfully credited wallet (fallback). New balance: ${newBal} UGX`);
+          } catch (dbErr) {
+            console.error('[NaJiki Webhook] Database fallback error:', dbErr);
+            if (!credited) {
+              return NextResponse.json({ error: 'Failed to credit wallet' }, { status: 500 });
+            }
           }
         }
 

@@ -1,15 +1,5 @@
 import { createAdminClient } from '@/utils/supabase/admin';
 
-interface QueuedCommand {
-  id: string;
-  command: string;
-  deviceSerialNumber?: string;
-  createdAt: number;
-}
-
-// In-memory fallback queue for active ADMS polling
-const globalCommandQueue: QueuedCommand[] = [];
-
 /**
  * Enqueues a command to be fetched by the ZKTeco ADMS terminal during its next heartbeat
  */
@@ -50,42 +40,13 @@ export async function enqueueDeviceCommand(
 
     if (insertErr) {
       console.warn('[ZKTeco ADMS] Persisting command to device_logs warning:', insertErr.message);
+      return { success: false, commandId };
     }
   } catch (e: any) {
     console.warn('[ZKTeco ADMS] Could not persist command to DB:', e?.message || e);
+    return { success: false, commandId };
   }
-
-  // Push to memory queue for instant dispatch in same node process
-  globalCommandQueue.push({
-    id: commandId,
-    command,
-    deviceSerialNumber: cleanSn,
-    createdAt: Date.now(),
-  });
 
   return { success: true, commandId };
-}
-
-/**
- * Retrieves pending commands for a specific device serial number
- */
-export function getPendingCommandsForDevice(deviceSerialNumber?: string): QueuedCommand[] {
-  if (!deviceSerialNumber) {
-    return [...globalCommandQueue];
-  }
-  const cleanSn = deviceSerialNumber.trim().toUpperCase();
-  return globalCommandQueue.filter(
-    (c) => !c.deviceSerialNumber || c.deviceSerialNumber === cleanSn || c.deviceSerialNumber === 'ALL'
-  );
-}
-
-/**
- * Clears processed commands from in-memory queue
- */
-export function markCommandProcessed(commandId: string): void {
-  const index = globalCommandQueue.findIndex((c) => c.id === commandId);
-  if (index !== -1) {
-    globalCommandQueue.splice(index, 1);
-  }
 }
 

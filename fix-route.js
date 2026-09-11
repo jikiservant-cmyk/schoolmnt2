@@ -1,82 +1,9 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { createAdminClient } from '@/utils/supabase/admin';
-import { isWithinAttendanceSmsWindow } from '@/lib/attendance-window';
+const fs = require('fs');
 
-// Helper to authenticate ZKTeco terminal
-async function authenticateDevice(req: NextRequest, sn: string | null) {
-  if (!sn || !sn.trim()) {
-    return { authenticated: false, reason: 'Missing device serial number (SN)' };
-  }
+const path = 'app/iclock/cdata/route.ts';
+let content = fs.readFileSync(path, 'utf8');
 
-  const cleanSn = sn.trim().toUpperCase();
-  const supabase = createAdminClient();
-
-  const { data: device, error } = await supabase
-    .from('devices')
-    .select('id, school_id, is_active, label')
-    .ilike('serial_number', cleanSn)
-    .maybeSingle();
-
-  if (error || !device) {
-    return { authenticated: false, reason: `Unregistered device serial number: ${cleanSn}` };
-  }
-
-  if (!device.is_active) {
-    return { authenticated: false, reason: `Device ${cleanSn} is deactivated in portal` };
-  }
-
-  // Check optional device token / secret if configured in environment
-  const expectedSecret = process.env.ZKTECO_DEVICE_SECRET;
-  if (expectedSecret) {
-    const { searchParams } = new URL(req.url);
-    const providedToken = 
-      req.headers.get('x-device-token') || 
-      req.headers.get('authorization')?.replace(/^Bearer\s+/i, '') || 
-      searchParams.get('token') || 
-      searchParams.get('push_token') || 
-      searchParams.get('PushToken');
-
-    if (!providedToken || providedToken !== expectedSecret) {
-      return { authenticated: false, reason: 'Invalid or missing device authentication token' };
-    }
-  }
-
-  return { authenticated: true, device, supabase };
-}
-
-// 1. Initial Handshake / Config Pull from Device
-export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const sn = searchParams.get('SN');
-  
-  console.log(`[ZKTeco ADMS] Init GET request from SN: ${sn}`);
-
-  const authResult = await authenticateDevice(req, sn);
-  if (!authResult.authenticated || !authResult.device) {
-    console.warn(`[ZKTeco ADMS] Rejected GET from unrecognized device: ${sn}. Reason: ${authResult.reason}`);
-    return new NextResponse(`ERROR: ${authResult.reason}`, {
-      status: 401,
-      headers: { 'Content-Type': 'text/plain' }
-    });
-  }
-
-  // Update device heartbeat
-  await authResult.supabase
-    .from('devices')
-    .update({ last_seen_at: new Date().toISOString() })
-    .eq('id', authResult.device.id);
-
-  // The device expects a specific text configuration response to know the server is ready.
-  // Standard ADMS parameters for F18 and similar legacy devices.
-  const responseText = `GET OPTION FROM: ${sn}\nStamp=9999\nOpStamp=9999\nErrorDelay=60\nDelay=10\nTransTimes=00:00;14:00\nTransInterval=1\nTransFlag=1111000000\nTimeZone=180\nRealtime=1\nEncrypt=0`;
-  
-  return new NextResponse(responseText, {
-    status: 200,
-    headers: { 'Content-Type': 'text/plain' }
-  });
-}
-
-// 2. Data Push (Attendance Logs, Users, etc.)
+const replacement = `// 2. Data Push (Attendance Logs, Users, etc.)
 export async function POST(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const sn = searchParams.get('SN') || searchParams.get('sn') || req.headers.get('x-device-sn') || '';
@@ -84,8 +11,8 @@ export async function POST(req: NextRequest) {
 
   const authResult = await authenticateDevice(req, sn);
   if (!authResult.authenticated || !authResult.device) {
-    console.warn(`[ZKTeco ADMS] Rejected POST from device: ${sn}. Reason: ${authResult.reason}`);
-    return new NextResponse(`ERROR: ${authResult.reason}`, {
+    console.warn(\`[ZKTeco ADMS] Rejected POST from device: \${sn}. Reason: \${authResult.reason}\`);
+    return new NextResponse(\`ERROR: \${authResult.reason}\`, {
       status: 401,
       headers: { 'Content-Type': 'text/plain' }
     });
@@ -93,7 +20,7 @@ export async function POST(req: NextRequest) {
 
   const { device, supabase } = authResult;
   const rawBody = await req.text();
-  console.log(`[ZKTeco ADMS] POST request from SN: ${sn}, Table: ${table}`);
+  console.log(\`[ZKTeco ADMS] POST request from SN: \${sn}, Table: \${table}\`);
 
   // Update heartbeat on data push (fire and forget)
   supabase
@@ -103,10 +30,10 @@ export async function POST(req: NextRequest) {
     .then();
 
   // If this is an attendance log push
-  const isAttLog = table === 'ATTLOG' || table === 'OPERLOG' || rawBody.includes('\t20') || /^\S+\s+\d{4}-\d{2}-\d{2}/m.test(rawBody);
+  const isAttLog = table === 'ATTLOG' || table === 'OPERLOG' || rawBody.includes('\\t20') || /^\\S+\\s+\\d{4}-\\d{2}-\\d{2}/m.test(rawBody);
 
   if (isAttLog) {
-    const lines = rawBody.split(/[\r\n]+/).map(line => line.trim()).filter(line => line.length > 0);
+    const lines = rawBody.split(/[\\r\\n]+/).map(line => line.trim()).filter(line => line.length > 0);
     if (lines.length > 0) {
       // 1. Fetch all people in this school that have a device_user_id
       const { data: peopleData } = await supabase
@@ -140,8 +67,8 @@ export async function POST(req: NextRequest) {
         let statusNum = '0';
         let verifyType = '1';
 
-        if (line.includes('\t')) {
-          const parts = line.split('\t').map(s => s.trim());
+        if (line.includes('\\t')) {
+          const parts = line.split('\\t').map(s => s.trim());
           pin = parts[0];
           datetimeStr = parts[1];
           statusNum = parts[2] || '0';
@@ -153,17 +80,17 @@ export async function POST(req: NextRequest) {
           statusNum = parts[2] || '0';
           verifyType = parts[3] || '1';
         } else {
-          const match = line.match(/^(\S+)\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})(?:\s+(\d+))?(?:\s+(\d+))?/);
+          const match = line.match(/^(\\S+)\\s+(\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2})(?:\\s+(\\d+))?(?:\\s+(\\d+))?/);
           if (match) {
             pin = match[1];
             datetimeStr = match[2];
             statusNum = match[3] || '0';
             verifyType = match[4] || '1';
           } else {
-            const parts = line.split(/\s+/);
+            const parts = line.split(/\\s+/);
             if (parts.length >= 3) {
               pin = parts[0];
-              datetimeStr = `${parts[1]} ${parts[2]}`;
+              datetimeStr = \`\${parts[1]} \${parts[2]}\`;
               statusNum = parts[3] || '0';
             }
           }
@@ -176,7 +103,7 @@ export async function POST(req: NextRequest) {
         let logDate;
         let isoString;
         try {
-          if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(:\d{2})?$/.test(datetimeStr.trim())) {
+          if (/^\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}(:\\d{2})?$/.test(datetimeStr.trim())) {
             isoString = new Date(datetimeStr.trim().replace(' ', 'T') + '+03:00').toISOString();
             logDate = new Date(isoString);
           } else {
@@ -194,7 +121,7 @@ export async function POST(req: NextRequest) {
         
         const person = personMap.get(cleanPin) || personMap.get(cleanPin.replace(/^0+/, '')) || personMap.get(cleanPin.padStart(4, '0'));
         if (!person) {
-          console.warn(`[ZKTeco ADMS] Unrecognized PIN "${cleanPin}" for school ${device.school_id}.`);
+          console.warn(\`[ZKTeco ADMS] Unrecognized PIN "\${cleanPin}" for school \${device.school_id}.\`);
           continue;
         }
 
@@ -218,7 +145,7 @@ export async function POST(req: NextRequest) {
           .gte('occurred_at', earliestIso)
           .lte('occurred_at', latestIso);
 
-        const existingSet = new Set((existingLogs || []).map(l => `${l.person_id}-${l.occurred_at}`));
+        const existingSet = new Set((existingLogs || []).map(l => \`\${l.person_id}-\${l.occurred_at}\`));
 
         const deviceLogsToInsert = [];
         const attendanceLogsToInsert = [];
@@ -226,10 +153,10 @@ export async function POST(req: NextRequest) {
         const nowIso = new Date().toISOString();
 
         for (const record of parsedRecords) {
-          if (existingSet.has(`${record.person.id}-${record.isoString}`)) continue;
+          if (existingSet.has(\`\${record.person.id}-\${record.isoString}\`)) continue;
 
           // Prevent inserting duplicates in this very batch
-          existingSet.add(`${record.person.id}-${record.isoString}`);
+          existingSet.add(\`\${record.person.id}-\${record.isoString}\`);
 
           const deviceLogId = crypto.randomUUID();
           
@@ -292,7 +219,7 @@ export async function POST(req: NextRequest) {
         }
         if (attendanceLogsToInsert.length > 0) {
           await supabase.from('attendance_logs').insert(attendanceLogsToInsert);
-          console.log(`[ZKTeco ADMS] Batch inserted ${attendanceLogsToInsert.length} attendance logs`);
+          console.log(\`[ZKTeco ADMS] Batch inserted \${attendanceLogsToInsert.length} attendance logs\`);
         }
 
         if (validStudentRecords.length > 0) {
@@ -308,7 +235,7 @@ export async function POST(req: NextRequest) {
             for (const row of parentsData) {
               parentMap.set(row.student_id, {
                 parent_id: row.parent_id,
-                phone: Array.isArray(row.parents) ? (row.parents[0] as any)?.phone : (row.parents as any)?.phone
+                phone: Array.isArray(row.parents) ? row.parents[0]?.phone : row.parents?.phone
               });
             }
           }
@@ -328,14 +255,14 @@ export async function POST(req: NextRequest) {
                 channel: 'sms',
                 notification_type: 'attendance',
                 status: 'pending',
-                message: `${record.person.full_name} has ${actionText} at ${timeFormatted}.`
+                message: \`\${record.person.full_name} has \${actionText} at \${timeFormatted}.\`
               });
             }
           }
 
           if (notificationsToInsert.length > 0) {
             await supabase.from('notifications').insert(notificationsToInsert);
-            console.log(`[ZKTeco ADMS] Queued ${notificationsToInsert.length} SMS notifications`);
+            console.log(\`[ZKTeco ADMS] Queued \${notificationsToInsert.length} SMS notifications\`);
           }
         }
       }
@@ -347,3 +274,7 @@ export async function POST(req: NextRequest) {
     headers: { 'Content-Type': 'text/plain' }
   });
 }
+`;
+
+content = content.replace(/\/\/ 2\. Data Push \(Attendance Logs, Users, etc\.\)[\s\S]+$/, replacement);
+fs.writeFileSync(path, content);

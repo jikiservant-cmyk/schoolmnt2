@@ -38,7 +38,7 @@ async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<str
   return null;
 }
 
-export async function getAttendanceData() {
+export async function getAttendanceData(dateFilterStr?: string) {
   const supabase = await createClient();
   
   const { data: userData, error: userErr } = await supabase.auth.getUser();
@@ -65,7 +65,8 @@ export async function getAttendanceData() {
 
   // 1. Get attendance logs strictly scoped to this school
   let logs: any[] = [];
-  const { data: logsData, error: logsError } = await supabase
+  
+  let query = supabase
     .from('attendance_logs')
     .select(`
       *,
@@ -83,8 +84,18 @@ export async function getAttendanceData() {
       )
     `)
     .eq('school_id', schoolId)
-    .order('occurred_at', { ascending: false })
-    .limit(500);
+    .order('occurred_at', { ascending: false });
+    
+  if (dateFilterStr) {
+    // Expecting YYYY-MM-DD
+    const startIso = `${dateFilterStr}T00:00:00+03:00`; // EAT Start
+    const endIso = `${dateFilterStr}T23:59:59+03:00`;   // EAT End
+    query = query.gte('occurred_at', startIso).lte('occurred_at', endIso).limit(2000);
+  } else {
+    query = query.limit(500);
+  }
+  
+  const { data: logsData, error: logsError } = await query;
 
   if (!logsError && logsData) {
     logs = logsData;

@@ -72,6 +72,15 @@ export default async function DashboardPage() {
     }
 
     // Fetch counts and daily logs
+    const schoolIdMatch = await supabase.rpc('auth_school_id').then(res => res.data);
+    
+    // We must try to determine the schoolId if possible
+    let targetSchoolId = schoolIdMatch;
+    if (!targetSchoolId && user) {
+       const { data: stf } = await supabase.from('staff_users').select('people(school_id)').eq('auth_user_id', user.id).maybeSingle();
+       if (stf?.people && (stf.people as any).school_id) targetSchoolId = (stf.people as any).school_id;
+    }
+
     const [
       { count: students },
       { count: teachers },
@@ -82,12 +91,39 @@ export default async function DashboardPage() {
       { data: weekLogsData },
       { data: messagesData }
     ] = await Promise.all([
-      supabase.from('people').select('*', { count: 'exact', head: true }).eq('role', 'student'),
-      supabase.from('people').select('*', { count: 'exact', head: true }).in('role', ['teacher', 'admin', 'support_staff']),
-      supabase.from('classes').select('id, name').order('name'),
-      supabase.from('people').select('id, full_name, role, class_id').eq('role', 'student'),
-      supabase.from('devices').select('*').limit(5),
+      targetSchoolId ? supabase.from('people').select('*', { count: 'exact', head: true }).eq('school_id', targetSchoolId).eq('role', 'student') : supabase.from('people').select('*', { count: 'exact', head: true }).eq('role', 'student'),
+      targetSchoolId ? supabase.from('people').select('*', { count: 'exact', head: true }).eq('school_id', targetSchoolId).in('role', ['teacher', 'admin', 'support_staff']) : supabase.from('people').select('*', { count: 'exact', head: true }).in('role', ['teacher', 'admin', 'support_staff']),
+      targetSchoolId ? supabase.from('classes').select('id, name').eq('school_id', targetSchoolId).order('name') : supabase.from('classes').select('id, name').order('name'),
+      targetSchoolId ? supabase.from('people').select('id, full_name, role, class_id').eq('school_id', targetSchoolId).eq('role', 'student') : supabase.from('people').select('id, full_name, role, class_id').eq('role', 'student'),
+      targetSchoolId ? supabase.from('devices').select('*').eq('school_id', targetSchoolId).limit(5) : supabase.from('devices').select('*').limit(5),
       // STRICTLY TODAY's attendance logs in EAT
+      targetSchoolId ? supabase
+        .from('attendance_logs')
+        .select(`
+          id,
+          person_id,
+          status,
+          attendance_type,
+          occurred_at,
+          source,
+          people:people (
+            id,
+            full_name,
+            role,
+            phone,
+            class_id,
+            classes:class_id (
+              name
+            )
+          ),
+          classes:classes(
+            name
+          )
+        `)
+        .eq('school_id', targetSchoolId)
+        .gte('occurred_at', todayRange.startIso)
+        .lte('occurred_at', todayRange.endIso)
+        .order('occurred_at', { ascending: false }) :
       supabase
         .from('attendance_logs')
         .select(`
@@ -115,12 +151,22 @@ export default async function DashboardPage() {
         .lte('occurred_at', todayRange.endIso)
         .order('occurred_at', { ascending: false }),
       // Week's attendance logs for trend calculation
-      supabase
+      targetSchoolId ? supabase
+        .from('attendance_logs')
+        .select('id, person_id, status, occurred_at, people:people(role)')
+        .eq('school_id', targetSchoolId)
+        .gte('occurred_at', weekStartIso)
+        .lte('occurred_at', weekEndIso) : supabase
         .from('attendance_logs')
         .select('id, person_id, status, occurred_at, people:people(role)')
         .gte('occurred_at', weekStartIso)
         .lte('occurred_at', weekEndIso),
-      supabase
+      targetSchoolId ? supabase
+        .from('notifications')
+        .select('*')
+        .eq('school_id', targetSchoolId)
+        .order('created_at', { ascending: false })
+        .limit(10) : supabase
         .from('notifications')
         .select('*')
         .order('created_at', { ascending: false })

@@ -61,10 +61,11 @@ export default function AttendancePage() {
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [classFilter, setClassFilter] = useState<string>('all');
+  const [dateFilter, setDateFilter] = useState<string>(''); // YYYY-MM-DD
 
   useEffect(() => {
     loadData();
-  }, []);
+  }, [dateFilter]);
 
   // Poll for balance updates when waiting for Mobile Money PIN confirmation
   useEffect(() => {
@@ -101,7 +102,7 @@ export default function AttendancePage() {
   async function loadData() {
     try {
       setLoading(true);
-      const data = await getAttendanceData();
+      const data = await getAttendanceData(dateFilter || undefined);
       if (data.error) {
         setError(data.error);
       } else {
@@ -460,6 +461,17 @@ export default function AttendancePage() {
                   ))}
                 </select>
               </div>
+
+              {/* Date Filter Input */}
+              <div className="w-full sm:w-auto">
+                <input
+                  type="date"
+                  value={dateFilter}
+                  onChange={(e) => setDateFilter(e.target.value)}
+                  className="w-full sm:w-auto h-9 px-3 text-xs border border-[#e1e1e5] rounded-[9px] bg-white text-[#171719] focus:outline-none focus:border-[#007aff] transition font-medium cursor-pointer"
+                  title="Filter by Date"
+                />
+              </div>
             </div>
 
             <div className="flex items-center gap-2 justify-between lg:justify-end">
@@ -499,13 +511,14 @@ export default function AttendancePage() {
                 </button>
               </div>
 
-              {(searchTerm || statusFilter !== 'all' || classFilter !== 'all') && (
+              {(searchTerm || statusFilter !== 'all' || classFilter !== 'all' || dateFilter) && (
                 <button
                   type="button"
                   onClick={() => {
                     setSearchTerm('');
                     setStatusFilter('all');
                     setClassFilter('all');
+                    setDateFilter('');
                   }}
                   className="h-9 px-2.5 border border-[#e1e1e5] rounded-[9px] bg-white hover:bg-[#f7f7f8] text-[#85858a] hover:text-[#171719] text-xs transition cursor-pointer"
                   title="Reset all filters"
