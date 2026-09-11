@@ -301,7 +301,7 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       };
     }
 
-    const { enqueueDeviceCommand } = await import('@/utils/zkteco/commandQueue');
+    const { enqueueDeviceCommand, enqueueDeviceCommandForSchool } = await import('@/utils/zkteco/commandQueue');
     const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
 
     let queuedCount = 0;
@@ -321,7 +321,11 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       const pri = p.role === 'admin' ? 14 : 0; // 0=Normal User, 14=Device Admin
       const cmd = `DATA UPDATE userinfo PIN=${p.device_user_id.trim()}\tName=${displayName}\tPri=${pri}`;
       
-      await enqueueDeviceCommand(cmd, deviceSerialNumber);
+      if (deviceSerialNumber) {
+        await enqueueDeviceCommand(cmd, deviceSerialNumber);
+      } else {
+        await enqueueDeviceCommandForSchool(cmd, schoolId);
+      }
       queuedCount++;
 
       if (previewList.length < 12) {
@@ -436,7 +440,7 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
       return { success: true, count: 0, message: 'All selected members already have a biometric PIN assigned.' };
     }
 
-    const { enqueueDeviceCommand } = await import('@/utils/zkteco/commandQueue');
+    const { enqueueDeviceCommand, enqueueDeviceCommandForSchool } = await import('@/utils/zkteco/commandQueue');
     const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
 
     let currentPinNum = maxNumericPin;
@@ -466,7 +470,11 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
 
       const pri = p.role === 'admin' ? 14 : 0;
       const cmd = `DATA UPDATE userinfo PIN=${assignedPin}\tName=${displayName}\tPri=${pri}`;
-      await enqueueDeviceCommand(cmd, deviceSerialNumber);
+      if (deviceSerialNumber) {
+        await enqueueDeviceCommand(cmd, deviceSerialNumber);
+      } else {
+        await enqueueDeviceCommandForSchool(cmd, schoolId);
+      }
 
       assignedCount++;
     }

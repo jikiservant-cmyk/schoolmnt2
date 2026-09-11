@@ -187,7 +187,9 @@ export async function submitClassAttendance(
   
   // Resolve staff_users.id for marked_by FK constraint
   let markedByStaffUserId: string | null = null;
-  if (teacherId) {
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  
+  if (teacherId && uuidRegex.test(teacherId)) {
     const { data: staffUser } = await adminClient
       .from('staff_users')
       .select('id')
@@ -248,10 +250,26 @@ export async function submitClassAttendance(
     created_at: now.toISOString(),
   }));
 
-  if (presentLogs.length > 0) {
+  const absentLogs = absentStudentIds.map(studentId => ({
+    id: crypto.randomUUID(),
+    school_id: cls.school_id,
+    person_id: studentId,
+    class_id_at_time: cls.id,
+    class_name_at_time: cls.name,
+    status: 'absent' as const,
+    attendance_type: attendanceType,
+    marked_by: markedByStaffUserId,
+    occurred_at: now.toISOString(),
+    source: 'manual' as const,
+    created_at: now.toISOString(),
+  }));
+
+  const allLogs = [...presentLogs, ...absentLogs];
+
+  if (allLogs.length > 0) {
     const { error: insertError } = await adminClient
       .from('attendance_logs')
-      .insert(presentLogs);
+      .insert(allLogs);
       
     if (insertError) {
       console.error("Error inserting manual attendance", insertError);

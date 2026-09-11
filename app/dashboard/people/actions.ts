@@ -114,13 +114,16 @@ export async function addPersonAction(formData: FormData) {
       if (cleanDeviceId) {
         try {
           const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
-          const { enqueueDeviceCommand } = await import('@/utils/zkteco/commandQueue');
+          const { enqueueDeviceCommandForSchool } = await import('@/utils/zkteco/commandQueue');
           const displayName = formatZKTecoDisplayName({
             full_name: fullName.trim(),
             role: 'support_staff',
             classes: null
           });
-          await enqueueDeviceCommand(`DATA UPDATE userinfo PIN=${cleanDeviceId}\tName=${displayName}\tPri=0`);
+          await enqueueDeviceCommandForSchool(
+            `DATA UPDATE userinfo PIN=${cleanDeviceId}\tName=${displayName}\tPri=0`,
+            schoolId
+          );
         } catch (cmdErr) {
           console.warn('Non-blocking: Failed to enqueue ADMS user sync command for support staff:', cmdErr);
         }
@@ -350,7 +353,7 @@ export async function addPersonAction(formData: FormData) {
         }
 
         const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
-        const { enqueueDeviceCommand } = await import('@/utils/zkteco/commandQueue');
+        const { enqueueDeviceCommandForSchool } = await import('@/utils/zkteco/commandQueue');
 
         const displayName = formatZKTecoDisplayName({
           full_name: fullName.trim(),
@@ -358,7 +361,10 @@ export async function addPersonAction(formData: FormData) {
           classes: className ? { name: className } : null
         });
 
-        await enqueueDeviceCommand(`DATA UPDATE userinfo PIN=${cleanDeviceId}\tName=${displayName}\tPri=0`);
+        await enqueueDeviceCommandForSchool(
+          `DATA UPDATE userinfo PIN=${cleanDeviceId}\tName=${displayName}\tPri=0`,
+          schoolId
+        );
       } catch (cmdErr) {
         console.warn('Non-blocking: Failed to enqueue ADMS user sync command:', cmdErr);
       }
@@ -589,7 +595,7 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
     if (cleanUid) {
       try {
         const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
-        const { enqueueDeviceCommand } = await import('@/utils/zkteco/commandQueue');
+        const { enqueueDeviceCommandForSchool } = await import('@/utils/zkteco/commandQueue');
 
         const displayName = formatZKTecoDisplayName({
           full_name: person.full_name,
@@ -597,7 +603,10 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
           classes: (person as any).classes?.name ? { name: (person as any).classes.name } : null
         });
 
-        await enqueueDeviceCommand(`DATA UPDATE userinfo PIN=${cleanUid}\tName=${displayName}\tPri=0`);
+        await enqueueDeviceCommandForSchool(
+          `DATA UPDATE userinfo PIN=${cleanUid}\tName=${displayName}\tPri=0`,
+          schoolId
+        );
       } catch (cmdErr) {
         console.warn('Non-blocking: Failed to enqueue ADMS user sync command:', cmdErr);
       }
