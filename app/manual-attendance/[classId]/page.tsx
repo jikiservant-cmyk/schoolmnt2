@@ -230,7 +230,8 @@ export default function ManualAttendancePage() {
         teacher.id,
         presentIds,
         [],
-        activeMode
+        activeMode,
+        pin
       );
 
       if (res.success) {

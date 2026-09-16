@@ -55,6 +55,7 @@ export async function GET(req: NextRequest) {
     .from('device_commands')
     .select('id, raw_command')
     .eq('status', 'pending')
+    .eq('school_id', device.school_id)
     .in('target_serial', [cleanSn, 'ALL'])
     .order('created_at', { ascending: true })
     .limit(50);
@@ -85,6 +86,7 @@ export async function GET(req: NextRequest) {
       .select('id, payload')
       .eq('processed', false)
       .eq('device_user_id', 'COMMAND')
+      .eq('school_id', device.school_id)
       .in('raw_serial_number', [cleanSn, 'ALL'])
       .order('event_timestamp', { ascending: true })
       .limit(50);

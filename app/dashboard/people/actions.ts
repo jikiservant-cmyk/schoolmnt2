@@ -2,6 +2,7 @@
 
 import { createClient } from '@/utils/supabase/server';
 import { createAdminClient } from '@/utils/supabase/admin';
+import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 import bcrypt from 'bcryptjs';
 
@@ -52,16 +53,7 @@ export async function addPersonAction(formData: FormData) {
   }
 
   try {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) {
-      return { error: 'Not authenticated. Please log in.' };
-    }
-
-    const schoolId = await getEffectiveSchoolId(supabase, user.id);
-    if (!schoolId) {
-      return { error: 'No school tenant found for this account. Please verify your staff credentials.' };
-    }
-
+    const { supabase, schoolId } = await requireSchoolAdmin();
     const adminClient = createAdminClient();
     const rawDeviceId = formData.get('deviceUserId') as string;
     const cleanDeviceId = rawDeviceId && rawDeviceId.trim() ? rawDeviceId.trim() : null;
@@ -382,18 +374,8 @@ export async function addPersonAction(formData: FormData) {
 }
 
 export async function resetTeacherPinAction(personId: string) {
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) {
-    return { error: 'Not authenticated. Please log in.' };
-  }
-
-  const schoolId = await getEffectiveSchoolId(supabase, user.id);
-  if (!schoolId) {
-    return { error: 'Failed to resolve your school context.' };
-  }
-
   try {
+    const { schoolId } = await requireSchoolAdmin();
     // 1. Verify target person is a teacher and belongs to the caller's school
     const adminClient = createAdminClient();
     const { data: person, error: pErr } = await adminClient
@@ -483,15 +465,11 @@ export async function searchPeopleAction(params: {
   page?: number;
   limit?: number;
 }) {
-  const supabase = await createClient();
-  const { data: userData } = await supabase.auth.getUser();
-  if (!userData?.user) return { error: 'Unauthorized', data: [], count: 0 };
-
-  const schoolId = await getEffectiveSchoolId(supabase, userData.user.id);
-  if (!schoolId) return { error: 'No school tenant found', data: [], count: 0 };
-
-  let query = supabase
-    .from('people')
+  try {
+    const { supabase, schoolId } = await requireSchoolAdmin();
+    
+    let query = supabase
+      .from('people')
     .select('id, full_name, role, class_id, device_user_id, phone, is_active', { count: 'exact' })
     .eq('school_id', schoolId);
 
@@ -528,22 +506,16 @@ export async function searchPeopleAction(params: {
     return { error: error.message, data: [], count: 0 };
   }
 
-  return { success: true, data: data || [], count: count || 0 };
+    return { success: true, data: data || [], count: count || 0 };
+  } catch (err: any) {
+    console.error('searchPeopleAction error:', err);
+    return { error: err.message || 'Unauthorized', data: [], count: 0 };
+  }
 }
 
 export async function updatePersonDeviceUserIdAction(personId: string, deviceUserId: string | null) {
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) {
-    return { error: 'Not authenticated. Please log in.' };
-  }
-
-  const schoolId = await getEffectiveSchoolId(supabase, user.id);
-  if (!schoolId) {
-    return { error: 'Failed to resolve your school context.' };
-  }
-
   try {
+    const { schoolId } = await requireSchoolAdmin();
     const adminClient = createAdminClient();
     const cleanUid = deviceUserId && deviceUserId.trim() ? deviceUserId.trim() : null;
 

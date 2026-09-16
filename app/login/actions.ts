@@ -31,8 +31,8 @@ export async function loginAction(formData: FormData) {
         .eq('id', data.user.id)
         .maybeSingle();
       
-      // If a profile exists and explicitly has a non-admin role, reject access
-      if (adminProfile && adminProfile.role && adminProfile.role !== 'school_admin') {
+      // Enforce fail-closed login gate
+      if (!adminProfile || adminProfile.role !== 'school_admin') {
         await supabase.auth.signOut();
         return { error: 'Access denied. You do not have the required admin role.' };
       }

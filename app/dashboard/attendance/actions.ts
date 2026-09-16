@@ -3,6 +3,7 @@
 import crypto from 'crypto';
 import { createClient } from '@/utils/supabase/server';
 import { createPublicAdminClient } from '@/utils/supabase/admin';
+import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
@@ -39,31 +40,10 @@ async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<str
 }
 
 export async function getAttendanceData(dateFilterStr?: string) {
-  const supabase = await createClient();
-  
-  const { data: userData, error: userErr } = await supabase.auth.getUser();
-  if (userErr || !userData?.user) {
-    return {
-      logs: [],
-      school: null,
-      classes: [],
-      people: [],
-      error: 'Not authenticated. Please log in.'
-    };
-  }
-
-  const schoolId = await getEffectiveSchoolId(supabase, userData.user.id);
-  if (!schoolId) {
-    return {
-      logs: [],
-      school: null,
-      classes: [],
-      people: [],
-      error: 'Your account is not linked to an active school tenant.'
-    };
-  }
-
-  // 1. Get attendance logs strictly scoped to this school
+  try {
+    const { supabase, schoolId } = await requireSchoolAdmin();
+    
+    // 1. Get attendance logs strictly scoped to this school
   let logs: any[] = [];
   
   let query = supabase
@@ -162,29 +142,28 @@ export async function getAttendanceData(dateFilterStr?: string) {
     }
   }
 
-  return {
-    logs: logs || [],
-    school,
-    classes: classes || [],
-    people: people || [],
-    error: undefined as string | undefined
-  };
+    return {
+      logs: logs || [],
+      school,
+      classes: classes || [],
+      people: people || [],
+      error: undefined as string | undefined
+    };
+  } catch (err: any) {
+    return {
+      logs: [],
+      school: null,
+      classes: [],
+      people: [],
+      error: err.message || 'Unauthorized'
+    };
+  }
 }
 
 export async function recordTeacherAttendance(personId: string, status?: 'present' | 'late' | 'excused') {
-  const supabase = await createClient();
-  
-  const { data: userData, error: userError } = await supabase.auth.getUser();
-  if (userError || !userData?.user) {
-    return { error: 'Unauthorized' };
-  }
-
-  const schoolId = await getEffectiveSchoolId(supabase, userData.user.id);
-  if (!schoolId) {
-    return { error: 'No school tenant context found.' };
-  }
-
   try {
+    const { supabase, schoolId } = await requireSchoolAdmin();
+    
     const now = new Date();
     // Default rule: if checking in after 08:30 AM East Africa Time, mark as late unless specified
     const eatHours = (now.getUTCHours() + 3) % 24;
@@ -222,14 +201,8 @@ export async function markTeacherAttendanceAction(personId: string, status?: 'pr
 }
 
 export async function getSchoolBalance() {
-  const supabase = await createClient();
-  const { data: userData, error: userError } = await supabase.auth.getUser();
-  if (userError || !userData?.user) return { error: 'Unauthorized' };
-
-  const schoolId = await getEffectiveSchoolId(supabase, userData.user.id);
-  if (!schoolId) return { error: 'No school tenant context found.' };
-
   try {
+    const { supabase, schoolId } = await requireSchoolAdmin();
     const publicAdmin = createPublicAdminClient();
     
     // Check wallet balance (supporting both tenant_id and school_id columns)
@@ -276,18 +249,10 @@ export async function getSchoolBalance() {
 }
 
 export async function topUpBalance(amount: number, phoneNumber: string) {
-  const supabase = await createClient();
-  const publicAdmin = createPublicAdminClient();
-  
-  const { data: userData, error: userError } = await supabase.auth.getUser();
-  if (userError || !userData?.user) {
-    return { error: 'Unauthorized. Please log in to top up.' };
-  }
-
-  const schoolId = await getEffectiveSchoolId(supabase, userData.user.id);
-  if (!schoolId) {
-    return { error: 'No school context resolved for this account.' };
-  }
+  try {
+    const { supabase, schoolId, user } = await requireSchoolAdmin();
+    const publicAdmin = createPublicAdminClient();
+    const userData = { user };
 
   const { data: school } = await supabase
     .from('schools')
@@ -495,5 +460,9 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
     return { 
       error: 'Could not connect to payment gateway. Please check your network connection and try again.' 
     };
+  }
+  } catch (err: any) {
+    console.error('topUpBalance error:', err);
+    return { error: err.message || 'Failed to top up balance' };
   }
 }

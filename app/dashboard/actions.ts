@@ -1,18 +1,12 @@
 'use server';
 
 import { createClient } from '@/utils/supabase/server';
+import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 
 export async function processPendingNotificationsAction() {
-  const supabase = await createClient();
-  
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return { error: 'Unauthorized.' };
-
-  const { data: schoolId } = await supabase.rpc('auth_school_id');
-  if (!schoolId) return { error: 'Tenant context required.' };
-
   try {
+    const { supabase, schoolId } = await requireSchoolAdmin();
     // 1. Fetch pending notifications for this school only
     const { data: pending, error } = await supabase
       .from('notifications')

@@ -2,6 +2,7 @@
 
 import { createClient } from '@/utils/supabase/server';
 import { createAdminClient } from '@/utils/supabase/admin';
+import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 
 async function resolveSchoolId(supabase: any, userId: string): Promise<string | null> {
@@ -47,18 +48,7 @@ export async function addDeviceAction(formData: FormData) {
   }
 
   try {
-    const supabase = await createClient();
-    const { data: { user } } = await supabase.auth.getUser();
-    
-    if (!user) {
-      return { error: 'Not authenticated. Please log in.' };
-    }
-
-    const schoolId = await resolveSchoolId(supabase, user.id);
-    if (!schoolId) {
-      return { error: 'School tenant context could not be resolved. Please try refreshing.' };
-    }
-
+    const { schoolId } = await requireSchoolAdmin();
     const adminClient = createAdminClient();
 
     // Check if device serial already exists
@@ -101,40 +91,25 @@ export async function addDeviceAction(formData: FormData) {
         ...baseRecord,
         firmware_version: 'Ver 2.0.1-20170210',
         device_type: deviceType,
-        device_secret: secretToSave,
         device_secret_hash: secretHashToSave,
         config
       });
 
-    // 2. Fallback if device_secret column is not present or metadata packing is needed
+    // 2. Fallback if metadata packing is needed
     if (insertErr && (insertErr.code === 'PGRST204' || insertErr.message?.includes('column'))) {
-      const retryWithoutSecret = await adminClient
+      const packedFw = packDeviceMetadata('Ver 2.0.1-20170210', {
+        type: deviceType as any,
+        config
+      });
+
+      const retryPacked = await adminClient
         .from('devices')
         .insert({
           ...baseRecord,
-          firmware_version: 'Ver 2.0.1-20170210',
-          device_type: deviceType,
           device_secret_hash: secretHashToSave,
-          config
+          firmware_version: packedFw
         });
-
-      if (!retryWithoutSecret.error) {
-        insertErr = null;
-      } else {
-        const packedFw = packDeviceMetadata('Ver 2.0.1-20170210', {
-          type: deviceType as any,
-          secret: secretToSave,
-          config
-        });
-
-        const retryPacked = await adminClient
-          .from('devices')
-          .insert({
-            ...baseRecord,
-            firmware_version: packedFw
-          });
-        insertErr = retryPacked.error;
-      }
+      insertErr = retryPacked.error;
     }
 
     if (insertErr) {
@@ -155,13 +130,7 @@ export async function addDeviceAction(formData: FormData) {
 
 export async function regenerateDeviceSecretAction(deviceId: string) {
   try {
-    const supabase = await createClient();
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return { error: 'Not authenticated.' };
-
-    const schoolId = await resolveSchoolId(supabase, user.id);
-    if (!schoolId) return { error: 'School context could not be resolved.' };
-
+    const { schoolId } = await requireSchoolAdmin();
     const adminClient = createAdminClient();
     const { data: dev, error: fetchErr } = await adminClient
       .from('devices')
@@ -181,31 +150,20 @@ export async function regenerateDeviceSecretAction(deviceId: string) {
     let { error: updateErr } = await adminClient
       .from('devices')
       .update({ 
-        device_secret_hash: newSecretHash,
-        device_secret: newSecret 
+        device_secret_hash: newSecretHash
       })
       .eq('id', deviceId);
 
     if (updateErr && (updateErr.code === 'PGRST204' || updateErr.message?.includes('column'))) {
-      const retryHashOnly = await adminClient
+      const packedFw = packDeviceMetadata(dev.firmware_version, {
+        type: parsed.device_type,
+        config: parsed.config
+      });
+      const retryPacked = await adminClient
         .from('devices')
-        .update({ device_secret_hash: newSecretHash })
+        .update({ firmware_version: packedFw, device_secret_hash: newSecretHash })
         .eq('id', deviceId);
-
-      if (!retryHashOnly.error) {
-        updateErr = null;
-      } else {
-        const packedFw = packDeviceMetadata(dev.firmware_version, {
-          type: parsed.device_type,
-          secret: newSecret,
-          config: parsed.config
-        });
-        const retryPacked = await adminClient
-          .from('devices')
-          .update({ firmware_version: packedFw })
-          .eq('id', deviceId);
-        updateErr = retryPacked.error;
-      }
+      updateErr = retryPacked.error;
     }
 
     if (updateErr) {
@@ -227,19 +185,9 @@ export interface PushDeviceTargetOptions {
 
 export async function getDevicePushCandidatesAction(options: PushDeviceTargetOptions) {
   try {
+    const { schoolId } = await requireSchoolAdmin();
     const adminClient = createAdminClient();
     const { deviceSerialNumber, category, classId } = options;
-
-    const supabase = await createClient();
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) {
-      return { error: 'Not authenticated.' };
-    }
-
-    const schoolId = await resolveSchoolId(supabase, user.id);
-    if (!schoolId) {
-      return { error: 'No school tenant found for the current user.' };
-    }
 
     let schoolName = 'Connected School';
 
@@ -327,19 +275,9 @@ export async function getDevicePushCandidatesAction(options: PushDeviceTargetOpt
 
 export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) {
   try {
+    const { schoolId } = await requireSchoolAdmin();
     const adminClient = createAdminClient();
     const { deviceSerialNumber, category = 'all', classId } = options;
-
-    const supabase = await createClient();
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) {
-      return { error: 'Not authenticated.' };
-    }
-
-    const schoolId = await resolveSchoolId(supabase, user.id);
-    if (!schoolId) {
-      return { error: 'Could not determine the school context for this device push.' };
-    }
 
     let schoolName = 'Connected School';
 
@@ -498,19 +436,9 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
  */
 export async function autoAssignDevicePinsAction(options: PushDeviceTargetOptions) {
   try {
+    const { schoolId } = await requireSchoolAdmin();
     const adminClient = createAdminClient();
     const { deviceSerialNumber, category = 'all', classId } = options;
-
-    const supabase = await createClient();
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) {
-      return { error: 'Not authenticated.' };
-    }
-
-    const schoolId = await resolveSchoolId(supabase, user.id);
-    if (!schoolId) {
-      return { error: 'Could not determine school context.' };
-    }
 
     let schoolName = 'Connected School';
 

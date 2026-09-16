@@ -205,7 +205,8 @@ export async function submitClassAttendance(
   teacherId: string,
   presentStudentIds: string[],
   absentStudentIds: string[],
-  attendanceType: 'check_in' | 'check_out' = 'check_in'
+  attendanceType: 'check_in' | 'check_out' = 'check_in',
+  pin: string = ''
 ) {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
@@ -216,6 +217,12 @@ export async function submitClassAttendance(
 
   const adminClient = createAdminClient();
 
+  // Re-verify Teacher PIN server-side
+  const pinVerification = await verifyTeacherPin(classId, teacherId, pin);
+  if (!pinVerification.success) {
+    return { success: false, error: pinVerification.error || 'Invalid Teacher PIN.' };
+  }
+
   // Get class and school info, scoped by schoolId
   const { data: cls } = await supabase
     .from('classes')
@@ -225,6 +232,21 @@ export async function submitClassAttendance(
     .maybeSingle();
 
   if (!cls) return { success: false, error: 'Class not found or access denied' };
+
+  // Validate that all submitted student IDs actually belong to this class
+  const { data: classStudents } = await adminClient
+    .from('people')
+    .select('id')
+    .eq('class_id', classId)
+    .eq('school_id', schoolId)
+    .in('role', ['student']);
+    
+  const validStudentIds = new Set((classStudents || []).map((s: any) => s.id));
+  for (const id of [...presentStudentIds, ...absentStudentIds]) {
+    if (!validStudentIds.has(id)) {
+      return { success: false, error: 'Invalid student reference provided.' };
+    }
+  }
   
   // Resolve staff_users.id for marked_by FK constraint
   let markedByStaffUserId: string | null = null;

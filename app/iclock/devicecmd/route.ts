@@ -67,7 +67,8 @@ export async function POST(req: NextRequest) {
             await supabase
               .from('device_commands')
               .update(updatePayload)
-              .eq('id', cmdId);
+              .eq('id', cmdId)
+              .eq('school_id', device.school_id);
           }
         }
       }

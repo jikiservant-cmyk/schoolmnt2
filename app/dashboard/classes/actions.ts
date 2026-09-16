@@ -1,6 +1,7 @@
 'use server';
 
 import { createClient } from '@/utils/supabase/server';
+import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 
 export async function addClassAction(formData: FormData) {
@@ -19,17 +20,8 @@ export async function addClassAction(formData: FormData) {
   }
 
   try {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) {
-      return { error: 'Not authenticated. Please log in.' };
-    }
+    const { supabase, schoolId } = await requireSchoolAdmin();
 
-    // Resolve the active school ID using the security definer RPC function
-    const { data: schoolId, error: schoolErr } = await supabase.rpc('auth_school_id');
-    if (schoolErr || !schoolId) {
-      console.error('Failed to resolve school ID via auth_school_id:', schoolErr);
-      return { error: 'Your school context could not be resolved. Please contact support.' };
-    }
 
     // Find the current active academic year for this school
     let { data: activeYear } = await supabase

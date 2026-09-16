@@ -25,7 +25,6 @@ export function packDeviceMetadata(
   baseFirmware: string | null,
   metadata: {
     type?: DeviceType;
-    secret?: string | null;
     statusCodeMap?: Record<string, 'check_in' | 'check_out'>;
     config?: DeviceConfig;
   }
@@ -33,7 +32,6 @@ export function packDeviceMetadata(
   const base = (baseFirmware || 'Ver 2.0.1-20170210').split('|META:')[0].trim();
   const payload = JSON.stringify({
     type: metadata.type || 'zkteco_adms',
-    secret: metadata.secret || null,
     statusCodeMap: metadata.statusCodeMap,
     config: metadata.config
   });
