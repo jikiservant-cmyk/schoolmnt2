@@ -37,6 +37,10 @@ export async function addDeviceAction(formData: FormData) {
   const serialNumber = formData.get('serialNumber') as string;
   const label = formData.get('label') as string;
   const ipAddress = (formData.get('ipAddress') as string) || null;
+  const deviceType = ((formData.get('deviceType') as string) || 'zkteco_adms').trim();
+  const rawSecret = (formData.get('deviceSecret') as string)?.trim() || null;
+  const lateCutoff = (formData.get('lateCutoff') as string)?.trim() || '08:00';
+  const timeZone = (formData.get('timeZone') as string)?.trim() || 'Africa/Kampala';
 
   if (!serialNumber || !serialNumber.trim()) {
     return { error: 'Device Serial Number is required.' };
@@ -69,18 +73,69 @@ export async function addDeviceAction(formData: FormData) {
       return { error: `Device with Serial Number "${cleanSerial}" is already registered.` };
     }
 
-    // Insert device record into school.devices
-    const { error: insertErr } = await adminClient
+    const { generateDeviceSecret, hashDeviceSecret, packDeviceMetadata } = await import('@/lib/devices/metadata');
+    const secretToSave = rawSecret || generateDeviceSecret();
+    const secretHashToSave = hashDeviceSecret(secretToSave);
+
+    const [lateH, lateM] = lateCutoff.split(':').map(n => parseInt(n, 10));
+    const config = {
+      lateCutoffHour: isNaN(lateH) ? 8 : lateH,
+      lateCutoffMinute: isNaN(lateM) ? 0 : lateM,
+      timeZone: timeZone || 'Africa/Kampala',
+    };
+
+    const baseRecord = {
+      school_id: schoolId,
+      serial_number: cleanSerial,
+      label: label ? label.trim() : `Terminal (${cleanSerial})`,
+      location_label: label ? label.trim() : `Terminal (${cleanSerial})`,
+      ip_address: ipAddress ? ipAddress.trim() : null,
+      is_active: true,
+      last_seen_at: null
+    };
+
+    // 1. Attempt insert with dedicated columns according to new DB schema
+    let { error: insertErr } = await adminClient
       .from('devices')
       .insert({
-        school_id: schoolId,
-        serial_number: cleanSerial,
-        label: label ? label.trim() : 'ZKTeco F18 Terminal',
-        ip_address: ipAddress ? ipAddress.trim() : null,
-        is_active: true,
+        ...baseRecord,
         firmware_version: 'Ver 2.0.1-20170210',
-        last_seen_at: null
+        device_type: deviceType,
+        device_secret: secretToSave,
+        device_secret_hash: secretHashToSave,
+        config
       });
+
+    // 2. Fallback if device_secret column is not present or metadata packing is needed
+    if (insertErr && (insertErr.code === 'PGRST204' || insertErr.message?.includes('column'))) {
+      const retryWithoutSecret = await adminClient
+        .from('devices')
+        .insert({
+          ...baseRecord,
+          firmware_version: 'Ver 2.0.1-20170210',
+          device_type: deviceType,
+          device_secret_hash: secretHashToSave,
+          config
+        });
+
+      if (!retryWithoutSecret.error) {
+        insertErr = null;
+      } else {
+        const packedFw = packDeviceMetadata('Ver 2.0.1-20170210', {
+          type: deviceType as any,
+          secret: secretToSave,
+          config
+        });
+
+        const retryPacked = await adminClient
+          .from('devices')
+          .insert({
+            ...baseRecord,
+            firmware_version: packedFw
+          });
+        insertErr = retryPacked.error;
+      }
+    }
 
     if (insertErr) {
       console.error('Failed to insert device:', insertErr);
@@ -91,10 +146,76 @@ export async function addDeviceAction(formData: FormData) {
     }
 
     revalidatePath('/dashboard/devices');
-    return { success: true };
+    return { success: true, deviceSecret: secretToSave };
   } catch (err: any) {
     console.error('Error in addDeviceAction:', err);
     return { error: err?.message || 'An unexpected error occurred while registering the device.' };
+  }
+}
+
+export async function regenerateDeviceSecretAction(deviceId: string) {
+  try {
+    const supabase = await createClient();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return { error: 'Not authenticated.' };
+
+    const schoolId = await resolveSchoolId(supabase, user.id);
+    if (!schoolId) return { error: 'School context could not be resolved.' };
+
+    const adminClient = createAdminClient();
+    const { data: dev, error: fetchErr } = await adminClient
+      .from('devices')
+      .select('*')
+      .eq('id', deviceId)
+      .eq('school_id', schoolId)
+      .maybeSingle();
+
+    if (fetchErr || !dev) return { error: 'Device not found.' };
+
+    const { generateDeviceSecret, hashDeviceSecret, parseDeviceMetadata, packDeviceMetadata } = await import('@/lib/devices/metadata');
+    const newSecret = generateDeviceSecret();
+    const newSecretHash = hashDeviceSecret(newSecret);
+    const parsed = parseDeviceMetadata(dev);
+
+    // Attempt update with device_secret_hash first
+    let { error: updateErr } = await adminClient
+      .from('devices')
+      .update({ 
+        device_secret_hash: newSecretHash,
+        device_secret: newSecret 
+      })
+      .eq('id', deviceId);
+
+    if (updateErr && (updateErr.code === 'PGRST204' || updateErr.message?.includes('column'))) {
+      const retryHashOnly = await adminClient
+        .from('devices')
+        .update({ device_secret_hash: newSecretHash })
+        .eq('id', deviceId);
+
+      if (!retryHashOnly.error) {
+        updateErr = null;
+      } else {
+        const packedFw = packDeviceMetadata(dev.firmware_version, {
+          type: parsed.device_type,
+          secret: newSecret,
+          config: parsed.config
+        });
+        const retryPacked = await adminClient
+          .from('devices')
+          .update({ firmware_version: packedFw })
+          .eq('id', deviceId);
+        updateErr = retryPacked.error;
+      }
+    }
+
+    if (updateErr) {
+      return { error: updateErr.message || 'Failed to regenerate device secret.' };
+    }
+
+    revalidatePath('/dashboard/devices');
+    return { success: true, newSecret };
+  } catch (err: any) {
+    return { error: err?.message || 'Failed to update token.' };
   }
 }
 
@@ -301,35 +422,58 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       };
     }
 
-    const { enqueueDeviceCommand, enqueueDeviceCommandForSchool } = await import('@/utils/zkteco/commandQueue');
-    const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
+    const { enqueueDeviceCommand, enqueuePersonEnrollmentForSchool } = await import('@/utils/zkteco/commandQueue');
+    const { getDeviceAdapter } = await import('@/lib/devices/registry');
+    const { parseDeviceMetadata } = await import('@/lib/devices/metadata');
+
+    let targetAdapter: any = null;
+    let targetDevice: any = null;
+
+    if (deviceSerialNumber && deviceSerialNumber.trim()) {
+      const cleanSerial = deviceSerialNumber.trim().toUpperCase();
+      const { data: devRow } = await adminClient
+        .from('devices')
+        .select('*')
+        .eq('school_id', schoolId)
+        .ilike('serial_number', cleanSerial)
+        .maybeSingle();
+
+      if (devRow) {
+        targetDevice = parseDeviceMetadata(devRow);
+        targetAdapter = getDeviceAdapter(targetDevice.device_type);
+      }
+    }
 
     let queuedCount = 0;
     const previewList: string[] = [];
 
     for (const p of people) {
       if (!p.device_user_id || !p.device_user_id.trim()) continue;
-      
-      const displayName = formatZKTecoDisplayName({
-        full_name: p.full_name,
-        role: p.role as any,
-        classes: p.classes as any
-      });
 
-      // ZKTeco ADMS command to update user info on terminal:
-      // DATA UPDATE userinfo PIN=201\tName=Tr. Denis Mpungu\tPri=0
-      const pri = p.role === 'admin' ? 14 : 0; // 0=Normal User, 14=Device Admin
-      const cmd = `DATA UPDATE userinfo PIN=${p.device_user_id.trim()}\tName=${displayName}\tPri=${pri}`;
-      
-      if (deviceSerialNumber) {
-        await enqueueDeviceCommand(cmd, deviceSerialNumber);
+      const enrollInput = {
+        pin: p.device_user_id.trim(),
+        fullName: p.full_name,
+        role: p.role as any,
+        className: (p.classes as any)?.name || null
+      };
+
+      if (targetDevice && targetAdapter) {
+        const enrollCmd = targetAdapter.buildEnrollCommand(enrollInput, targetDevice);
+        if (enrollCmd.transportType === 'adms_command' || enrollCmd.transportType === 'rest_api') {
+          await enqueueDeviceCommand(enrollCmd.command, targetDevice.serial_number);
+          queuedCount++;
+        }
       } else {
-        await enqueueDeviceCommandForSchool(cmd, schoolId);
+        // Broadcast to all devices owned by school with dynamic per-vendor translation
+        const res = await enqueuePersonEnrollmentForSchool(enrollInput, schoolId);
+        if (res.success) {
+          queuedCount += res.queuedCount;
+        }
       }
-      queuedCount++;
 
       if (previewList.length < 12) {
-        previewList.push(`${p.device_user_id}: ${displayName}`);
+        const vendorLabel = targetAdapter ? targetAdapter.displayName : 'Multi-Vendor';
+        previewList.push(`${p.device_user_id}: ${p.full_name} (${vendorLabel})`);
       }
     }
 
@@ -341,7 +485,7 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       schoolName,
       categoryLabel,
       previewList,
-      message: `Enqueued ${queuedCount} names (${categoryLabel}) to terminal screen for ${schoolName}.`
+      message: `Enqueued ${queuedCount} enrollment payload(s) (${categoryLabel}) for ${schoolName}.`
     };
   } catch (err: any) {
     console.error('Error pushing users to device:', err);

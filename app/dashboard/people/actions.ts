@@ -113,19 +113,18 @@ export async function addPersonAction(formData: FormData) {
       // Sync user to biometric device queue if device ID provided
       if (cleanDeviceId) {
         try {
-          const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
-          const { enqueueDeviceCommandForSchool } = await import('@/utils/zkteco/commandQueue');
-          const displayName = formatZKTecoDisplayName({
-            full_name: fullName.trim(),
-            role: 'support_staff',
-            classes: null
-          });
-          await enqueueDeviceCommandForSchool(
-            `DATA UPDATE userinfo PIN=${cleanDeviceId}\tName=${displayName}\tPri=0`,
+          const { enqueuePersonEnrollmentForSchool } = await import('@/utils/zkteco/commandQueue');
+          await enqueuePersonEnrollmentForSchool(
+            {
+              pin: cleanDeviceId,
+              fullName: fullName.trim(),
+              role: 'support_staff',
+              className: null
+            },
             schoolId
           );
         } catch (cmdErr) {
-          console.warn('Non-blocking: Failed to enqueue ADMS user sync command for support staff:', cmdErr);
+          console.warn('Non-blocking: Failed to enqueue user sync command for support staff:', cmdErr);
         }
       }
 
@@ -352,21 +351,18 @@ export async function addPersonAction(formData: FormData) {
           if (cls?.name) className = cls.name;
         }
 
-        const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
-        const { enqueueDeviceCommandForSchool } = await import('@/utils/zkteco/commandQueue');
-
-        const displayName = formatZKTecoDisplayName({
-          full_name: fullName.trim(),
-          role: role,
-          classes: className ? { name: className } : null
-        });
-
-        await enqueueDeviceCommandForSchool(
-          `DATA UPDATE userinfo PIN=${cleanDeviceId}\tName=${displayName}\tPri=0`,
+        const { enqueuePersonEnrollmentForSchool } = await import('@/utils/zkteco/commandQueue');
+        await enqueuePersonEnrollmentForSchool(
+          {
+            pin: cleanDeviceId,
+            fullName: fullName.trim(),
+            role: role,
+            className: className || null
+          },
           schoolId
         );
       } catch (cmdErr) {
-        console.warn('Non-blocking: Failed to enqueue ADMS user sync command:', cmdErr);
+        console.warn('Non-blocking: Failed to enqueue user sync command:', cmdErr);
       }
     }
 
@@ -591,24 +587,38 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
       return { error: updateErr.message || 'Failed to update biometric UID.' };
     }
 
-    // 4. If cleanUid is assigned, enqueue command to ZKTeco terminal
+    // 4. Sync into school.person_credentials table if cleanUid is present
     if (cleanUid) {
       try {
-        const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
-        const { enqueueDeviceCommandForSchool } = await import('@/utils/zkteco/commandQueue');
+        await adminClient
+          .from('person_credentials')
+          .upsert(
+            {
+              school_id: schoolId,
+              person_id: personId,
+              credential_type: 'pin',
+              identifier_value: cleanUid,
+              is_active: true
+            },
+            { onConflict: 'school_id,credential_type,identifier_value' }
+          );
+      } catch (credErr) {
+        console.warn('Non-blocking: person_credentials sync skipped:', credErr);
+      }
 
-        const displayName = formatZKTecoDisplayName({
-          full_name: person.full_name,
-          role: person.role,
-          classes: (person as any).classes?.name ? { name: (person as any).classes.name } : null
-        });
-
-        await enqueueDeviceCommandForSchool(
-          `DATA UPDATE userinfo PIN=${cleanUid}\tName=${displayName}\tPri=0`,
+      try {
+        const { enqueuePersonEnrollmentForSchool } = await import('@/utils/zkteco/commandQueue');
+        await enqueuePersonEnrollmentForSchool(
+          {
+            pin: cleanUid,
+            fullName: person.full_name,
+            role: person.role,
+            className: (person as any).classes?.name || null
+          },
           schoolId
         );
       } catch (cmdErr) {
-        console.warn('Non-blocking: Failed to enqueue ADMS user sync command:', cmdErr);
+        console.warn('Non-blocking: Failed to enqueue user sync command:', cmdErr);
       }
     }
 

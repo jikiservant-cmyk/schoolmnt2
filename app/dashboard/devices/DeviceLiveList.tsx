@@ -19,15 +19,24 @@ import {
   Layers, 
   X, 
   Sparkles,
-  Search
+  Search,
+  Key,
+  Eye,
+  EyeOff,
+  Copy,
+  Check,
+  RefreshCw,
+  Globe
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { 
   pushUsersToDeviceAction, 
   getDevicePushCandidatesAction, 
   autoAssignDevicePinsAction,
+  regenerateDeviceSecretAction,
   PushDeviceTargetOptions 
 } from './actions';
+import { SUPPORTED_DEVICE_TYPES } from '@/lib/devices/registry';
 
 interface DeviceItem {
   id: string;
@@ -40,6 +49,15 @@ interface DeviceItem {
   is_active: boolean | null;
   school_id?: string | null;
   schools?: { id?: string; name?: string } | null;
+  device_type?: string;
+  device_secret?: string | null;
+  config?: {
+    lateCutoffHour?: number;
+    lateCutoffMinute?: number;
+    timeZone?: string;
+    [key: string]: any;
+  };
+  status_code_map?: Record<string, 'check_in' | 'check_out'>;
 }
 
 interface ClassItem {
@@ -85,9 +103,42 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
   const [isPushing, setIsPushing] = useState(false);
   const [candidateFilter, setCandidateFilter] = useState('');
 
+  // Per-Device Secret state
+  const [revealedSecrets, setRevealedSecrets] = useState<Record<string, boolean>>({});
+  const [copiedSecretId, setCopiedSecretId] = useState<string | null>(null);
+  const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
+
+  const toggleSecretVisibility = (id: string) => {
+    setRevealedSecrets(prev => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const handleCopyToken = (id: string, token: string) => {
+    navigator.clipboard.writeText(token);
+    setCopiedSecretId(id);
+    setTimeout(() => setCopiedSecretId(null), 2000);
+  };
+
+  const handleRegenerateSecret = async (deviceId: string) => {
+    if (!confirm('Regenerating this security token will invalidate the previous secret on this terminal. Confirm to proceed?')) {
+      return;
+    }
+    setRegeneratingId(deviceId);
+    try {
+      const res = await regenerateDeviceSecretAction(deviceId);
+      if (res && (res as any).error) {
+        alert((res as any).error);
+      } else {
+        router.refresh();
+      }
+    } catch (err: any) {
+      alert(err?.message || 'Failed to regenerate device secret');
+    } finally {
+      setRegeneratingId(null);
+    }
+  };
+
   // Periodically refresh the server data and clock every 5 seconds
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setNow(Date.now());
     const interval = setInterval(() => {
       setNow(Date.now());
@@ -315,6 +366,19 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
         }
 
         const schoolName = dev.schools?.name || 'Assigned School';
+        const typeMeta = SUPPORTED_DEVICE_TYPES.find(t => t.type === dev.device_type) || {
+          type: dev.device_type || 'zkteco_adms',
+          label: (dev.device_type || 'zkteco_adms').toUpperCase().replace('_', ' '),
+          manufacturer: 'Universal',
+          description: ''
+        };
+        const secretToken = dev.device_secret || 'dev_sec_default';
+        const isSecretVisible = !!revealedSecrets[dev.id];
+        const lateH = dev.config?.lateCutoffHour ?? 8;
+        const lateM = dev.config?.lateCutoffMinute ?? 0;
+        const lateCutoffDisplay = `${String(lateH).padStart(2, '0')}:${String(lateM).padStart(2, '0')}`;
+        const tzDisplay = dev.config?.timeZone || 'Africa/Kampala';
+        const pushEndpoint = dev.device_type === 'zkteco_adms' ? '/iclock/cdata' : `/api/devices/push?sn=${dev.serial_number}`;
 
         return (
           <div
@@ -343,6 +407,12 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
                     <h4 className="font-semibold text-base text-[#171719]">
                       {dev.label || 'Biometric Terminal'}
                     </h4>
+
+                    {/* Protocol / Vendor Badge */}
+                    <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200">
+                      <Cpu className="w-3 h-3 text-amber-600" />
+                      {typeMeta.label}
+                    </span>
 
                     {/* School Multi-tenant Badge */}
                     <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
@@ -402,6 +472,55 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
                   <Clock className="w-3 h-3 text-gray-400" />
                   <span>Last Ping: {timeAgoText}</span>
                 </div>
+              </div>
+            </div>
+
+            {/* Hardware Security & Push Ingestion Details */}
+            <div className="pt-3 border-t border-gray-100 flex flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="flex items-center gap-2 font-mono bg-gray-50 border border-gray-200 px-3 py-1.5 rounded-lg">
+                <Key className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                <span className="text-gray-500 text-[11px]">Secret:</span>
+                <span className="font-semibold text-gray-800 tracking-wider select-all text-xs">
+                  {isSecretVisible ? secretToken : '••••••••••••••••'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => toggleSecretVisibility(dev.id)}
+                  className="text-gray-400 hover:text-gray-600 p-0.5 transition"
+                  title={isSecretVisible ? "Hide token" : "Reveal token"}
+                >
+                  {isSecretVisible ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleCopyToken(dev.id, secretToken)}
+                  className="text-gray-400 hover:text-gray-600 p-0.5 transition"
+                  title="Copy token"
+                >
+                  {copiedSecretId === dev.id ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleRegenerateSecret(dev.id)}
+                  disabled={regeneratingId === dev.id}
+                  className="text-gray-400 hover:text-amber-600 p-0.5 transition disabled:opacity-50"
+                  title="Regenerate token"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${regeneratingId === dev.id ? 'animate-spin text-amber-600' : ''}`} />
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] text-gray-500">
+                <span className="bg-blue-50 text-blue-700 px-2 py-0.5 rounded border border-blue-200 flex items-center gap-1">
+                  <Globe className="w-3 h-3 text-blue-600" />
+                  {pushEndpoint}
+                </span>
+                <span className="bg-gray-100 text-gray-700 px-2 py-0.5 rounded">
+                  Cutoff: {lateCutoffDisplay}
+                </span>
+                <span className="bg-gray-100 text-gray-700 px-2 py-0.5 rounded">
+                  {tzDisplay}
+                </span>
               </div>
             </div>
 

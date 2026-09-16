@@ -38,39 +38,63 @@ export async function GET(req: NextRequest) {
     .update({ last_seen_at: new Date().toISOString() })
     .eq('id', device.id);
 
-  // 2. Fetch pending commands from database queue strictly for this device
-  const { data: cmds } = await supabase
-    .from('device_logs')
-    .select('id, payload')
-    .eq('processed', false)
-    .eq('device_user_id', 'COMMAND')
-    .in('raw_serial_number', [cleanSn, 'ALL'])
-    .order('event_timestamp', { ascending: true })
-    .limit(100);
+  // 2. Fetch pending commands from primary school.device_commands queue
+  const { data: dbCommands, error: dbCmdsErr } = await supabase
+    .from('device_commands')
+    .select('id, raw_command')
+    .eq('status', 'pending')
+    .in('target_serial', [cleanSn, 'ALL'])
+    .order('created_at', { ascending: true })
+    .limit(50);
 
   const commandList: { id: string | number; text: string }[] = [];
-  const processedLogIds: string[] = [];
+  const sentCommandIds: string[] = [];
 
-  if (cmds && cmds.length > 0) {
-    cmds.forEach((c, idx) => {
-      processedLogIds.push(c.id);
-      const payloadObj = c.payload as { cmd?: string };
-      const rawCmd = payloadObj?.cmd?.trim();
-      if (rawCmd) {
-        commandList.push({
-          id: idx + 1,
-          text: rawCmd
-        });
-      }
+  if (dbCommands && dbCommands.length > 0) {
+    dbCommands.forEach((c) => {
+      sentCommandIds.push(c.id);
+      commandList.push({
+        id: c.id,
+        text: c.raw_command.trim()
+      });
     });
+
+    // Mark commands as sent to device
+    await supabase
+      .from('device_commands')
+      .update({ status: 'sent', sent_at: new Date().toISOString() })
+      .in('id', sentCommandIds);
   }
 
-  if (processedLogIds.length > 0) {
-    // Mark database commands as processed so they aren't delivered repeatedly
-    await supabase
+  // Fallback: Check legacy device_logs queue if primary queue was empty
+  if (commandList.length === 0) {
+    const { data: legacyCmds } = await supabase
       .from('device_logs')
-      .update({ processed: true, processed_at: new Date().toISOString() })
-      .in('id', processedLogIds);
+      .select('id, payload')
+      .eq('processed', false)
+      .eq('device_user_id', 'COMMAND')
+      .in('raw_serial_number', [cleanSn, 'ALL'])
+      .order('event_timestamp', { ascending: true })
+      .limit(50);
+
+    const processedLogIds: string[] = [];
+    if (legacyCmds && legacyCmds.length > 0) {
+      legacyCmds.forEach((c, idx) => {
+        processedLogIds.push(c.id);
+        const payloadObj = c.payload as { cmd?: string };
+        const rawCmd = payloadObj?.cmd?.trim();
+        if (rawCmd) {
+          commandList.push({
+            id: idx + 1,
+            text: rawCmd
+          });
+        }
+      });
+      await supabase
+        .from('device_logs')
+        .update({ processed: true, processed_at: new Date().toISOString() })
+        .in('id', processedLogIds);
+    }
   }
 
   if (commandList.length > 0) {
