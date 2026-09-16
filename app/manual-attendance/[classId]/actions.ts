@@ -1,5 +1,6 @@
 'use server';
 
+import { createClient } from '@/utils/supabase/server';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { 
   isWithinAttendanceSmsWindow, 
@@ -25,6 +26,13 @@ export interface StudentAttendanceStatus {
 
 export async function verifyTeacherPin(classId: string, teacherId: string, pin: string) {
   await new Promise(resolve => setTimeout(resolve, 300));
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { success: false, error: 'Unauthorized.' };
+
+  const { data: schoolId } = await supabase.rpc('auth_school_id');
+  if (!schoolId) return { success: false, error: 'School context not found.' };
+
   const adminClient = createAdminClient();
 
   const { data: staffUser } = await adminClient
@@ -41,7 +49,7 @@ export async function verifyTeacherPin(classId: string, teacherId: string, pin: 
   }
 
   const cleanPin = pin.trim().toUpperCase();
-  const isMatch = staffUser.pin_hash && (bcrypt.compareSync(cleanPin, staffUser.pin_hash) || bcrypt.compareSync(pin.trim(), staffUser.pin_hash));
+  const isMatch = staffUser.pin_hash && ((await bcrypt.compare(cleanPin, staffUser.pin_hash)) || (await bcrypt.compare(pin.trim(), staffUser.pin_hash)));
   
   if (!isMatch) {
     const newFailures = (staffUser.failed_attempts || 0) + 1;
@@ -53,30 +61,39 @@ export async function verifyTeacherPin(classId: string, teacherId: string, pin: 
 
   await adminClient.from('staff_users').update({ failed_attempts: 0, locked_until: null }).eq('id', staffUser.id);
   
-  const { data: teacher } = await adminClient
+  const { data: teacher } = await supabase
     .from('people')
     .select('id, full_name, role, school_id, device_user_id')
     .eq('id', staffUser.person_id)
+    .eq('school_id', schoolId)
     .maybeSingle();
+
+  if (!teacher) return { success: false, error: 'Teacher access denied.' };
     
   return { success: true, teacher: teacher };
 }
 
 export async function getTeachersForClass(classId: string) {
-  const adminClient = createAdminClient();
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { success: false, error: 'Unauthorized.' };
+
+  const { data: schoolId } = await supabase.rpc('auth_school_id');
+  if (!schoolId) return { success: false, error: 'School context not found.' };
   
-  const { data: cls } = await adminClient
+  const { data: cls } = await supabase
     .from('classes')
-    .select('school_id')
+    .select('id')
     .eq('id', classId)
+    .eq('school_id', schoolId)
     .maybeSingle();
 
-  if (!cls) return { success: false, error: 'Class not found' };
+  if (!cls) return { success: false, error: 'Class not found or access denied.' };
 
-  const { data: teachers } = await adminClient
+  const { data: teachers } = await supabase
     .from('people')
     .select('id, full_name')
-    .eq('school_id', cls.school_id)
+    .eq('school_id', schoolId)
     .eq('role', 'teacher')
     .eq('is_active', true)
     .order('full_name');
@@ -85,11 +102,27 @@ export async function getTeachersForClass(classId: string) {
 }
 
 export async function getStudentsForClass(classId: string) {
-  const adminClient = createAdminClient();
-  const { data: students, error } = await adminClient
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { error: 'Unauthorized.' };
+
+  const { data: schoolId } = await supabase.rpc('auth_school_id');
+  if (!schoolId) return { error: 'School context not found.' };
+
+  const { data: cls } = await supabase
+    .from('classes')
+    .select('id')
+    .eq('id', classId)
+    .eq('school_id', schoolId)
+    .maybeSingle();
+
+  if (!cls) return { error: 'Class not found or access denied.' };
+
+  const { data: students, error } = await supabase
     .from('people')
     .select('id, full_name, device_user_id')
     .eq('class_id', classId)
+    .eq('school_id', schoolId)
     .eq('role', 'student')
     .eq('is_active', true)
     .order('full_name');
@@ -106,7 +139,7 @@ export async function getStudentsForClass(classId: string) {
   const { startIso, endIso } = getEatTodayRange();
   const studentIds = students.map(s => s.id);
 
-  const { data: logs } = await adminClient
+  const { data: logs } = await supabase
     .from('attendance_logs')
     .select('person_id, attendance_type, status, occurred_at')
     .in('person_id', studentIds)
@@ -174,23 +207,31 @@ export async function submitClassAttendance(
   absentStudentIds: string[],
   attendanceType: 'check_in' | 'check_out' = 'check_in'
 ) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { success: false, error: 'Unauthorized.' };
+
+  const { data: schoolId } = await supabase.rpc('auth_school_id');
+  if (!schoolId) return { success: false, error: 'School context not found.' };
+
   const adminClient = createAdminClient();
 
-  // Get class and school info
-  const { data: cls } = await adminClient
+  // Get class and school info, scoped by schoolId
+  const { data: cls } = await supabase
     .from('classes')
     .select('id, name, school_id')
     .eq('id', classId)
+    .eq('school_id', schoolId)
     .maybeSingle();
 
-  if (!cls) return { success: false, error: 'Class not found' };
+  if (!cls) return { success: false, error: 'Class not found or access denied' };
   
   // Resolve staff_users.id for marked_by FK constraint
   let markedByStaffUserId: string | null = null;
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   
   if (teacherId && uuidRegex.test(teacherId)) {
-    const { data: staffUser } = await adminClient
+    const { data: staffUser } = await supabase
       .from('staff_users')
       .select('id')
       .or(`id.eq.${teacherId},person_id.eq.${teacherId}`)

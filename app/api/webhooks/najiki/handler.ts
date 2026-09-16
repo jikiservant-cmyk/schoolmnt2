@@ -61,7 +61,14 @@ export async function handleNajikiWebhook(req: NextRequest) {
       return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
     }
 
-    console.log('[NaJiki Webhook] Received payload:', JSON.stringify(payload));
+    // Remove PII from logging
+    const safeLogPayload = { ...payload };
+    if (safeLogPayload.data) {
+      delete safeLogPayload.data.phone;
+      delete safeLogPayload.data.email;
+      delete safeLogPayload.data.customer_name;
+    }
+    console.log('[NaJiki Webhook] Received payload:', JSON.stringify(safeLogPayload));
 
     const publicAdmin = createPublicAdminClient();
     const eventType = (payload.event || payload.eventType || payload.type || payload.event_type || '').toString().toLowerCase();
@@ -136,6 +143,18 @@ export async function handleNajikiWebhook(req: NextRequest) {
 
         console.log(`[NaJiki Webhook] Processing wallet credit for school ${targetSchoolId} (raw identifier: ${schoolId}) with amount ${amount} UGX, ref: ${txRef}`);
         
+        // Strict Idempotency Check: Verify if txRef already exists
+        const { data: existingTx } = await publicAdmin
+          .from('transactions')
+          .select('id')
+          .eq('reference', txRef)
+          .maybeSingle();
+
+        if (existingTx) {
+          console.log(`[NaJiki Webhook] Transaction ${txRef} already processed (Idempotency Hit). Ignoring.`);
+          return NextResponse.json({ success: true, message: 'Transaction already processed' }, { status: 200 });
+        }
+
         let credited = false;
 
         // 1. Try RPC credit_wallet
@@ -185,7 +204,27 @@ export async function handleNajikiWebhook(req: NextRequest) {
                 .select('id')
                 .maybeSingle();
               walletId = newWallet?.id || genId;
-            } else {
+            }
+
+            // 4. Record transaction FIRST to enforce unique constraint on reference (idempotency fallback for race conditions)
+            if (walletId) {
+              const { error: tErr } = await publicAdmin.from('transactions').insert({
+                wallet_id: walletId,
+                amount: amount,
+                type: 'credit',
+                reference: txRef,
+                status: 'completed',
+                description: `NaJiki Mobile Money Top-up (+${amount.toLocaleString()} UGX)`
+              });
+
+              if (tErr) {
+                console.warn('[NaJiki Webhook] Failed inserting transactions row, likely duplicate reference during race condition:', tErr);
+                return NextResponse.json({ success: true, message: 'Transaction already processed or failed to insert' }, { status: 200 });
+              }
+            }
+
+            // If we successfully recorded the transaction, update the balance
+            if (walletData) {
               await publicAdmin
                 .from('wallets')
                 .update({ balance: newBal })
@@ -214,22 +253,6 @@ export async function handleNajikiWebhook(req: NextRequest) {
               }
             } catch (schErr) {
               console.warn('[NaJiki Webhook] Notice updating schools.settings:', schErr);
-            }
-
-            // 4. Record transaction
-            if (walletId) {
-              try {
-                await publicAdmin.from('transactions').insert({
-                  wallet_id: walletId,
-                  amount: amount,
-                  type: 'credit',
-                  reference: txRef,
-                  status: 'completed',
-                  description: `NaJiki Mobile Money Top-up (+${amount.toLocaleString()} UGX)`
-                });
-              } catch (tErr) {
-                console.warn('[NaJiki Webhook] Notice inserting transactions row:', tErr);
-              }
             }
 
             credited = true;

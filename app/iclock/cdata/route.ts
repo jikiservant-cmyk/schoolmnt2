@@ -11,13 +11,13 @@ async function authenticateDevice(req: NextRequest, sn: string | null) {
     return { authenticated: false, reason: 'Missing device serial number (SN)' };
   }
 
-  const cleanSn = sn.trim().toUpperCase();
+  const cleanSn = sn.trim().toUpperCase().replace(/[%_]/g, '');
   const supabase = createAdminClient();
 
   const { data: rawDevice, error } = await supabase
     .from('devices')
     .select('*')
-    .ilike('serial_number', cleanSn)
+    .eq('serial_number', cleanSn)
     .maybeSingle();
 
   if (error || !rawDevice) {

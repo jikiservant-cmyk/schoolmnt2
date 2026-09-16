@@ -6,6 +6,13 @@ import CopyLinkButton from './CopyLinkButton';
 
 export default async function ClassesPage() {
   const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return null;
+
+  const { data: schoolId } = await supabase.rpc('auth_school_id');
+  if (!schoolId) {
+    return <div>Error: School context not found.</div>;
+  }
 
   // 1. Fetch raw classes
   const { data: classesRaw } = await supabase
@@ -18,12 +25,14 @@ export default async function ClassesPage() {
         name
       )
     `)
+    .eq('school_id', schoolId)
     .order('name');
 
   // 2. Fetch all teachers (to pass to the form and display list assignments)
   const { data: teachersRaw } = await supabase
     .from('people')
     .select('id, full_name')
+    .eq('school_id', schoolId)
     .eq('role', 'teacher')
     .eq('is_active', true)
     .order('full_name');
@@ -32,6 +41,7 @@ export default async function ClassesPage() {
   const { data: studentsRaw } = await supabase
     .from('people')
     .select('id, class_id')
+    .eq('school_id', schoolId)
     .eq('role', 'student')
     .eq('is_active', true);
 

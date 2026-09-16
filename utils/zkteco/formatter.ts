@@ -47,5 +47,8 @@ export function formatZKTecoDisplayName(person: PersonInfo): string {
     }
   }
 
+  // Sanitize out ADMS command control characters
+  formatted = formatted.replace(/[\t\r\n=]/g, '');
+
   return formatted;
 }

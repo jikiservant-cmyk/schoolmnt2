@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/utils/supabase/admin';
+import { parseDeviceMetadata } from '@/lib/devices/metadata';
+import { getDeviceAdapter } from '@/lib/devices/registry';
 
 // Device polling for server commands (ADMS /iclock/getrequest)
 // Required config to prevent caching the polling endpoint
@@ -14,22 +16,32 @@ export async function GET(req: NextRequest) {
     return new NextResponse('OK', { status: 200, headers: { 'Content-Type': 'text/plain' } });
   }
 
-  const cleanSn = sn.trim().toUpperCase();
+  const cleanSn = sn.trim().toUpperCase().replace(/[%_]/g, '');
   const supabase = createAdminClient();
 
   // Validate device exists and is active
-  const { data: device } = await supabase
+  const { data: rawDevice } = await supabase
     .from('devices')
-    .select('id, school_id, is_active')
-    .ilike('serial_number', cleanSn)
+    .select('*')
+    .eq('serial_number', cleanSn)
     .maybeSingle();
 
-  if (!device || !device.is_active) {
+  if (!rawDevice || !rawDevice.is_active) {
     console.warn(`[ZKTeco ADMS] getrequest from unauthorized or inactive device SN: ${cleanSn}`);
     return new NextResponse('ERROR: UNAUTHORIZED_DEVICE', { 
       status: 401, 
       headers: { 'Content-Type': 'text/plain' } 
     });
+  }
+
+  const device = parseDeviceMetadata(rawDevice);
+  const adapter = getDeviceAdapter(device.device_type);
+
+  // Enforce token/secret verification
+  const isAuth = await adapter.buildAuthCheck(req, device);
+  if (!isAuth) {
+    console.warn(`[ZKTeco ADMS] getrequest authentication failed for SN: ${cleanSn}`);
+    return new NextResponse('ERROR: INVALID_CREDENTIALS', { status: 401 });
   }
 
   // 1. Update device heartbeat

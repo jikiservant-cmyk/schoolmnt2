@@ -150,39 +150,40 @@ export function isAuthorizedToken(
   deviceSecretOrHash: string | null,
   globalSecret: string | undefined = process.env.ZKTECO_DEVICE_SECRET
 ): boolean {
-  if (!providedToken) {
-    // If no secret or hash configured anywhere, allow connection (open setup)
-    return !deviceSecretOrHash && !globalSecret;
+  if (!providedToken || !providedToken.trim()) {
+    return false; // Fail-closed: Never permit anonymous device pushes
   }
 
   const cleanProvided = providedToken.trim();
+  const target = deviceSecretOrHash?.trim() || globalSecret?.trim();
 
-  // 1. If device has a secret or hash configured
-  if (deviceSecretOrHash && deviceSecretOrHash.trim().length > 0) {
-    const target = deviceSecretOrHash.trim();
+  if (!target) {
+    return false; // Fail-closed if no secret configured on server
+  }
 
-    // Check if stored target is a SHA-256 hash (64 hex characters)
-    if (/^[0-9a-fA-F]{64}$/.test(target)) {
-      const computedHash = hashDeviceSecret(cleanProvided);
-      try {
-        return crypto.timingSafeEqual(
-          Buffer.from(computedHash, 'utf8'),
-          Buffer.from(target.toLowerCase(), 'utf8')
-        );
-      } catch {
-        return computedHash.toLowerCase() === target.toLowerCase();
-      }
+  // 1. Check if stored target is a SHA-256 hash (64 hex characters)
+  if (/^[0-9a-fA-F]{64}$/.test(target)) {
+    const computedHash = hashDeviceSecret(cleanProvided);
+    try {
+      return crypto.timingSafeEqual(
+        Buffer.from(computedHash, 'utf8'),
+        Buffer.from(target.toLowerCase(), 'utf8')
+      );
+    } catch {
+      return computedHash.toLowerCase() === target.toLowerCase();
     }
+  }
 
-    // Direct comparison for unhashed legacy secret
+  // 2. Direct timing-safe comparison for unhashed legacy secret
+  try {
+    // Pad or truncate to ensure equal length for timingSafeEqual if needed, 
+    // but easiest is to check length first to prevent Buffer throw.
+    if (cleanProvided.length !== target.length) return false;
+    return crypto.timingSafeEqual(
+      Buffer.from(cleanProvided, 'utf8'),
+      Buffer.from(target, 'utf8')
+    );
+  } catch {
     return cleanProvided === target;
   }
-
-  // 2. Fallback to global env secret if configured
-  if (globalSecret && globalSecret.trim().length > 0) {
-    return cleanProvided === globalSecret.trim();
-  }
-
-  // If no secrets are configured anywhere, allow connection (open setup)
-  return true;
 }

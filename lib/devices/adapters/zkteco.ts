@@ -152,7 +152,7 @@ export class ZKTecoAdmsAdapter implements DeviceAdapter {
     });
 
     const pri = person.role === 'admin' ? 14 : 0;
-    const cleanPin = person.pin.trim();
+    const cleanPin = person.pin.trim().replace(/[\t\r\n=]/g, '');
     const command = `DATA UPDATE userinfo PIN=${cleanPin}\tName=${displayName}\tPri=${pri}`;
 
     return {

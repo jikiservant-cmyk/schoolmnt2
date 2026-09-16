@@ -1,14 +1,44 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/utils/supabase/admin';
+import { parseDeviceMetadata } from '@/lib/devices/metadata';
+import { getDeviceAdapter } from '@/lib/devices/registry';
 
 // Device responding with the execution status of a command (ZKTeco ADMS /iclock/devicecmd)
 export async function POST(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const sn = searchParams.get('SN');
   
+  if (!sn || !sn.trim()) {
+    return new NextResponse('ERROR: Missing SN', { status: 400 });
+  }
+
   const rawBody = await req.text();
   console.log(`[ZKTeco ADMS] DeviceCmd POST from SN: ${sn}`);
-  console.log(`[ZKTeco ADMS] Payload:\n${rawBody}`);
+
+  const supabase = createAdminClient();
+  const cleanSn = sn.trim().toUpperCase().replace(/[%_]/g, '');
+
+  // Validate device exists and is active
+  const { data: rawDevice } = await supabase
+    .from('devices')
+    .select('*')
+    .eq('serial_number', cleanSn)
+    .maybeSingle();
+
+  if (!rawDevice || !rawDevice.is_active) {
+    console.warn(`[ZKTeco ADMS] devicecmd from unauthorized or inactive device SN: ${cleanSn}`);
+    return new NextResponse('ERROR: UNAUTHORIZED_DEVICE', { status: 401 });
+  }
+
+  const device = parseDeviceMetadata(rawDevice);
+  const adapter = getDeviceAdapter(device.device_type);
+
+  // Enforce token/secret verification
+  const isAuth = await adapter.buildAuthCheck(req, device);
+  if (!isAuth) {
+    console.warn(`[ZKTeco ADMS] devicecmd authentication failed for SN: ${cleanSn}`);
+    return new NextResponse('ERROR: INVALID_CREDENTIALS', { status: 401 });
+  }
 
   if (rawBody && rawBody.trim()) {
     try {

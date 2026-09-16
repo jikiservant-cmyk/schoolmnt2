@@ -596,7 +596,7 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
         currentPinNum++;
       } while (existingPins.has(String(currentPinNum)));
 
-      const assignedPin = String(currentPinNum);
+      const assignedPin = String(currentPinNum).replace(/[\t\r\n=]/g, '');
       existingPins.add(assignedPin);
 
       // Update in DB
