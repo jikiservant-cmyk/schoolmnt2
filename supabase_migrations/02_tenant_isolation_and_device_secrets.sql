@@ -275,3 +275,90 @@ BEGIN
     END IF;
   END IF;
 END $$;
+
+-- Device serials are the external identity used by hardware protocols before
+-- their per-device token is checked. They must be globally unique after
+-- normalization or two tenants could claim the same terminal.
+DO $$
+BEGIN
+  IF to_regclass('school.devices') IS NOT NULL
+     AND EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'school' AND table_name = 'devices' AND column_name = 'serial_number'
+     ) THEN
+    IF EXISTS (
+      SELECT 1
+      FROM school.devices
+      WHERE serial_number IS NOT NULL AND btrim(serial_number::TEXT) <> ''
+      GROUP BY upper(btrim(serial_number::TEXT))
+      HAVING count(*) > 1
+    ) THEN
+      RAISE EXCEPTION 'Duplicate normalized device serial numbers exist; reconcile them before applying migration 02.';
+    END IF;
+
+    UPDATE school.devices
+    SET serial_number = upper(btrim(serial_number::TEXT))
+    WHERE serial_number IS NOT NULL
+      AND serial_number::TEXT IS DISTINCT FROM upper(btrim(serial_number::TEXT));
+
+    CREATE UNIQUE INDEX IF NOT EXISTS devices_serial_number_normalized_uq
+      ON school.devices (upper(btrim(serial_number::TEXT)))
+      WHERE serial_number IS NOT NULL AND btrim(serial_number::TEXT) <> '';
+  END IF;
+END $$;
+
+-- Authenticated school users may view device configuration, but device tokens
+-- and legacy packed firmware metadata are server-only. Remove broad table grants
+-- and grant only the non-sensitive columns actually used by browser queries.
+DO $$
+DECLARE
+  safe_select_columns TEXT;
+BEGIN
+  IF to_regclass('school.devices') IS NOT NULL THEN
+    REVOKE ALL PRIVILEGES ON TABLE school.devices FROM PUBLIC, anon, authenticated;
+    GRANT ALL PRIVILEGES ON TABLE school.devices TO service_role;
+
+    SELECT string_agg(format('%I', column_name), ', ' ORDER BY ordinal_position)
+    INTO safe_select_columns
+    FROM information_schema.columns
+    WHERE table_schema = 'school'
+      AND table_name = 'devices'
+      AND column_name = ANY (ARRAY[
+        'id', 'school_id', 'serial_number', 'label', 'location_label', 'ip_address',
+        'device_type', 'status_code_map', 'config', 'is_active', 'last_seen_at',
+        'created_at', 'updated_at'
+      ]);
+
+    IF safe_select_columns IS NULL THEN
+      RAISE EXCEPTION 'No safe device columns were found for authenticated reads.';
+    END IF;
+
+    EXECUTE format('GRANT SELECT (%s) ON TABLE school.devices TO authenticated', safe_select_columns);
+  END IF;
+END $$;
+
+-- Staff PIN hashes and lockout internals must not be readable by a browser
+-- session, even for the authenticated user's own staff row. App code accesses
+-- those sensitive columns through the service-role client only.
+DO $$
+DECLARE
+  safe_select_columns TEXT;
+BEGIN
+  IF to_regclass('school.staff_users') IS NOT NULL THEN
+    REVOKE ALL PRIVILEGES ON TABLE school.staff_users FROM PUBLIC, anon, authenticated;
+    GRANT ALL PRIVILEGES ON TABLE school.staff_users TO service_role;
+
+    SELECT string_agg(format('%I', column_name), ', ' ORDER BY ordinal_position)
+    INTO safe_select_columns
+    FROM information_schema.columns
+    WHERE table_schema = 'school'
+      AND table_name = 'staff_users'
+      AND column_name = ANY (ARRAY['id', 'auth_user_id', 'person_id', 'staff_role']);
+
+    IF safe_select_columns IS NULL THEN
+      RAISE EXCEPTION 'No safe staff_users columns were found for authenticated reads.';
+    END IF;
+
+    EXECUTE format('GRANT SELECT (%s) ON TABLE school.staff_users TO authenticated', safe_select_columns);
+  END IF;
+END $$;

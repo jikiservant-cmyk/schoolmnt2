@@ -9,6 +9,7 @@ Configure secrets in the hosting provider, not in Git:
 - `NEXT_PUBLIC_SUPABASE_URL` (or the supported server-side alias `SUPABASE_URL`)
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY` (or `SUPABASE_ANON_KEY`)
 - `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_SERVICE_KEY`); server-only
+- Optional `ATTENDANCE_SESSION_SECRET` (at least 32 random characters); otherwise short-lived kiosk session tokens are derived from the server-only service-role key
 - `NAJIKI_API_KEY` for payment initiation and webhook authentication
 - `NAJIKI_API_URL` or `NAJIKI_DOMAIN` for the intended payment provider endpoint
 - `NAJIKI_APP_CODE` if required by the provider
@@ -19,17 +20,18 @@ The app now fails closed when public Supabase settings are absent or invalid. Th
 
 1. Take and verify a restorable database backup before schema changes.
 2. Apply `supabase_migrations/01_add_multi_vendor_device_columns.sql`, `02_tenant_isolation_and_device_secrets.sql`, `03_idempotent_attendance_and_device_pins.sql`, and `04_restrict_public_admin_tables.sql` in staging, in order.
-3. Migration 03 deliberately aborts if it finds duplicate school PINs, normalized `person_credentials` identifiers (when that optional table exists), or duplicate related notification rows. Review and reconcile those records rather than bypassing the checks.
-4. Verify RLS is enabled and the intended policies exist for every exposed table in both `school` and `public`. Migration 04 denies direct `anon`/`authenticated` access to the app's public admin tables; confirm any external consumer that needs public access has its own reviewed, tenant-scoped policy before applying it.
-5. Run `npm run test:tenant-integration` with a dedicated test project and two separate school accounts. Verify reads and writes are denied across tenants.
-6. Apply the same migration sequence to production only after the staging test passes. Keep `03_idempotent_attendance_and_device_pins.down.sql` as a rollback aid; it removes the new unique indexes but intentionally preserves attendance idempotency keys. Restore the backup if a schema or data rollback is required.
+3. Migration 02 normalizes device serials and adds a global normalized unique index. Reconcile duplicate serials across all schools before applying it; do not remove the uniqueness gate.
+4. Migration 03 deliberately aborts if it finds duplicate school PINs, normalized `person_credentials` identifiers (when that optional table exists), or duplicate related notification rows. Review and reconcile those records rather than bypassing the checks.
+5. Verify RLS is enabled and the intended policies exist for every exposed table in both `school` and `public`. Migration 02 limits authenticated device-table reads to non-sensitive columns and prevents browser sessions from reading staff PIN hashes/lockout fields. Migration 04 denies direct `anon`/`authenticated` access to public admin tables and revokes those roles' execution rights on any existing `public.credit_wallet` overload; verify only `service_role` can execute the RPC. Confirm any external consumer needing public access has a reviewed, tenant-scoped policy before applying it.
+6. Run `npm run test:tenant-integration` with a dedicated test project and two separate school accounts. Verify reads and writes are denied across tenants and the test account cannot read device tokens, firmware metadata, or staff PIN hashes/lockout fields. Separately inspect database grants to confirm only `service_role` can execute the wallet-credit and PIN-lockout RPCs.
+7. Apply the same migration sequence to production only after the staging test passes. Keep `03_idempotent_attendance_and_device_pins.down.sql` as a rollback aid; it removes the new indexes and atomic PIN lockout function but intentionally preserves attendance idempotency keys. Restore the backup if a schema or data rollback is required.
 
 ## External integrations that require a production smoke test
 
 - Enforce HTTPS at the hosting proxy, retain the app's HSTS header, and configure provider/platform rate limits for login/signup, webhook, and device-ingestion endpoints. The repository does not provide a durable distributed rate limiter.
 - **SMS:** verify that the deployed sender consumes `school.notifications`, records its provider reference there, and that a signed NaJiki delivery callback updates the same row. Send one test attendance notification and verify delivered/failed status. `processPendingNotificationsAction` is intentionally not a sender.
 - **Payments:** verify that `public.credit_wallet(p_school_id, p_amount, p_tx_ref)` updates the wallet and inserts the transaction atomically, with a unique transaction reference. Verify that the provider honors the submitted idempotency key when the same top-up request is retried. The webhook returns a retryable error if this RPC is missing or fails; it does not use a non-atomic REST fallback.
-- **Devices:** test an authenticated device handshake, an attendance push within the 2 MiB/1,000-event limits, an oversized request (413), and a replay. Apply migration 03 before deploying code that uses attendance idempotency keys.
+- **Devices:** test an authenticated device handshake, an attendance push within the 2 MiB/1,000-event limits, an oversized request (413), and a replay. Rotate each pre-existing legacy device secret through the admin UI, install the one-time replacement on the terminal, and confirm the old token no longer works; rotation also scrubs packed legacy secrets. Apply migration 03 before deploying code that uses attendance idempotency keys.
 
 ## Application verification
 

@@ -27,3 +27,29 @@ BEGIN
     );
   END LOOP;
 END $$;
+
+-- The app invokes this atomic wallet RPC only with its service-role client.
+-- PostgreSQL grants EXECUTE to PUBLIC by default; table RLS alone does not
+-- protect a SECURITY DEFINER function from arbitrary wallet-credit requests.
+DO $$
+DECLARE
+  function_identity_arguments TEXT;
+BEGIN
+  FOR function_identity_arguments IN
+    SELECT pg_get_function_identity_arguments(p.oid)
+    FROM pg_proc AS p
+    JOIN pg_namespace AS n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND p.proname = 'credit_wallet'
+      AND p.prokind = 'f'
+  LOOP
+    EXECUTE format(
+      'REVOKE EXECUTE ON FUNCTION public.credit_wallet(%s) FROM PUBLIC, anon, authenticated',
+      function_identity_arguments
+    );
+    EXECUTE format(
+      'GRANT EXECUTE ON FUNCTION public.credit_wallet(%s) TO service_role',
+      function_identity_arguments
+    );
+  END LOOP;
+END $$;

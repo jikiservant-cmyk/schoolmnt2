@@ -1,4 +1,5 @@
-import { createClient } from '@/utils/supabase/server';
+import { createAdminClient } from '@/utils/supabase/admin';
+import { requireSchoolAdmin } from '@/lib/auth-guard';
 import AddDeviceForm from './AddDeviceForm';
 import DeviceLiveList from './DeviceLiveList';
 import { Smartphone, ArrowLeft, ShieldCheck, RefreshCw } from 'lucide-react';
@@ -6,24 +7,19 @@ import Link from 'next/link';
 import { getClientSafeDeviceMetadata } from '@/lib/devices/metadata';
 
 export default async function DevicesPage() {
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return null;
+  const { schoolId } = await requireSchoolAdmin();
+  const adminClient = createAdminClient();
 
-  const { data: schoolId } = await supabase.rpc('auth_school_id');
-  if (!schoolId) {
-    return <div>Error: School context not found.</div>;
-  }
-
-  // 1. Fetch registered physical devices with school information (excluding sensitive secrets)
-  const { data: devicesData } = await supabase
+  // Read legacy metadata with server credentials only; the mapper removes any
+  // packed secrets before data is passed to client components.
+  const { data: devicesData } = await adminClient
     .from('devices')
     .select('id, serial_number, label, location_label, ip_address, firmware_version, device_type, config, last_seen_at, is_active, created_at, school_id, schools:school_id(id, name)')
     .eq('school_id', schoolId)
     .order('created_at', { ascending: false });
 
   // 2. Fetch classes for class-by-class student push
-  const { data: classesData } = await supabase
+  const { data: classesData } = await adminClient
     .from('classes')
     .select('id, name, school_id')
     .eq('school_id', schoolId)

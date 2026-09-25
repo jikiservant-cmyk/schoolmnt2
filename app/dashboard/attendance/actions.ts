@@ -271,42 +271,52 @@ export async function getSchoolBalance() {
     const { supabase, schoolId } = await requireSchoolAdmin();
     const publicAdmin = createPublicAdminClient();
     
-    // Check wallet balance (supporting both tenant_id and school_id columns)
-    let walletBalance: number | null = null;
-    try {
-      const { data: wallet } = await publicAdmin
-        .from('wallets')
-        .select('balance')
-        .or(`tenant_id.eq.${schoolId},school_id.eq.${schoolId}`)
-        .maybeSingle();
-
-      if (wallet && wallet.balance !== null && wallet.balance !== undefined) {
-        walletBalance = Number(wallet.balance);
-      }
-    } catch {
-      // Fallback direct query if .or fails
-      const { data: w1 } = await publicAdmin.from('wallets').select('balance').eq('tenant_id', schoolId).maybeSingle();
-      if (w1?.balance !== null && w1?.balance !== undefined) {
-        walletBalance = Number(w1.balance);
-      } else {
-        const { data: w2 } = await publicAdmin.from('wallets').select('balance').eq('school_id', schoolId).maybeSingle();
-        if (w2?.balance !== null && w2?.balance !== undefined) {
-          walletBalance = Number(w2.balance);
-        }
-      }
+    // Support both historical wallet schemas, while treating non-schema query
+    // failures and conflicting tenant rows as errors rather than stale balances.
+    const missingWalletColumnCodes = new Set(['42703', 'PGRST204']);
+    const [walletByTenantId, walletBySchoolId] = await Promise.all([
+      publicAdmin.from('wallets').select('id, balance').eq('tenant_id', schoolId).maybeSingle(),
+      publicAdmin.from('wallets').select('id, balance').eq('school_id', schoolId).maybeSingle(),
+    ]);
+    const unexpectedWalletError = [walletByTenantId.error, walletBySchoolId.error].find(
+      error => error && !missingWalletColumnCodes.has(error.code || ''),
+    );
+    if (unexpectedWalletError || (walletByTenantId.error && walletBySchoolId.error)) {
+      console.error('Could not verify the school wallet:', unexpectedWalletError);
+      return { error: 'Could not verify the school wallet balance.' };
+    }
+    if (
+      walletByTenantId.data && walletBySchoolId.data &&
+      walletByTenantId.data.id !== walletBySchoolId.data.id
+    ) {
+      console.error('Conflicting wallet rows exist for the school.');
+      return { error: 'Wallet configuration is ambiguous. Contact support.' };
     }
 
-    // Also check school settings balance
-    const { data: schoolRecord } = await supabase
+    const wallet = walletByTenantId.data || walletBySchoolId.data;
+    let walletBalance: number | null = null;
+    if (wallet?.balance !== null && wallet?.balance !== undefined) {
+      const parsedBalance = Number(wallet.balance);
+      if (!Number.isFinite(parsedBalance)) return { error: 'The school wallet balance is invalid.' };
+      walletBalance = parsedBalance;
+    }
+
+    // Historical installations may keep a balance in school.settings instead.
+    const { data: schoolRecord, error: schoolError } = await supabase
       .from('schools')
       .select('settings')
       .eq('id', schoolId)
       .maybeSingle();
+    if (schoolError) return { error: 'Could not load the school balance.' };
 
-    const settingsBalance = schoolRecord?.settings?.balance !== undefined ? Number(schoolRecord.settings.balance) : null;
+    const settingsBalance = schoolRecord?.settings?.balance !== undefined
+      ? Number(schoolRecord.settings.balance)
+      : null;
+    if (settingsBalance !== null && !Number.isFinite(settingsBalance)) {
+      return { error: 'The school balance setting is invalid.' };
+    }
 
     const resolvedBalance = walletBalance !== null ? walletBalance : (settingsBalance !== null ? settingsBalance : 0);
-
     return { balance: resolvedBalance };
   } catch (err) {
     console.error('Error fetching balance:', err);
@@ -506,7 +516,9 @@ export async function topUpBalance(amount: number, phoneNumber: string, requestI
     : formattedPhoneNumeric;
 
   // 4. Generate unique transaction / idempotency key
-  const idempotencyKey = `sch_topup_${requestId?.toLowerCase() || crypto.randomUUID()}`;
+  // Namespace provider idempotency by school so equal client UUIDs from two
+  // tenants can never suppress or replay each other's top-up requests.
+  const idempotencyKey = `sch_topup_${school.id}_${requestId?.toLowerCase() || crypto.randomUUID()}`;
 
   // 5. Determine NaJiki API Endpoint
   let endpointUrl = process.env.NAJIKI_API_URL?.trim();

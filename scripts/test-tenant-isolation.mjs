@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = process.env.TEST_SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -80,11 +81,34 @@ async function assertPublicTableNotReadable(client, table, roleLabel) {
   return true;
 }
 
+async function assertColumnNotReadable(client, table, column, roleLabel) {
+  const { error } = await client.from(table).select(column).limit(1);
+  assert.ok(
+    error && error.code === '42501',
+    `${roleLabel} unexpectedly read ${table}.${column}${error ? ` (${error.code}: ${error.message})` : ''}`,
+  );
+}
+
 async function main() {
   assert.notEqual(schoolAEmail, schoolBEmail, 'Use two distinct test-school accounts.');
   const schoolA = await schoolClient(schoolAEmail, schoolAPassword);
   const schoolB = await schoolClient(schoolBEmail, schoolBPassword);
   assert.notEqual(schoolA.schoolId, schoolB.schoolId, 'Test accounts must belong to different schools.');
+
+  await assertColumnNotReadable(schoolA.client, 'devices', 'device_secret', 'School A');
+  await assertColumnNotReadable(schoolA.client, 'devices', 'device_secret_hash', 'School A');
+  await assertColumnNotReadable(schoolA.client, 'devices', 'firmware_version', 'School A');
+  await assertColumnNotReadable(schoolA.client, 'staff_users', 'pin_hash', 'School A');
+  await assertColumnNotReadable(schoolA.client, 'staff_users', 'failed_attempts', 'School A');
+  await assertColumnNotReadable(schoolA.client, 'staff_users', 'locked_until', 'School A');
+  const { error: pinLockoutRpcError } = await schoolA.client.rpc('record_teacher_pin_failure', {
+    p_staff_user_id: randomUUID(),
+    p_person_id: randomUUID(),
+  });
+  assert.ok(
+    pinLockoutRpcError && ['42501', 'PGRST202'].includes(pinLockoutRpcError.code),
+    `Authenticated School A must not execute the service-only PIN lockout RPC${pinLockoutRpcError ? ` (${pinLockoutRpcError.code}: ${pinLockoutRpcError.message})` : ''}`,
+  );
 
   let checkedTables = 0;
   let checkedIds = 0;
@@ -210,7 +234,8 @@ async function main() {
   }
 
   // Optional HTTP check confirms a token issued for School A's physical device
-  // cannot authenticate as School B's device. It makes no event/database write.
+  // cannot authenticate as School B's device. An empty push may update the
+  // device heartbeat, but must not create any attendance events.
   const appUrl = process.env.TEST_APP_URL;
   const schoolADeviceSerial = process.env.TEST_SCHOOL_A_DEVICE_SERIAL;
   const schoolADeviceToken = process.env.TEST_SCHOOL_A_DEVICE_TOKEN;

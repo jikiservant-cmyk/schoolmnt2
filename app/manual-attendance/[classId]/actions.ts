@@ -11,6 +11,10 @@ import {
 import bcrypt from 'bcryptjs';
 import { createAttendanceIdentity } from '@/lib/attendance/idempotency';
 import {
+  createAttendanceSessionToken,
+  verifyAttendanceSessionToken,
+} from '@/lib/attendance/kiosk-session';
+import {
   getEligibleStudentIds,
   isAttendanceType,
   validateAttendanceSelection,
@@ -32,7 +36,7 @@ export interface StudentAttendanceStatus {
 
 export async function verifyTeacherPin(classId: string, teacherId: string, pin: string) {
   await new Promise(resolve => setTimeout(resolve, 300));
-  if (typeof classId !== 'string' || !classId || typeof teacherId !== 'string' || !teacherId || typeof pin !== 'string' || !pin.trim() || pin.length > 64) {
+  if (typeof classId !== 'string' || !classId || classId.length > 200 || typeof teacherId !== 'string' || !teacherId || teacherId.length > 200 || typeof pin !== 'string' || !pin.trim() || pin.length > 64) {
     return { success: false, error: 'Invalid attendance credentials.' };
   }
 
@@ -82,17 +86,36 @@ export async function verifyTeacherPin(classId: string, teacherId: string, pin: 
   );
 
   if (!isMatch) {
-    const newFailures = (staffUser.failed_attempts || 0) + 1;
-    const update: Record<string, unknown> = { failed_attempts: newFailures };
-    if (newFailures >= 5) update.locked_until = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-    const { error: updateError } = await adminClient
-      .from('staff_users')
-      .update(update)
-      .eq('id', staffUser.id)
-      .eq('person_id', teacher.id);
-    if (updateError) {
-      console.error('Failed to update teacher PIN lockout state:', updateError);
+    const { data: failureData, error: failureError } = await adminClient.rpc('record_teacher_pin_failure', {
+      p_staff_user_id: String(staffUser.id),
+      p_person_id: String(teacher.id),
+    });
+    if (failureError) {
+      console.error('Failed to atomically update teacher PIN lockout state:', failureError);
       return { success: false, error: 'PIN verification is temporarily unavailable.' };
+    }
+
+    const failureRow = Array.isArray(failureData) ? failureData[0] : failureData;
+    let lockedUntil = failureRow?.locked_until || null;
+    if (!failureRow) {
+      // A parallel attempt may have reached the lockout threshold first.
+      const { data: currentLockout, error: lockoutError } = await adminClient
+        .from('staff_users')
+        .select('locked_until')
+        .eq('id', staffUser.id)
+        .eq('person_id', teacher.id)
+        .maybeSingle();
+      if (lockoutError || !currentLockout) {
+        console.error('Could not verify teacher PIN lockout state:', lockoutError);
+        return { success: false, error: 'PIN verification is temporarily unavailable.' };
+      }
+      lockedUntil = currentLockout.locked_until;
+    }
+
+    const lockedUntilMs = lockedUntil ? new Date(lockedUntil).getTime() : Number.NaN;
+    if (Number.isFinite(lockedUntilMs) && lockedUntilMs > Date.now()) {
+      const mins = Math.ceil((lockedUntilMs - Date.now()) / 60000);
+      return { success: false, error: `Locked for ${mins} minute(s).` };
     }
     return { success: false, error: 'Invalid PIN.' };
   }
@@ -107,10 +130,24 @@ export async function verifyTeacherPin(classId: string, teacherId: string, pin: 
     return { success: false, error: 'PIN verification is temporarily unavailable.' };
   }
 
-  return { success: true, teacher };
+  const attendanceSessionToken = createAttendanceSessionToken({
+    userId: user.id,
+    schoolId,
+    classId,
+    teacherId: teacher.id,
+  });
+  return {
+    success: true,
+    teacher: { id: teacher.id, full_name: teacher.full_name },
+    attendanceSessionToken,
+  };
 }
 
 export async function getTeachersForClass(classId: string) {
+  if (typeof classId !== 'string' || !classId || classId.length > 200) {
+    return { success: false, error: 'Invalid class reference.' };
+  }
+
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return { success: false, error: 'Unauthorized.' };
@@ -139,13 +176,35 @@ export async function getTeachersForClass(classId: string) {
   return { success: true, teachers: teachers || [] };
 }
 
-export async function getStudentsForClass(classId: string) {
+export async function getStudentsForClass(classId: string, teacherId: string, attendanceSessionToken: string) {
+  if (typeof classId !== 'string' || !classId || classId.length > 200 || typeof teacherId !== 'string' || !teacherId || teacherId.length > 200) {
+    return { error: 'Invalid attendance session.' };
+  }
+
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return { error: 'Unauthorized.' };
 
-  const { data: schoolId } = await supabase.rpc('auth_school_id');
-  if (!schoolId) return { error: 'School context not found.' };
+  const { data: schoolId, error: schoolError } = await supabase.rpc('auth_school_id');
+  if (schoolError || !schoolId) return { error: 'School context not found.' };
+
+  const sessionScope = { userId: user.id, schoolId, classId, teacherId };
+  if (!verifyAttendanceSessionToken(attendanceSessionToken, sessionScope)) {
+    return { error: 'Attendance session expired. Verify your teacher PIN again.' };
+  }
+
+  const adminClient = createAdminClient();
+  const { data: activeTeacher, error: teacherError } = await adminClient
+    .from('people')
+    .select('id')
+    .eq('id', teacherId)
+    .eq('school_id', schoolId)
+    .eq('role', 'teacher')
+    .eq('is_active', true)
+    .maybeSingle();
+  if (teacherError || !activeTeacher) {
+    return { error: 'Attendance session expired. Verify your teacher PIN again.' };
+  }
 
   const { data: cls } = await supabase
     .from('classes')
@@ -250,9 +309,9 @@ export async function submitClassAttendance(
   presentStudentIds: string[],
   absentStudentIds: string[],
   attendanceType: 'check_in' | 'check_out' = 'check_in',
-  pin: string = ''
+  attendanceSessionToken: string = ''
 ) {
-  if (typeof classId !== 'string' || !classId || typeof teacherId !== 'string' || !teacherId || !isAttendanceType(attendanceType)) {
+  if (typeof classId !== 'string' || !classId || classId.length > 200 || typeof teacherId !== 'string' || !teacherId || teacherId.length > 200 || !isAttendanceType(attendanceType)) {
     return { success: false, error: 'Invalid attendance request.' };
   }
 
@@ -263,12 +322,22 @@ export async function submitClassAttendance(
   const { data: schoolId, error: schoolError } = await supabase.rpc('auth_school_id');
   if (schoolError || !schoolId) return { success: false, error: 'School context not found.' };
 
-  const adminClient = createAdminClient();
+  const sessionScope = { userId: user.id, schoolId, classId, teacherId };
+  if (!verifyAttendanceSessionToken(attendanceSessionToken, sessionScope)) {
+    return { success: false, error: 'Attendance session expired. Verify your teacher PIN again.' };
+  }
 
-  // Re-verify the teacher PIN and tenant-scoped class on every write.
-  const pinVerification = await verifyTeacherPin(classId, teacherId, pin);
-  if (!pinVerification.success) {
-    return { success: false, error: pinVerification.error || 'Invalid Teacher PIN.' };
+  const adminClient = createAdminClient();
+  const { data: activeTeacher, error: teacherError } = await adminClient
+    .from('people')
+    .select('id')
+    .eq('id', teacherId)
+    .eq('school_id', schoolId)
+    .eq('role', 'teacher')
+    .eq('is_active', true)
+    .maybeSingle();
+  if (teacherError || !activeTeacher) {
+    return { success: false, error: 'Attendance session expired. Verify your teacher PIN again.' };
   }
 
   const { data: cls, error: classError } = await supabase

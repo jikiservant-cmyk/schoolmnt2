@@ -2,6 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient, createPublicAdminClient } from '@/utils/supabase/admin';
 import crypto from 'crypto';
 import { readRequestTextLimited, RequestBodyTooLargeError } from '@/lib/http/read-limited-body';
+import {
+  asJsonObject,
+  firstScalarString,
+  parseNajikiWebhookPayload,
+} from '@/lib/payments/najiki-payload';
 
 const MAX_WEBHOOK_BODY_BYTES = 512 * 1024;
 
@@ -26,14 +31,13 @@ export async function handleNajikiWebhook(req: NextRequest) {
     const headersList = req.headers;
 
     // Secret key for verification
-    const expectedSecret = (
-      process.env.NAJIKI_API_KEY ||
-      process.env.SCHOOL_SECRET_KEY ||
-      process.env.NAJIKI_SECRET_KEY ||
-      ''
-    ).trim();
+    const expectedSecret =
+      process.env.NAJIKI_API_KEY?.trim() ||
+      process.env.SCHOOL_SECRET_KEY?.trim() ||
+      process.env.NAJIKI_SECRET_KEY?.trim() ||
+      '';
 
-    if (!expectedSecret || /^(test_key|changeme|placeholder|your[-_])/i.test(expectedSecret)) {
+    if (!expectedSecret || /^(test[-_]?key|changeme|placeholder|your[-_])/i.test(expectedSecret)) {
       console.error('[NaJiki Webhook] Missing webhook secret configuration in environment variables.');
       return NextResponse.json({ error: 'Server configuration error' }, { status: 500 });
     }
@@ -70,25 +74,29 @@ export async function handleNajikiWebhook(req: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    let payload: any;
-    try {
-      payload = JSON.parse(rawBody);
-    } catch {
-      return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
+    const payload = parseNajikiWebhookPayload(rawBody);
+    if (!payload) {
+      return NextResponse.json({ error: 'Webhook payload must be a valid JSON object.' }, { status: 400 });
     }
+
+    const nestedData = asJsonObject(payload.data);
+    if (payload.data !== undefined && !nestedData) {
+      return NextResponse.json({ error: 'Webhook data must be a JSON object.' }, { status: 400 });
+    }
+    const eventData = nestedData || payload;
+    const metadata = asJsonObject(eventData.metadata) || {};
+    const eventType = firstScalarString(payload.event, payload.eventType, payload.type, payload.event_type).toLowerCase();
+    const rawStatus = firstScalarString(payload.status, nestedData?.status).toUpperCase();
 
     // Log only allowlisted operational fields; provider payloads may contain PII
     // in nested metadata or fields whose names change over time.
     console.log('[NaJiki Webhook] Received event:', {
-      event: payload.event || payload.eventType || payload.type || payload.event_type || 'unknown',
-      id: payload.id || payload.data?.id || null,
-      status: payload.status || payload.data?.status || null,
+      event: eventType || 'unknown',
+      id: firstScalarString(payload.id, nestedData?.id) || null,
+      status: rawStatus || null,
     });
 
     const publicAdmin = createPublicAdminClient();
-    const eventType = (payload.event || payload.eventType || payload.type || payload.event_type || '').toString().toLowerCase();
-    const rawStatus = (payload.status || payload.data?.status || '').toString().toUpperCase();
-    const eventData = payload.data || payload;
 
     // Check if this is a payment success event or status
     const isPaymentSuccess = 
@@ -103,47 +111,51 @@ export async function handleNajikiWebhook(req: NextRequest) {
       rawStatus === 'PAID';
 
     if (isPaymentSuccess) {
-      const schoolId =
-        eventData.school_id ||
-        eventData.schoolId ||
-        eventData.tenant_id ||
-        eventData.tenantId ||
-        eventData.tenantCode ||
-        eventData.tenant_code ||
-        eventData.externalEntityId ||
-        eventData.external_entity_id ||
-        eventData.metadata?.schoolId ||
-        eventData.metadata?.school_id ||
-        eventData.metadata?.tenantId ||
-        eventData.metadata?.tenant_id;
+      const schoolId = firstScalarString(
+        eventData.school_id,
+        eventData.schoolId,
+        eventData.tenant_id,
+        eventData.tenantId,
+        eventData.tenantCode,
+        eventData.tenant_code,
+        eventData.externalEntityId,
+        eventData.external_entity_id,
+        metadata.schoolId,
+        metadata.school_id,
+        metadata.tenantId,
+        metadata.tenant_id,
+      );
 
       const rawAmount = [
         eventData.amount,
         eventData.value,
         eventData.total,
-        eventData.metadata?.amount,
+        metadata.amount,
       ].find(value => value !== undefined && value !== null);
       const amount = typeof rawAmount === 'number'
         ? rawAmount
         : typeof rawAmount === 'string' && rawAmount.trim() !== ''
           ? Number(rawAmount)
           : Number.NaN;
-      const rawCurrency = eventData.currency ?? eventData.metadata?.currency;
-      const validCurrency = rawCurrency === undefined || rawCurrency === null || String(rawCurrency).toUpperCase() === 'UGX';
-      const rawTxRef =
-        eventData.transaction_ref ||
-        eventData.transactionRef ||
-        eventData.transaction_id ||
-        eventData.transactionId ||
-        eventData.reference ||
-        eventData.paymentIntentId ||
-        eventData.idempotencyKey ||
-        eventData.idempotency_key ||
-        eventData.ext_ref;
-      const txRef = rawTxRef === undefined || rawTxRef === null ? '' : String(rawTxRef).trim();
+      const rawCurrency = eventData.currency ?? metadata.currency;
+      const validCurrency = rawCurrency === undefined || rawCurrency === null ||
+        (typeof rawCurrency === 'string' && rawCurrency.trim().toUpperCase() === 'UGX');
+      const txRef = firstScalarString(
+        eventData.transaction_ref,
+        eventData.transactionRef,
+        eventData.transaction_id,
+        eventData.transactionId,
+        eventData.reference,
+        eventData.paymentIntentId,
+        eventData.idempotencyKey,
+        eventData.idempotency_key,
+        eventData.ext_ref,
+      );
 
       if (
         !schoolId ||
+        schoolId.length > 200 ||
+        /[\u0000-\u001f\u007f]/.test(schoolId) ||
         !Number.isSafeInteger(amount) ||
         amount <= 0 ||
         !validCurrency ||
@@ -162,22 +174,23 @@ export async function handleNajikiWebhook(req: NextRequest) {
         );
       }
 
-      let targetSchoolId = String(schoolId).trim();
+      let targetSchoolId = schoolId;
       const isSchoolUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(targetSchoolId);
       if (!isSchoolUuid) {
         const { data: profile, error: profileError } = await publicAdmin
           .from('profiles')
-          .select('id, school_id, code')
+          .select('school_id, code')
           .eq('code', targetSchoolId)
           .maybeSingle();
         if (profileError) {
           console.error('[NaJiki Webhook] Could not resolve payment tenant code:', profileError);
           return NextResponse.json({ error: 'Could not resolve payment tenant.' }, { status: 500 });
         }
-        targetSchoolId = profile?.school_id || profile?.id || '';
-      }
-      if (!targetSchoolId) {
-        return NextResponse.json({ error: 'Payment tenant was not found.' }, { status: 400 });
+        const resolvedSchoolId = typeof profile?.school_id === 'string' ? profile.school_id.trim() : '';
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(resolvedSchoolId)) {
+          return NextResponse.json({ error: 'Payment tenant was not found or has no valid school ID.' }, { status: 400 });
+        }
+        targetSchoolId = resolvedSchoolId;
       }
 
       const { data: existingTx, error: existingTxError } = await publicAdmin
@@ -243,9 +256,8 @@ export async function handleNajikiWebhook(req: NextRequest) {
       eventType.includes("sms") ||
       eventType.includes("delivery")
     ) {
-      const rawSmsId = eventData.messageId || eventData.smsId || eventData.id || eventData.provider_ref;
-      const smsId = rawSmsId === undefined || rawSmsId === null ? '' : String(rawSmsId).trim();
-      const statusStr = (eventData.status || '').toString().toUpperCase();
+      const smsId = firstScalarString(eventData.messageId, eventData.smsId, eventData.id, eventData.provider_ref);
+      const statusStr = firstScalarString(eventData.status).toUpperCase();
       const isDelivered = ['DELIVERED', 'SENT', 'SUCCESS'].includes(statusStr);
       const isFailed = ['FAILED', 'UNDELIVERED', 'REJECTED', 'EXPIRED', 'ERROR'].includes(statusStr) || statusStr.includes('FAIL');
 

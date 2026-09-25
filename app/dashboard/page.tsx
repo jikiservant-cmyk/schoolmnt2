@@ -104,7 +104,7 @@ export default async function DashboardPage() {
       supabase.from('people').select('*', { count: 'exact', head: true }).eq('school_id', targetSchoolId).in('role', ['teacher', 'admin', 'support_staff']),
       supabase.from('classes').select('id, name').eq('school_id', targetSchoolId).order('name'),
       supabase.from('people').select('id, full_name, role, class_id').eq('school_id', targetSchoolId).eq('role', 'student'),
-      supabase.from('devices').select('id, serial_number, label, location_label, ip_address, firmware_version, device_type, config, last_seen_at, is_active, created_at, school_id').eq('school_id', targetSchoolId).limit(5),
+      supabase.from('devices').select('id, serial_number, label, location_label, ip_address, device_type, config, last_seen_at, is_active, created_at, school_id').eq('school_id', targetSchoolId).limit(5),
       // STRICTLY TODAY's attendance logs in EAT
       supabase
         .from('attendance_logs')

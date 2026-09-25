@@ -122,3 +122,31 @@ CREATE UNIQUE INDEX IF NOT EXISTS notifications_school_related_channel_uq
 
 COMMENT ON COLUMN school.attendance_logs.idempotency_key IS
   'Stable school/person/attendance-type/EAT-day key used to make attendance writes idempotent.';
+
+-- Increment failed PIN attempts atomically. A read/modify/write sequence in the
+-- application is vulnerable to concurrent guesses that overwrite each other's
+-- counters and bypass the lockout threshold.
+CREATE OR REPLACE FUNCTION school.record_teacher_pin_failure(
+  p_staff_user_id TEXT,
+  p_person_id TEXT
+)
+RETURNS TABLE(failed_attempts INTEGER, locked_until TIMESTAMPTZ)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+  UPDATE school.staff_users AS staff
+  SET failed_attempts = COALESCE(staff.failed_attempts, 0) + 1,
+      locked_until = CASE
+        WHEN COALESCE(staff.failed_attempts, 0) + 1 >= 5
+          THEN clock_timestamp() + INTERVAL '10 minutes'
+        ELSE staff.locked_until
+      END
+  WHERE staff.id::TEXT = p_staff_user_id
+    AND staff.person_id::TEXT = p_person_id
+    AND (staff.locked_until IS NULL OR staff.locked_until <= clock_timestamp())
+  RETURNING staff.failed_attempts, staff.locked_until;
+$function$;
+
+REVOKE ALL ON FUNCTION school.record_teacher_pin_failure(TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION school.record_teacher_pin_failure(TEXT, TEXT) TO service_role;

@@ -37,6 +37,7 @@ export default function ManualAttendancePage() {
   const [loadingTeachers, setLoadingTeachers] = useState(true);
   const [error, setError] = useState('');
   const [teacher, setTeacher] = useState<{ id: string; full_name: string } | null>(null);
+  const [attendanceSessionToken, setAttendanceSessionToken] = useState('');
   
   useEffect(() => {
     async function loadTeachers() {
@@ -65,14 +66,19 @@ export default function ManualAttendancePage() {
   const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'info' | 'error'; message: string } | null>(null);
 
-  const fetchStudents = useCallback(async (isInitial = false) => {
-    if (!classId) return;
+  const fetchStudents = useCallback(async (
+    isInitial = false,
+    sessionToken = attendanceSessionToken,
+    teacherId = teacher?.id,
+  ) => {
+    if (!classId || !sessionToken || !teacherId) return;
     if (!isInitial) setIsRefreshing(true);
     try {
-      const res = await getStudentsForClass(classId);
+      const res = await getStudentsForClass(classId, teacherId, sessionToken);
       if (res.students) {
         setStudents(res.students);
         setLastRefreshedAt(new Date());
+        setError('');
         if (isInitial && res.activeWindowMode) {
           setActiveMode(res.activeWindowMode);
         }
@@ -89,6 +95,13 @@ export default function ManualAttendancePage() {
           }
           return next;
         });
+      } else if (res.error?.toLowerCase().includes('attendance session expired')) {
+        setTeacher(null);
+        setAttendanceSessionToken('');
+        setPin('');
+        setStudents([]);
+        setNewlySelectedIds(new Set());
+        setError(res.error);
       } else if (isInitial) {
         setError(res.error || 'Failed to load students.');
       }
@@ -99,19 +112,18 @@ export default function ManualAttendancePage() {
     } finally {
       if (!isInitial) setIsRefreshing(false);
     }
-  }, [classId, activeMode]);
+  }, [classId, activeMode, attendanceSessionToken, teacher]);
 
   // Real-time polling every 10 seconds once teacher is authenticated
   useEffect(() => {
-    if (!teacher) return;
+    if (!teacher || !attendanceSessionToken) return;
 
-    // Set up 10-second interval
     const interval = setInterval(() => {
-      fetchStudents(false);
+      fetchStudents(false, attendanceSessionToken, teacher.id);
     }, 10000);
 
     return () => clearInterval(interval);
-  }, [teacher, fetchStudents]);
+  }, [teacher, attendanceSessionToken, fetchStudents]);
 
   const handlePinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -122,9 +134,11 @@ export default function ManualAttendancePage() {
     
     try {
       const res = await verifyTeacherPin(classId, selectedTeacherId, pin);
-      if (res.success && res.teacher) {
+      if (res.success && res.teacher && res.attendanceSessionToken) {
         setTeacher(res.teacher);
-        await fetchStudents(true);
+        setAttendanceSessionToken(res.attendanceSessionToken);
+        setPin('');
+        await fetchStudents(true, res.attendanceSessionToken, res.teacher.id);
       } else {
         setError(res.error || 'Invalid PIN');
       }
@@ -231,7 +245,7 @@ export default function ManualAttendancePage() {
         presentIds,
         [],
         activeMode,
-        pin
+        attendanceSessionToken
       );
 
       if (res.success) {
@@ -245,6 +259,13 @@ export default function ManualAttendancePage() {
         });
         setNewlySelectedIds(new Set());
         await fetchStudents(false);
+      } else if (res.error?.toLowerCase().includes('attendance session expired')) {
+        setTeacher(null);
+        setAttendanceSessionToken('');
+        setPin('');
+        setStudents([]);
+        setNewlySelectedIds(new Set());
+        setError(res.error);
       } else {
         setFeedback({
           type: 'error',

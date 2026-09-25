@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
@@ -49,7 +50,7 @@ export async function enqueueDeviceCommand(
   deviceSerialNumber: string,
   options?: EnqueueCommandOptions
 ): Promise<{ success: boolean; commandId: string }> {
-  let commandId = `cmd_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  let commandId = `cmd_${randomUUID()}`;
   const rawSerial = typeof deviceSerialNumber === 'string' ? deviceSerialNumber.trim() : '';
   const cleanSn = rawSerial.toUpperCase();
   const isBroadcast = cleanSn === 'ALL';

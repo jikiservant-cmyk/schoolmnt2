@@ -170,19 +170,20 @@ export async function regenerateDeviceSecretAction(deviceId: string) {
     const newSecretHash = hashDeviceSecret(newSecret);
     const parsed = parseDeviceMetadata(dev);
 
-    // Store only a digest. Older schemas can keep the digest in the legacy
-    // device_secret column until the dedicated hash column is migrated.
+    // Store only a digest and remove any legacy raw secret from both the
+    // dedicated column and packed firmware metadata.
+    const packedFw = packDeviceMetadata(dev.firmware_version, {
+      type: parsed.device_type,
+      statusCodeMap: parsed.status_code_map,
+      config: parsed.config,
+    });
     let { error: updateErr } = await adminClient
       .from('devices')
-      .update({ device_secret_hash: newSecretHash, device_secret: null })
+      .update({ device_secret_hash: newSecretHash, device_secret: null, firmware_version: packedFw })
       .eq('id', deviceId)
       .eq('school_id', schoolId);
 
     if (updateErr && (updateErr.code === 'PGRST204' || updateErr.message?.toLowerCase().includes('column'))) {
-      const packedFw = packDeviceMetadata(dev.firmware_version, {
-        type: parsed.device_type,
-        config: parsed.config
-      });
       const retryLegacy = await adminClient
         .from('devices')
         .update({ device_secret: newSecretHash, firmware_version: packedFw })
