@@ -35,6 +35,7 @@ const tables = [
   'parents',
 ];
 const requiredFixtureTables = new Set(tables);
+const optionalTenantTables = new Set(['person_credentials']);
 const publicAdminTables = ['admin_profiles', 'profiles', 'tenants', 'schools', 'wallets', 'transactions', 'notifications'];
 const optionalSchemaCodes = new Set(['PGRST205', '42P01']);
 
@@ -122,6 +123,10 @@ async function main() {
       .eq('school_id', schoolB.schoolId)
       .limit(5);
 
+    if (bError && optionalTenantTables.has(table) && optionalSchemaCodes.has(bError.code)) {
+      console.warn(`Skipped optional tenant table school.${table}; it is not installed in this project.`);
+      continue;
+    }
     if (bError) {
       throw new Error(`School B could not read its own ${table} fixture: ${bError.message}`);
     }
