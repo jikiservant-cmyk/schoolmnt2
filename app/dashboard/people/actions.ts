@@ -4,6 +4,7 @@ import { createClient } from '@/utils/supabase/server';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
+import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
@@ -55,6 +56,7 @@ export async function addPersonAction(formData: FormData) {
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
     const adminClient = createAdminClient();
+    const warnings: string[] = [];
     const rawDeviceId = formData.get('deviceUserId') as string;
     const cleanDeviceId = rawDeviceId && rawDeviceId.trim() ? rawDeviceId.trim() : null;
 
@@ -106,7 +108,7 @@ export async function addPersonAction(formData: FormData) {
       if (cleanDeviceId) {
         try {
           const { enqueuePersonEnrollmentForSchool } = await import('@/utils/zkteco/commandQueue');
-          await enqueuePersonEnrollmentForSchool(
+          const enrollment = await enqueuePersonEnrollmentForSchool(
             {
               pin: cleanDeviceId,
               fullName: fullName.trim(),
@@ -115,8 +117,14 @@ export async function addPersonAction(formData: FormData) {
             },
             schoolId
           );
+          if (enrollment.totalDevices === 0) {
+            warnings.push('No active device was available to receive the biometric enrollment.');
+          } else if (enrollment.queuedCount < enrollment.totalDevices) {
+            warnings.push(`Enrollment was queued to only ${enrollment.queuedCount} of ${enrollment.totalDevices} active devices.`);
+          }
         } catch (cmdErr) {
-          console.warn('Non-blocking: Failed to enqueue user sync command for support staff:', cmdErr);
+          console.warn('Support staff registered, but device enrollment queueing failed:', cmdErr);
+          warnings.push('The profile was saved, but device enrollment could not be queued.');
         }
       }
 
@@ -127,7 +135,8 @@ export async function addPersonAction(formData: FormData) {
       return {
         success: true,
         data: newPerson,
-        teacherPin: null
+        teacherPin: null,
+        warnings,
       };
     }
 
@@ -183,10 +192,14 @@ export async function addPersonAction(formData: FormData) {
 
       // Auto-generate a globally unique Teacher Attendance Passcode / PIN (alphanumeric, e.g. T7K9M2)
       const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-      const { data: existingStaff } = await adminClient
+      const { data: existingStaff, error: existingStaffError } = await adminClient
         .from('staff_users')
         .select('pin_hash')
         .not('pin_hash', 'is', null);
+      if (existingStaffError) {
+        console.error('Could not verify existing teacher attendance PINs:', existingStaffError);
+        return { error: 'Could not safely generate a unique teacher attendance PIN. Please retry.' };
+      }
 
       let isUnique = false;
       let attempts = 0;
@@ -194,7 +207,7 @@ export async function addPersonAction(formData: FormData) {
         attempts++;
         let candidate = 'T';
         for (let i = 0; i < 5; i++) {
-          candidate += chars.charAt(Math.floor(Math.random() * chars.length));
+          candidate += chars.charAt(crypto.randomInt(chars.length));
         }
 
         let collision = false;
@@ -259,35 +272,45 @@ export async function addPersonAction(formData: FormData) {
         const guardianPhone = formData.get('guardianPhone') as string;
         let guardianLinked = false;
 
+        let guardianLinkWarning = false;
         if (guardianPhone && guardianPhone.trim()) {
-          try {
-            const { data: parentRec } = await adminClient
-              .from('parents')
-              .insert({
-                school_id: schoolId,
-                full_name: guardianName && guardianName.trim() ? guardianName.trim() : 'Guardian',
-                phone: guardianPhone.trim()
-              })
-              .select('id')
-              .single();
+          const { data: parentRec, error: parentError } = await adminClient
+            .from('parents')
+            .insert({
+              school_id: schoolId,
+              full_name: guardianName && guardianName.trim() ? guardianName.trim() : 'Guardian',
+              phone: guardianPhone.trim()
+            })
+            .select('id')
+            .single();
 
-            if (parentRec?.id) {
-              await adminClient
-                .from('student_parents')
-                .insert({
-                  student_id: newPerson.id,
-                  parent_id: parentRec.id,
-                  relationship: (formData.get('guardianRelationship') as string) || 'guardian',
-                  is_primary: true
-                });
+          if (parentError || !parentRec?.id) {
+            console.error('Failed to create guardian record in fallback:', parentError);
+            guardianLinkWarning = true;
+          } else {
+            const { error: linkError } = await adminClient
+              .from('student_parents')
+              .insert({
+                student_id: newPerson.id,
+                parent_id: parentRec.id,
+                relationship: (formData.get('guardianRelationship') as string) || 'guardian',
+                is_primary_contact: true
+              });
+
+            if (linkError) {
+              console.error('Failed to link guardian in fallback:', linkError);
+              guardianLinkWarning = true;
+            } else {
               guardianLinked = true;
             }
-          } catch (gErr) {
-            console.warn('Non-blocking: Failed to link parent in fallback:', gErr);
           }
         }
 
-        rpcData = { ...newPerson, guardian_linked: guardianLinked };
+        rpcData = {
+          ...newPerson,
+          guardian_linked: guardianLinked,
+          guardian_link_warning: guardianLinkWarning,
+        };
       } else if (role === 'teacher') {
         const phone = (formData.get('phone') as string)?.trim() || null;
         const { data: newPerson, error: pInsertErr } = await adminClient
@@ -311,18 +334,21 @@ export async function addPersonAction(formData: FormData) {
         }
 
         if (generatedTeacherPin) {
-          const salt = bcrypt.genSaltSync(6);
+          const salt = bcrypt.genSaltSync(10);
           const pinHash = bcrypt.hashSync(generatedTeacherPin, salt);
-          try {
-            await adminClient
-              .from('staff_users')
-              .insert({
-                person_id: newPerson.id,
-                pin_hash: pinHash,
-                role: 'teacher'
-              });
-          } catch (stErr) {
-            console.warn('Non-blocking: staff_users insert in teacher fallback:', stErr);
+          const { data: staffRow, error: staffInsertError } = await adminClient
+            .from('staff_users')
+            .insert({
+              person_id: newPerson.id,
+              pin_hash: pinHash,
+              role: 'teacher'
+            })
+            .select('id')
+            .maybeSingle();
+          if (staffInsertError || !staffRow?.id) {
+            console.error('Teacher profile saved but attendance PIN persistence failed:', staffInsertError);
+            warnings.push('The teacher profile was saved, but the attendance PIN could not be stored. Regenerate it before use.');
+            generatedTeacherPin = null;
           }
         }
 
@@ -344,7 +370,7 @@ export async function addPersonAction(formData: FormData) {
         }
 
         const { enqueuePersonEnrollmentForSchool } = await import('@/utils/zkteco/commandQueue');
-        await enqueuePersonEnrollmentForSchool(
+        const enrollment = await enqueuePersonEnrollmentForSchool(
           {
             pin: cleanDeviceId,
             fullName: fullName.trim(),
@@ -353,8 +379,14 @@ export async function addPersonAction(formData: FormData) {
           },
           schoolId
         );
+        if (enrollment.totalDevices === 0) {
+          warnings.push('The profile was saved, but no active device was available to receive the biometric enrollment.');
+        } else if (enrollment.queuedCount < enrollment.totalDevices) {
+          warnings.push(`The profile was saved, but enrollment was queued to only ${enrollment.queuedCount} of ${enrollment.totalDevices} active devices.`);
+        }
       } catch (cmdErr) {
-        console.warn('Non-blocking: Failed to enqueue user sync command:', cmdErr);
+        console.warn('Profile saved, but device enrollment queueing failed:', cmdErr);
+        warnings.push('The profile was saved, but device enrollment could not be queued.');
       }
     }
 
@@ -362,10 +394,11 @@ export async function addPersonAction(formData: FormData) {
     revalidatePath('/dashboard/attendance');
     revalidatePath('/dashboard');
 
-    return { 
+    return {
       success: true,
       data: rpcData,
-      teacherPin: generatedTeacherPin
+      teacherPin: generatedTeacherPin,
+      warnings,
     };
   } catch (err: any) {
     console.error('addPersonAction server error:', err);
@@ -392,10 +425,14 @@ export async function resetTeacherPinAction(personId: string) {
     // 2. Auto-generate a unique 6-character PIN (e.g. T7K9M2)
     const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
-    const { data: existingStaff } = await adminClient
+    const { data: existingStaff, error: existingStaffError } = await adminClient
       .from('staff_users')
       .select('pin_hash')
       .not('pin_hash', 'is', null);
+    if (existingStaffError) {
+      console.error('Could not verify existing teacher attendance PINs:', existingStaffError);
+      return { error: 'Could not safely generate a unique teacher attendance PIN. Please retry.' };
+    }
 
     let isUnique = false;
     let attempts = 0;
@@ -405,7 +442,7 @@ export async function resetTeacherPinAction(personId: string) {
       attempts++;
       let candidate = 'T';
       for (let i = 0; i < 5; i++) {
-        candidate += chars.charAt(Math.floor(Math.random() * chars.length));
+        candidate += chars.charAt(crypto.randomInt(chars.length));
       }
 
       let collision = false;
@@ -427,23 +464,37 @@ export async function resetTeacherPinAction(personId: string) {
       return { error: 'Failed to generate a unique PIN. Please try again.' };
     }
 
-    // 3. Hash the new PIN using bcrypt with salt rounds = 6
-    const salt = bcrypt.genSaltSync(6);
+    // 3. Hash the new PIN using a work factor suitable for production.
+    const salt = bcrypt.genSaltSync(10);
     const pinHash = bcrypt.hashSync(newPin, salt);
 
-    // 4. Update staff_users table for this teacher
-    const { error: updateErr } = await adminClient
+    // 4. Update or create the staff_users row and verify that a row was persisted.
+    const pinUpdate = await adminClient
       .from('staff_users')
       .update({
         pin_hash: pinHash,
-        pin_failed_attempts: 0,
-        pin_locked_until: null,
+        failed_attempts: 0,
+        locked_until: null,
       })
-      .eq('person_id', personId);
+      .eq('person_id', personId)
+      .select('id')
+      .maybeSingle();
 
-    if (updateErr) {
-      console.error('Error resetting teacher PIN:', updateErr);
+    if (pinUpdate.error) {
+      console.error('Error resetting teacher PIN:', pinUpdate.error);
       return { error: 'Failed to update passcode in database.' };
+    }
+
+    if (!pinUpdate.data?.id) {
+      const { data: insertedStaff, error: staffInsertError } = await adminClient
+        .from('staff_users')
+        .insert({ person_id: personId, pin_hash: pinHash, role: 'teacher', failed_attempts: 0, locked_until: null })
+        .select('id')
+        .maybeSingle();
+      if (staffInsertError || !insertedStaff?.id) {
+        console.error('Error creating teacher passcode row:', staffInsertError);
+        return { error: 'Failed to persist the teacher passcode.' };
+      }
     }
 
     revalidatePath('/dashboard/people');
@@ -484,16 +535,20 @@ export async function searchPeopleAction(params: {
   }
 
   if (params.searchTerm && params.searchTerm.trim() !== '') {
-    const st = params.searchTerm.trim();
-    // ilike on full_name, phone, device_user_id
-    query = query.or(`full_name.ilike.%${st}%,phone.ilike.%${st}%,device_user_id.ilike.%${st}%`);
+    // Remove PostgREST logic/pattern metacharacters before composing the OR
+    // expression. Search is still tenant-scoped by the school_id predicate.
+    const st = params.searchTerm.trim().slice(0, 100).replace(/[\\,().%_*]/g, ' ').trim();
+    if (st) {
+      query = query.or(`full_name.ilike.%${st}%,phone.ilike.%${st}%,device_user_id.ilike.%${st}%`);
+    }
   }
 
   // order by full name
   query = query.order('full_name', { ascending: true });
 
-  const page = params.page || 1;
-  const limit = params.limit || 50;
+  const page = Number.isSafeInteger(params.page) ? Math.max(1, Math.min(params.page!, 100_000)) : 1;
+  const requestedLimit = Number.isSafeInteger(params.limit) ? params.limit! : 50;
+  const limit = Math.max(1, Math.min(requestedLimit, 100));
   const from = (page - 1) * limit;
   const to = from + limit - 1;
 
@@ -533,7 +588,7 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
 
     // 2. If UID is being set, ensure it's not already used by another person in the same school
     if (cleanUid) {
-      const { data: existingPerson } = await adminClient
+      const { data: existingPerson, error: existingPersonError } = await adminClient
         .from('people')
         .select('id, full_name, role')
         .eq('school_id', person.school_id)
@@ -541,10 +596,54 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
         .neq('id', personId)
         .maybeSingle();
 
+      if (existingPersonError) {
+        return { error: 'Could not verify whether this biometric UID is already in use.' };
+      }
       if (existingPerson) {
-        return { 
-          error: `Biometric UID ${cleanUid} is already assigned to ${existingPerson.full_name} (${existingPerson.role}).` 
+        return {
+          error: `Biometric UID ${cleanUid} is already assigned to ${existingPerson.full_name} (${existingPerson.role}).`
         };
+      }
+    }
+
+    const optionalCredentialSchemaCodes = new Set(['PGRST204', 'PGRST205', '42P01', '42703']);
+    let credentialSchemaAvailable = true;
+    if (cleanUid) {
+      // Backslash-escape LIKE wildcards so a user-entered UID is treated as an
+      // exact, case-insensitive identifier rather than a search pattern.
+      const escapedUid = cleanUid.replace(/[\\%_]/g, '\\$&');
+      const { data: existingCredential, error: credentialLookupError } = await adminClient
+        .from('person_credentials')
+        .select('person_id')
+        .eq('school_id', schoolId)
+        .eq('credential_type', 'pin')
+        .ilike('identifier_value', escapedUid)
+        .neq('person_id', personId)
+        .maybeSingle();
+
+      if (credentialLookupError && optionalCredentialSchemaCodes.has(credentialLookupError.code || '')) {
+        credentialSchemaAvailable = false;
+      } else if (credentialLookupError) {
+        console.error('Could not verify the secondary biometric credential:', credentialLookupError);
+        return { error: 'Could not safely verify this biometric UID. No changes were saved.' };
+      } else if (existingCredential) {
+        return { error: 'This biometric UID is already assigned to another person in your school.' };
+      }
+    }
+
+    if (credentialSchemaAvailable) {
+      const { error: deactivateCredentialError } = await adminClient
+        .from('person_credentials')
+        .update({ is_active: false })
+        .eq('school_id', schoolId)
+        .eq('person_id', personId)
+        .eq('credential_type', 'pin');
+
+      if (deactivateCredentialError && optionalCredentialSchemaCodes.has(deactivateCredentialError.code || '')) {
+        credentialSchemaAvailable = false;
+      } else if (deactivateCredentialError) {
+        console.error('Could not deactivate prior biometric credentials:', deactivateCredentialError);
+        return { error: 'Could not safely update stored biometric credentials. No UID changes were saved.' };
       }
     }
 
@@ -552,35 +651,42 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
     const { error: updateErr } = await adminClient
       .from('people')
       .update({ device_user_id: cleanUid })
-      .eq('id', personId);
+      .eq('id', personId)
+      .eq('school_id', schoolId);
 
     if (updateErr) {
       console.error('Error updating device_user_id:', updateErr);
       return { error: updateErr.message || 'Failed to update biometric UID.' };
     }
 
-    // 4. Sync into school.person_credentials table if cleanUid is present
+    // 4. Sync into school.person_credentials table if cleanUid is present.
+    // The legacy people.device_user_id remains the primary mapping, so an
+    // optional credential-schema/upsert failure does not undo the saved UID.
+    const warnings: string[] = [];
+    if (cleanUid && credentialSchemaAvailable) {
+      const { error: credentialUpsertError } = await adminClient
+        .from('person_credentials')
+        .upsert(
+          {
+            school_id: schoolId,
+            person_id: personId,
+            credential_type: 'pin',
+            identifier_value: cleanUid,
+            is_active: true
+          },
+          { onConflict: 'school_id,credential_type,identifier_value' }
+        );
+
+      if (credentialUpsertError) {
+        console.warn('Biometric UID saved, but secondary credential sync failed:', credentialUpsertError);
+        warnings.push('The UID was saved, but the secondary biometric credential record could not be synchronized.');
+      }
+    }
+
     if (cleanUid) {
       try {
-        await adminClient
-          .from('person_credentials')
-          .upsert(
-            {
-              school_id: schoolId,
-              person_id: personId,
-              credential_type: 'pin',
-              identifier_value: cleanUid,
-              is_active: true
-            },
-            { onConflict: 'school_id,credential_type,identifier_value' }
-          );
-      } catch (credErr) {
-        console.warn('Non-blocking: person_credentials sync skipped:', credErr);
-      }
-
-      try {
         const { enqueuePersonEnrollmentForSchool } = await import('@/utils/zkteco/commandQueue');
-        await enqueuePersonEnrollmentForSchool(
+        const enrollment = await enqueuePersonEnrollmentForSchool(
           {
             pin: cleanUid,
             fullName: person.full_name,
@@ -589,15 +695,22 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
           },
           schoolId
         );
+
+        if (enrollment.totalDevices === 0) {
+          warnings.push('The UID was saved, but no active device was available to receive the enrollment.');
+        } else if (enrollment.queuedCount < enrollment.totalDevices) {
+          warnings.push(`The UID was saved, but enrollment was queued to only ${enrollment.queuedCount} of ${enrollment.totalDevices} active devices.`);
+        }
       } catch (cmdErr) {
-        console.warn('Non-blocking: Failed to enqueue user sync command:', cmdErr);
+        console.warn('Biometric UID saved, but enrollment queueing failed:', cmdErr);
+        warnings.push('The UID was saved, but device enrollment could not be queued.');
       }
     }
 
     revalidatePath('/dashboard/people');
     revalidatePath('/dashboard/attendance');
     revalidatePath('/dashboard');
-    return { success: true };
+    return warnings.length > 0 ? { success: true, warnings } : { success: true };
   } catch (err: any) {
     console.error('updatePersonDeviceUserIdAction error:', err);
     return { error: err?.message || 'An unexpected error occurred.' };

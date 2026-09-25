@@ -235,11 +235,13 @@ export default function ManualAttendancePage() {
       );
 
       if (res.success) {
+        const successMessage = res.skipped
+          ? (res.message || 'Students already marked.')
+          : `Successfully recorded ${res.count} student(s) for ${activeMode === 'check_in' ? 'Morning Check-In' : 'Evening Check-Out'}.`;
+        const smsWarning = 'smsWarning' in res ? res.smsWarning : undefined;
         setFeedback({
-          type: 'success',
-          message: res.skipped 
-            ? (res.message || 'Students already marked.')
-            : `Successfully recorded ${res.count} student(s) for ${activeMode === 'check_in' ? 'Morning Check-In' : 'Evening Check-Out'}.`
+          type: smsWarning ? 'info' : 'success',
+          message: smsWarning ? `${successMessage} ${smsWarning}` : successMessage
         });
         setNewlySelectedIds(new Set());
         await fetchStudents(false);

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { getAttendanceData, topUpBalance, getSchoolBalance } from './actions';
 import { 
   Clock, 
@@ -40,6 +40,8 @@ export default function AttendancePage() {
   const [school, setSchool] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [logsTruncated, setLogsTruncated] = useState(false);
 
   // Active View Tab: 'students' | 'teachers' | 'reports'
   const [activeTab, setActiveTab] = useState<'students' | 'teachers' | 'reports'>('students');
@@ -49,6 +51,7 @@ export default function AttendancePage() {
   const [topUpStep, setTopUpStep] = useState<'form' | 'waiting' | 'success'>('form');
   const [topUpAmount, setTopUpAmount] = useState<string>('50000');
   const [phoneNumber, setPhoneNumber] = useState<string>('');
+  const [topUpRequestId, setTopUpRequestId] = useState<string | null>(null);
   const [isToppingUp, setIsToppingUp] = useState(false);
   const [topUpMessage, setTopUpMessage] = useState('');
   const [initialBalance, setInitialBalance] = useState<number>(0);
@@ -62,10 +65,6 @@ export default function AttendancePage() {
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [classFilter, setClassFilter] = useState<string>('all');
   const [dateFilter, setDateFilter] = useState<string>(''); // YYYY-MM-DD
-
-  useEffect(() => {
-    loadData();
-  }, [dateFilter]);
 
   // Poll for balance updates when waiting for Mobile Money PIN confirmation
   useEffect(() => {
@@ -99,28 +98,34 @@ export default function AttendancePage() {
     };
   }, [showTopUpModal, topUpStep, initialBalance]);
 
-  async function loadData() {
+  const loadData = useCallback(async () => {
     try {
       setLoading(true);
       const data = await getAttendanceData(dateFilter || undefined);
       if (data.error) {
-        setError(data.error);
+        setLoadError(data.error);
       } else {
         setLogs(data.logs || []);
         setPeople(data.people || []);
         setClasses(data.classes || []);
         setSchool(data.school || null);
-        setError(null);
+        setLogsTruncated(Boolean(data.truncated));
+        setLoadError(null);
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to load attendance data');
+      setLoadError(err.message || 'Failed to load attendance data');
     } finally {
       setLoading(false);
     }
-  }
+  }, [dateFilter]);
+
+  useEffect(() => {
+    void loadData();
+  }, [loadData]);
 
   const openTopUpModal = () => {
     setTopUpStep('form');
+    setTopUpRequestId(null);
     setError(null);
     setInitialBalance(school?.settings?.balance || 0);
     setShowTopUpModal(true);
@@ -139,9 +144,11 @@ export default function AttendancePage() {
     setError(null);
     const startBal = school?.settings?.balance || 0;
     setInitialBalance(startBal);
+    const requestId = topUpRequestId || crypto.randomUUID();
+    setTopUpRequestId(requestId);
 
     try {
-      const result = await topUpBalance(amountNum, phoneNumber);
+      const result = await topUpBalance(amountNum, phoneNumber, requestId);
       if (result.error) {
         setError(result.error);
       } else {
@@ -157,6 +164,7 @@ export default function AttendancePage() {
 
   const handleQuickAmount = (amount: number) => {
     setTopUpAmount(amount.toString());
+    setTopUpRequestId(null);
   };
 
   const copyTeacherLink = async () => {
@@ -281,6 +289,19 @@ export default function AttendancePage() {
 
   return (
     <div className="space-y-6 pt-5 animate-fade-in">
+      {loadError && (
+        <div role="alert" className="flex items-center justify-between gap-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+          <span>{loadError} Existing displayed data may be stale.</span>
+          <button type="button" onClick={() => void loadData()} disabled={loading} className="shrink-0 rounded-lg border border-red-300 px-3 py-1.5 font-semibold disabled:opacity-50">
+            {loading ? 'Retrying…' : 'Retry'}
+          </button>
+        </div>
+      )}
+      {logsTruncated && !loadError && (
+        <div role="status" className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          This view is showing only the most recent attendance records. Choose a date filter to narrow the results.
+        </div>
+      )}
       
       {/* Top Header Row with Wallet Section */}
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 bg-white border border-[#e7e7ea] p-6 rounded-[16px] shadow-[0_1px_2px_rgba(0,0,0,0.02)]">
@@ -834,7 +855,10 @@ export default function AttendancePage() {
                       step="1000"
                       required
                       value={topUpAmount}
-                      onChange={(e) => setTopUpAmount(e.target.value)}
+                      onChange={(e) => {
+                        setTopUpAmount(e.target.value);
+                        setTopUpRequestId(null);
+                      }}
                       className="block w-full px-3 py-2 border border-[#e1e1e5] rounded-[9px] bg-white text-[#171719] text-xs font-mono focus:border-[#007aff] focus:outline-none transition"
                       placeholder="50000"
                     />
@@ -860,7 +884,10 @@ export default function AttendancePage() {
                       id="phone-number"
                       required
                       value={phoneNumber}
-                      onChange={(e) => setPhoneNumber(e.target.value)}
+                      onChange={(e) => {
+                        setPhoneNumber(e.target.value);
+                        setTopUpRequestId(null);
+                      }}
                       className="block w-full px-3 py-2 border border-[#e1e1e5] rounded-[9px] bg-white text-[#171719] text-xs font-mono focus:border-[#007aff] focus:outline-none transition"
                       placeholder="0770 000 000 or 0700 000 000"
                     />

@@ -22,9 +22,11 @@ export default function AddPersonForm({ classes, onClose }: AddPersonFormProps) 
     role: 'student' | 'teacher' | 'support_staff';
     fullName: string;
     guardianLinked?: boolean;
+    guardianLinkWarning?: boolean;
     manualLinkToken?: string;
     manualLinkExpiresAt?: string;
     teacherPin?: string | null;
+    warnings?: string[];
   } | null>(null);
 
   const [selectedRole, setSelectedRole] = useState<string>('student');
@@ -51,9 +53,11 @@ export default function AddPersonForm({ classes, onClose }: AddPersonFormProps) 
             role: selectedRole as 'student' | 'teacher' | 'support_staff',
             fullName: formData.get('fullName') as string,
             guardianLinked: resData?.guardian_linked,
+            guardianLinkWarning: resData?.guardian_link_warning,
             manualLinkToken: resData?.manual_link_token,
             manualLinkExpiresAt: resData?.manual_link_expires_at,
             teacherPin: res?.teacherPin,
+            warnings: res?.warnings,
           });
 
           form.reset();
@@ -114,6 +118,13 @@ export default function AddPersonForm({ classes, onClose }: AddPersonFormProps) 
             </div>
           </div>
 
+          {successData.warnings?.map((warning, index) => (
+            <div key={index} className="p-3 text-xs bg-[#fff5e7] border border-[#ffe0b2] text-[#9b6500] rounded-[10px] flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span>{warning}</span>
+            </div>
+          ))}
+
           {/* Student Specific Details */}
           {successData.role === 'student' && (
             <div className="space-y-3">
@@ -125,7 +136,9 @@ export default function AddPersonForm({ classes, onClose }: AddPersonFormProps) 
               ) : (
                 <div className="p-3 text-xs bg-[#fff5e7] border border-[#ffe0b2] text-[#e99500] rounded-[10px] flex items-center gap-2">
                   <AlertTriangle className="w-4 h-4 shrink-0" />
-                  <span>No guardian phone provided — SMS alerts won&apos;t be routed.</span>
+                  <span>{successData.guardianLinkWarning
+                    ? 'Guardian details were provided, but the link could not be saved. Verify the guardian record before relying on SMS alerts.'
+                    : 'No guardian phone provided — SMS alerts won\'t be routed.'}</span>
                 </div>
               )}
             </div>

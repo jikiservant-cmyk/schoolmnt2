@@ -14,7 +14,7 @@ export class DahuaIsapiAdapter implements DeviceAdapter {
       req.headers.get('authorization')?.replace(/^Bearer\s+/i, '') ||
       url.searchParams.get('token');
 
-    return isAuthorizedToken(providedToken, device.device_secret);
+    return isAuthorizedToken(providedToken, device.device_secret_hash || device.device_secret);
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {

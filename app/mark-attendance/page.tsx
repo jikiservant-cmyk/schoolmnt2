@@ -21,7 +21,7 @@ export default function MarkAttendance() {
   const [statusMode, setStatusMode] = useState<'idle' | 'success' | 'error' | 'loading'>('idle');
   const [currentTime, setCurrentTime] = useState<string>('12:00:00');
   const [mounted, setMounted] = useState(false);
-  const [successInfo, setSuccessInfo] = useState<{ name: string; role: string } | null>(null);
+  const [successInfo, setSuccessInfo] = useState<{ name: string; role: string; warning?: string } | null>(null);
   const [availablePeople, setAvailablePeople] = useState<{ full_name: string; role: string; device_user_id: string }[]>([]);
 
   // Blinking colon indicator for digital clock
@@ -96,10 +96,11 @@ export default function MarkAttendance() {
           setStatusText(res.error.toUpperCase());
         } else if (res && res.success) {
           setStatusMode('success');
-          setStatusText('ACCESS GRANTED');
+          setStatusText(res.smsWarning ? 'ATTENDANCE SAVED; SMS WARNING' : 'ACCESS GRANTED');
           setSuccessInfo({
             name: res.fullName || 'User',
-            role: res.role || 'MEMBER'
+            role: res.role || 'MEMBER',
+            warning: res.smsWarning
           });
           setPin(''); // Reset digits
         }
@@ -243,6 +244,9 @@ export default function MarkAttendance() {
                 {successInfo && (
                   <div className="text-center font-serif text-sm font-semibold tracking-wide text-meridian-text-1 animate-fade-in">
                     {successInfo.name} <span className="text-[10px] font-mono text-meridian-text-3">({successInfo.role})</span>
+                    {successInfo.warning && (
+                      <p className="mt-1 text-[10px] font-sans font-medium text-amber-300">{successInfo.warning}</p>
+                    )}
                   </div>
                 )}
               </div>

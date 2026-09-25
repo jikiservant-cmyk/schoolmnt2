@@ -4,6 +4,8 @@ import { createClient } from '@/utils/supabase/server';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
+import { normalizeDeviceSerialNumber } from '@/lib/devices/serial';
+import { SUPPORTED_DEVICE_TYPES } from '@/lib/devices/registry';
 
 async function resolveSchoolId(supabase: any, userId: string): Promise<string | null> {
   // 1. Try auth_school_id RPC
@@ -39,12 +41,28 @@ export async function addDeviceAction(formData: FormData) {
   const label = formData.get('label') as string;
   const ipAddress = (formData.get('ipAddress') as string) || null;
   const deviceType = ((formData.get('deviceType') as string) || 'zkteco_adms').trim();
-  const rawSecret = (formData.get('deviceSecret') as string)?.trim() || null;
   const lateCutoff = (formData.get('lateCutoff') as string)?.trim() || '08:00';
   const timeZone = (formData.get('timeZone') as string)?.trim() || 'Africa/Kampala';
 
-  if (!serialNumber || !serialNumber.trim()) {
-    return { error: 'Device Serial Number is required.' };
+  const cleanSerial = normalizeDeviceSerialNumber(serialNumber);
+  if (!cleanSerial) {
+    return { error: 'Enter a valid device serial number (letters, digits, dot, underscore, colon, or hyphen).' };
+  }
+  if (!SUPPORTED_DEVICE_TYPES.some(option => option.type === deviceType)) {
+    return { error: 'Select a supported biometric device protocol.' };
+  }
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(lateCutoff)) {
+    return { error: 'Choose a valid late cutoff time.' };
+  }
+  const supportedTimeZones = new Set([
+    'Africa/Kampala',
+    'Africa/Nairobi',
+    'Africa/Kigali',
+    'Africa/Dar_es_Salaam',
+    'UTC',
+  ]);
+  if (!supportedTimeZones.has(timeZone)) {
+    return { error: 'Choose a supported time zone.' };
   }
 
   try {
@@ -52,19 +70,23 @@ export async function addDeviceAction(formData: FormData) {
     const adminClient = createAdminClient();
 
     // Check if device serial already exists
-    const cleanSerial = serialNumber.trim().toUpperCase();
-    const { data: existingDevice } = await adminClient
+    const { data: existingDevice, error: deviceLookupError } = await adminClient
       .from('devices')
       .select('id, serial_number')
       .eq('serial_number', cleanSerial)
       .maybeSingle();
 
+    if (deviceLookupError) {
+      console.error('Could not verify device serial uniqueness:', deviceLookupError);
+      return { error: 'Could not verify whether this device is already registered. Please retry.' };
+    }
     if (existingDevice) {
       return { error: `Device with Serial Number "${cleanSerial}" is already registered.` };
     }
 
     const { generateDeviceSecret, hashDeviceSecret, packDeviceMetadata } = await import('@/lib/devices/metadata');
-    const secretToSave = rawSecret || generateDeviceSecret();
+    // Generate credentials on the server so no client-controlled or weak token is trusted.
+    const secretToSave = generateDeviceSecret();
     const secretHashToSave = hashDeviceSecret(secretToSave);
 
     const [lateH, lateM] = lateCutoff.split(':').map(n => parseInt(n, 10));
@@ -95,21 +117,23 @@ export async function addDeviceAction(formData: FormData) {
         config
       });
 
-    // 2. Fallback if metadata packing is needed
-    if (insertErr && (insertErr.code === 'PGRST204' || insertErr.message?.includes('column'))) {
+    // Compatibility path for installations that have the legacy device_secret
+    // column but have not yet applied the hash/config-column migration. Store the
+    // SHA-256 digest in that column; never persist the raw token.
+    if (insertErr && (insertErr.code === 'PGRST204' || insertErr.message?.toLowerCase().includes('column'))) {
       const packedFw = packDeviceMetadata('Ver 2.0.1-20170210', {
         type: deviceType as any,
         config
       });
 
-      const retryPacked = await adminClient
+      const retryLegacy = await adminClient
         .from('devices')
         .insert({
           ...baseRecord,
-          device_secret_hash: secretHashToSave,
+          device_secret: secretHashToSave,
           firmware_version: packedFw
         });
-      insertErr = retryPacked.error;
+      insertErr = retryLegacy.error;
     }
 
     if (insertErr) {
@@ -146,24 +170,25 @@ export async function regenerateDeviceSecretAction(deviceId: string) {
     const newSecretHash = hashDeviceSecret(newSecret);
     const parsed = parseDeviceMetadata(dev);
 
-    // Attempt update with device_secret_hash first
+    // Store only a digest. Older schemas can keep the digest in the legacy
+    // device_secret column until the dedicated hash column is migrated.
     let { error: updateErr } = await adminClient
       .from('devices')
-      .update({ 
-        device_secret_hash: newSecretHash
-      })
-      .eq('id', deviceId);
+      .update({ device_secret_hash: newSecretHash, device_secret: null })
+      .eq('id', deviceId)
+      .eq('school_id', schoolId);
 
-    if (updateErr && (updateErr.code === 'PGRST204' || updateErr.message?.includes('column'))) {
+    if (updateErr && (updateErr.code === 'PGRST204' || updateErr.message?.toLowerCase().includes('column'))) {
       const packedFw = packDeviceMetadata(dev.firmware_version, {
         type: parsed.device_type,
         config: parsed.config
       });
-      const retryPacked = await adminClient
+      const retryLegacy = await adminClient
         .from('devices')
-        .update({ firmware_version: packedFw, device_secret_hash: newSecretHash })
-        .eq('id', deviceId);
-      updateErr = retryPacked.error;
+        .update({ device_secret: newSecretHash, firmware_version: packedFw })
+        .eq('id', deviceId)
+        .eq('school_id', schoolId);
+      updateErr = retryLegacy.error;
     }
 
     if (updateErr) {
@@ -191,15 +216,17 @@ export async function getDevicePushCandidatesAction(options: PushDeviceTargetOpt
 
     let schoolName = 'Connected School';
 
-    if (deviceSerialNumber && deviceSerialNumber.trim()) {
-      const cleanSerial = deviceSerialNumber.trim();
-      const { data: deviceRecord } = await adminClient
+    if (deviceSerialNumber !== undefined) {
+      const cleanSerial = normalizeDeviceSerialNumber(deviceSerialNumber);
+      if (!cleanSerial) return { error: 'Invalid device serial number.' };
+      const { data: deviceRecord, error: deviceLookupError } = await adminClient
         .from('devices')
         .select('id, serial_number, school_id, schools:school_id(name)')
         .eq('school_id', schoolId)
-        .ilike('serial_number', cleanSerial)
+        .eq('serial_number', cleanSerial)
         .maybeSingle();
 
+      if (deviceLookupError) return { error: 'Could not verify the selected device.' };
       if (!deviceRecord) {
         return { error: 'Device not found or access denied.' };
       }
@@ -219,7 +246,8 @@ export async function getDevicePushCandidatesAction(options: PushDeviceTargetOpt
       `)
       .eq('school_id', schoolId)
       .neq('is_active', false)
-      .order('full_name');
+      .order('full_name')
+      .order('id');
 
     if (category === 'teachers') {
       query = query.in('role', ['teacher', 'admin']);
@@ -234,15 +262,21 @@ export async function getDevicePushCandidatesAction(options: PushDeviceTargetOpt
       }
     }
 
-    const { data: people, error } = await query;
-    if (error) {
-      console.error('Error fetching push candidates:', error);
-      return { error: error.message || 'Failed to fetch candidate people.' };
+    const people: any[] = [];
+    const pageSize = 500;
+    for (let from = 0; ; from += pageSize) {
+      const { data: peoplePage, error } = await query.range(from, from + pageSize - 1);
+      if (error) {
+        console.error('Error fetching push candidates:', error);
+        return { error: 'Failed to fetch all candidate people.' };
+      }
+      people.push(...(peoplePage || []));
+      if (!peoplePage || peoplePage.length < pageSize) break;
     }
 
     const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
 
-    const formattedCandidates = (people || []).map((p: any) => ({
+    const formattedCandidates = people.map((p: any) => ({
       id: p.id,
       full_name: p.full_name,
       role: p.role,
@@ -282,15 +316,17 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
     let schoolName = 'Connected School';
 
     // 1. Resolve school from the target device to guarantee multi-tenant scoping
-    if (deviceSerialNumber && deviceSerialNumber.trim()) {
-      const cleanSerial = deviceSerialNumber.trim();
-      const { data: deviceRecord } = await adminClient
+    if (deviceSerialNumber !== undefined && deviceSerialNumber !== '') {
+      const cleanSerial = normalizeDeviceSerialNumber(deviceSerialNumber);
+      if (!cleanSerial) return { error: 'Invalid device serial number.' };
+      const { data: deviceRecord, error: deviceLookupError } = await adminClient
         .from('devices')
         .select('id, serial_number, school_id, schools:school_id(name)')
         .eq('school_id', schoolId)
-        .ilike('serial_number', cleanSerial)
+        .eq('serial_number', cleanSerial)
         .maybeSingle();
 
+      if (deviceLookupError) return { error: 'Could not verify the selected device.' };
       if (!deviceRecord) {
         return { error: 'Device not found or access denied.' };
       }
@@ -312,7 +348,8 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       .eq('school_id', schoolId)
       .neq('is_active', false)
       .not('device_user_id', 'is', null)
-      .order('full_name');
+      .order('full_name')
+      .order('id');
 
     let categoryLabel = 'All School Members';
     let targetClassName: string | null = null;
@@ -331,11 +368,13 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       if (classId) {
         query = query.eq('class_id', classId);
         // Find class name for nice label
-        const { data: cls } = await adminClient
+        const { data: cls, error: classLookupError } = await adminClient
           .from('classes')
           .select('name')
           .eq('id', classId)
+          .eq('school_id', schoolId)
           .maybeSingle();
+        if (classLookupError) return { error: 'Could not verify the selected class.' };
         targetClassName = cls?.name || 'Selected Class';
         categoryLabel = `Class "${targetClassName}" Students`;
       } else {
@@ -343,14 +382,19 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       }
     }
 
-    const { data: people, error } = await query;
-
-    if (error) {
-      console.error('Failed to fetch people for device sync:', error);
-      return { error: error.message || 'Failed to fetch enrolled people.' };
+    const people: any[] = [];
+    const peoplePageSize = 500;
+    for (let from = 0; ; from += peoplePageSize) {
+      const { data: peoplePage, error } = await query.range(from, from + peoplePageSize - 1);
+      if (error) {
+        console.error('Failed to fetch people for device sync:', error);
+        return { error: error.message || 'Failed to fetch enrolled people.' };
+      }
+      people.push(...(peoplePage || []));
+      if (!peoplePage || peoplePage.length < peoplePageSize) break;
     }
 
-    if (!people || people.length === 0) {
+    if (people.length === 0) {
       return { 
         success: true, 
         count: 0, 
@@ -360,29 +404,36 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       };
     }
 
-    const { enqueueDeviceCommand, enqueuePersonEnrollmentForSchool } = await import('@/utils/zkteco/commandQueue');
+    const { enqueueDeviceCommand, enqueuePersonEnrollmentForSchool, getActiveDevicesForSchool } = await import('@/utils/zkteco/commandQueue');
     const { getDeviceAdapter } = await import('@/lib/devices/registry');
     const { parseDeviceMetadata } = await import('@/lib/devices/metadata');
 
     let targetAdapter: any = null;
     let targetDevice: any = null;
 
-    if (deviceSerialNumber && deviceSerialNumber.trim()) {
-      const cleanSerial = deviceSerialNumber.trim().toUpperCase();
-      const { data: devRow } = await adminClient
+    if (deviceSerialNumber !== undefined && deviceSerialNumber !== '') {
+      const cleanSerial = normalizeDeviceSerialNumber(deviceSerialNumber);
+      if (!cleanSerial) return { error: 'Invalid device serial number.' };
+      const { data: devRow, error: deviceLookupError } = await adminClient
         .from('devices')
         .select('*')
         .eq('school_id', schoolId)
-        .ilike('serial_number', cleanSerial)
+        .eq('serial_number', cleanSerial)
         .maybeSingle();
 
-      if (devRow) {
-        targetDevice = parseDeviceMetadata(devRow);
-        targetAdapter = getDeviceAdapter(targetDevice.device_type);
-      }
+      if (deviceLookupError) return { error: 'Could not verify the selected device.' };
+      if (!devRow) return { error: 'Device not found or access denied.' };
+      targetDevice = parseDeviceMetadata(devRow);
+      targetAdapter = getDeviceAdapter(targetDevice.device_type);
+    }
+
+    const schoolDevices = targetDevice ? [] : await getActiveDevicesForSchool(schoolId);
+    if (!targetDevice && schoolDevices.length === 0) {
+      return { error: 'No active devices are registered to this school; no enrollment commands were queued.' };
     }
 
     let queuedCount = 0;
+    const enqueueFailures: string[] = [];
     const previewList: string[] = [];
 
     for (const p of people) {
@@ -398,14 +449,18 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       if (targetDevice && targetAdapter) {
         const enrollCmd = targetAdapter.buildEnrollCommand(enrollInput, targetDevice);
         if (enrollCmd.transportType === 'adms_command' || enrollCmd.transportType === 'rest_api') {
-          await enqueueDeviceCommand(enrollCmd.command, targetDevice.serial_number);
-          queuedCount++;
+          const enqueueResult = await enqueueDeviceCommand(enrollCmd.command, targetDevice.serial_number, { schoolId });
+          if (enqueueResult.success) queuedCount++;
+          else enqueueFailures.push(p.full_name);
+        } else {
+          enqueueFailures.push(p.full_name);
         }
       } else {
-        // Broadcast to all devices owned by school with dynamic per-vendor translation
-        const res = await enqueuePersonEnrollmentForSchool(enrollInput, schoolId);
-        if (res.success) {
-          queuedCount += res.queuedCount;
+        // Reuse the one school-scoped device lookup for this entire roster sync.
+        const res = await enqueuePersonEnrollmentForSchool(enrollInput, schoolId, schoolDevices);
+        queuedCount += res.queuedCount;
+        if (!res.success || res.queuedCount !== res.totalDevices) {
+          enqueueFailures.push(p.full_name);
         }
       }
 
@@ -416,6 +471,19 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
     }
 
     revalidatePath('/dashboard/devices');
+
+    if (enqueueFailures.length > 0) {
+      const failedNames = enqueueFailures.slice(0, 5).join(', ');
+      const omittedCount = Math.max(0, enqueueFailures.length - 5);
+      return {
+        success: false,
+        count: queuedCount,
+        schoolName,
+        categoryLabel,
+        previewList,
+        error: `Queued ${queuedCount} enrollment payload(s), but sync failed for ${enqueueFailures.length} member(s): ${failedNames}${omittedCount ? ` and ${omittedCount} more` : ''}. Retry the failed enrollments.`,
+      };
+    }
 
     return {
       success: true,
@@ -442,13 +510,14 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
 
     let schoolName = 'Connected School';
 
-    if (deviceSerialNumber && deviceSerialNumber.trim()) {
-      const cleanSerial = deviceSerialNumber.trim();
+    if (deviceSerialNumber !== undefined && deviceSerialNumber !== '') {
+      const cleanSerial = normalizeDeviceSerialNumber(deviceSerialNumber);
+      if (!cleanSerial) return { error: 'Invalid device serial number.' };
       const { data: deviceRecord } = await adminClient
         .from('devices')
         .select('id, serial_number, school_id, schools:school_id(name)')
         .eq('school_id', schoolId)
-        .ilike('serial_number', cleanSerial)
+        .eq('serial_number', cleanSerial)
         .maybeSingle();
 
       if (!deviceRecord) {
@@ -459,15 +528,28 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
     }
 
     // 1. Fetch all people in school to find highest existing numeric PIN
-    const { data: allSchoolPeople } = await adminClient
-      .from('people')
-      .select('device_user_id')
-      .eq('school_id', schoolId);
+    const allSchoolPeople: Array<{ device_user_id: string | null }> = [];
+    const pinPageSize = 500;
+    for (let from = 0; ; from += pinPageSize) {
+      const { data: peoplePage, error: existingPinsError } = await adminClient
+        .from('people')
+        .select('device_user_id')
+        .eq('school_id', schoolId)
+        .order('id')
+        .range(from, from + pinPageSize - 1);
+
+      if (existingPinsError) {
+        console.error('Failed to load existing school PINs:', existingPinsError);
+        return { error: 'Could not verify existing biometric PINs; no new PINs were assigned.' };
+      }
+      allSchoolPeople.push(...(peoplePage || []));
+      if (!peoplePage || peoplePage.length < pinPageSize) break;
+    }
 
     const existingPins = new Set<string>();
     let maxNumericPin = 100;
 
-    (allSchoolPeople || []).forEach(p => {
+    allSchoolPeople.forEach(p => {
       if (p.device_user_id) {
         existingPins.add(p.device_user_id.trim());
         const num = parseInt(p.device_user_id.trim(), 10);
@@ -491,7 +573,8 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
       .eq('school_id', schoolId)
       .is('device_user_id', null)
       .neq('is_active', false)
-      .order('full_name');
+      .order('full_name')
+      .order('id');
 
     if (category === 'teachers') {
       query = query.in('role', ['teacher', 'admin']);
@@ -503,12 +586,18 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
       query = query.eq('role', 'student').eq('class_id', classId);
     }
 
-    const { data: unassignedPeople, error: fetchErr } = await query;
-    if (fetchErr) {
-      return { error: fetchErr.message || 'Failed to fetch unassigned members.' };
+    const unassignedPeople: any[] = [];
+    const peoplePageSize = 500;
+    for (let from = 0; ; from += peoplePageSize) {
+      const { data: peoplePage, error: fetchErr } = await query.range(from, from + peoplePageSize - 1);
+      if (fetchErr) {
+        return { error: fetchErr.message || 'Failed to fetch unassigned members.' };
+      }
+      unassignedPeople.push(...(peoplePage || []));
+      if (!peoplePage || peoplePage.length < peoplePageSize) break;
     }
 
-    if (!unassignedPeople || unassignedPeople.length === 0) {
+    if (unassignedPeople.length === 0) {
       return { success: true, count: 0, message: 'All selected members already have a biometric PIN assigned.' };
     }
 
@@ -517,6 +606,7 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
 
     let currentPinNum = maxNumericPin;
     let assignedCount = 0;
+    let queueFailureCount = 0;
 
     for (const p of unassignedPeople) {
       // Find next free PIN
@@ -528,10 +618,15 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
       existingPins.add(assignedPin);
 
       // Update in DB
-      await adminClient
+      const { error: pinUpdateError } = await adminClient
         .from('people')
         .update({ device_user_id: assignedPin })
-        .eq('id', p.id);
+        .eq('id', p.id)
+        .eq('school_id', schoolId);
+      if (pinUpdateError) {
+        console.error('Failed to assign biometric PIN to school member:', pinUpdateError);
+        return { error: 'Failed to save an assigned biometric ID. No device command was queued for that member.' };
+      }
 
       // Enqueue sync command to terminal
       const displayName = formatZKTecoDisplayName({
@@ -542,11 +637,10 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
 
       const pri = p.role === 'admin' ? 14 : 0;
       const cmd = `DATA UPDATE userinfo PIN=${assignedPin}\tName=${displayName}\tPri=${pri}`;
-      if (deviceSerialNumber) {
-        await enqueueDeviceCommand(cmd, deviceSerialNumber);
-      } else {
-        await enqueueDeviceCommandForSchool(cmd, schoolId);
-      }
+      const enqueueResult = deviceSerialNumber
+        ? await enqueueDeviceCommand(cmd, deviceSerialNumber, { schoolId })
+        : await enqueueDeviceCommandForSchool(cmd, schoolId);
+      if (!enqueueResult.success) queueFailureCount++;
 
       assignedCount++;
     }
@@ -554,10 +648,18 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
     revalidatePath('/dashboard/devices');
     revalidatePath('/dashboard/people');
 
+    if (queueFailureCount > 0) {
+      return {
+        success: false,
+        count: assignedCount,
+        error: `Assigned PINs to ${assignedCount} member(s), but failed to queue device sync for ${queueFailureCount}. Use Push User Names to retry the device sync.`,
+      };
+    }
+
     return {
       success: true,
       count: assignedCount,
-      message: `Assigned sequential PINs to ${assignedCount} members and enqueued display names to terminal.`
+      message: `Assigned sequential PINs to ${assignedCount} members and queued display names to terminal.`
     };
   } catch (err: any) {
     console.error('Error auto-assigning PINs:', err);

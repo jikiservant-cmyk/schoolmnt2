@@ -1,7 +1,9 @@
 import { createAdminClient } from '@/utils/supabase/admin';
 import { parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
-import { EnrollPersonInput } from '@/lib/devices/types';
+import { normalizeDeviceSerialNumber } from '@/lib/devices/serial';
+import { isDeviceOwnedBySchool } from '@/lib/devices/tenant-safety';
+import { EnrollPersonInput, DeviceRecord } from '@/lib/devices/types';
 
 /**
  * Resolves all active device records registered to a given school.
@@ -9,6 +11,8 @@ import { EnrollPersonInput } from '@/lib/devices/types';
  * school that actually owns the person being enrolled.
  */
 export async function getActiveDevicesForSchool(schoolId: string) {
+  if (!schoolId) return [];
+
   const admin = createAdminClient();
   const { data: devices, error } = await admin
     .from('devices')
@@ -36,7 +40,9 @@ export interface EnqueueCommandOptions {
 }
 
 /**
- * Enqueues a command for a specific device serial number into school.device_commands.
+ * Enqueues a command for a single registered device, or a school-scoped ALL
+ * broadcast. A supplied school ID is checked against the device owner before
+ * either queue is written.
  */
 export async function enqueueDeviceCommand(
   command: string,
@@ -44,59 +50,81 @@ export async function enqueueDeviceCommand(
   options?: EnqueueCommandOptions
 ): Promise<{ success: boolean; commandId: string }> {
   let commandId = `cmd_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-  const cleanSn = deviceSerialNumber.trim().toUpperCase();
+  const rawSerial = typeof deviceSerialNumber === 'string' ? deviceSerialNumber.trim() : '';
+  const cleanSn = rawSerial.toUpperCase();
+  const isBroadcast = cleanSn === 'ALL';
 
   try {
     const admin = createAdminClient();
-    
-    // Resolve device info if cleanSn is specified
     let deviceId: string | null = null;
     let schoolId: string | null = options?.schoolId || null;
     let vendorProtocol: string = options?.vendorProtocol || 'zkteco_adms';
 
-    if (cleanSn !== 'ALL') {
-      const { data: dev } = await admin
+    if (isBroadcast) {
+      if (!schoolId) {
+        console.warn('[Device Command Queue] Refusing unscoped ALL-device broadcast.');
+        return { success: false, commandId };
+      }
+    } else {
+      const normalizedSerial = normalizeDeviceSerialNumber(rawSerial);
+      if (!normalizedSerial) {
+        console.warn('[Device Command Queue] Refusing command with invalid device serial.');
+        return { success: false, commandId };
+      }
+
+      const { data: dev, error: deviceError } = await admin
         .from('devices')
-        .select('id, school_id, device_type')
-        .ilike('serial_number', cleanSn)
+        .select('id, school_id, device_type, is_active')
+        .eq('serial_number', normalizedSerial)
+        .eq('is_active', true)
         .maybeSingle();
 
-      if (dev) {
-        deviceId = dev.id;
-        if (!schoolId) schoolId = dev.school_id;
-        if (dev.device_type) vendorProtocol = dev.device_type;
+      if (deviceError || !dev) {
+        console.warn('[Device Command Queue] Refusing command for an unknown device serial.');
+        return { success: false, commandId };
       }
+
+      if (schoolId && !isDeviceOwnedBySchool(dev, schoolId)) {
+        console.warn('[Device Command Queue] Refusing cross-school device command.');
+        return { success: false, commandId };
+      }
+
+      deviceId = dev.id;
+      schoolId = dev.school_id;
+      if (dev.device_type) vendorProtocol = dev.device_type;
     }
 
-    // 1. Primary: Insert into school.device_commands if school_id is known
-    if (schoolId) {
-      const { data: cmdRow, error: cmdErr } = await admin
-        .from('device_commands')
-        .insert({
-          school_id: schoolId,
-          device_id: deviceId,
-          target_serial: cleanSn,
-          vendor_protocol: vendorProtocol,
-          command_type: options?.commandType || 'ENROLL_USER',
-          payload: options?.payload || { raw_command: command, commandId },
-          raw_command: command,
-          status: 'pending'
-        })
-        .select('id')
-        .maybeSingle();
+    // No write is allowed without an authenticated school/device context.
+    if (!schoolId) return { success: false, commandId };
 
-      if (!cmdErr && cmdRow?.id) {
-        return { success: true, commandId: cmdRow.id };
-      }
-      if (cmdErr) {
-        console.warn('[Device Command Queue] device_commands insert failed, trying device_logs fallback:', cmdErr.message);
-      }
+    const { data: cmdRow, error: cmdErr } = await admin
+      .from('device_commands')
+      .insert({
+        school_id: schoolId,
+        device_id: deviceId,
+        target_serial: cleanSn,
+        vendor_protocol: vendorProtocol,
+        command_type: options?.commandType || 'ENROLL_USER',
+        payload: options?.payload || { raw_command: command, commandId },
+        raw_command: command,
+        status: 'pending'
+      })
+      .select('id')
+      .maybeSingle();
+
+    if (!cmdErr && cmdRow?.id) {
+      return { success: true, commandId: cmdRow.id };
+    }
+    if (cmdErr) {
+      console.warn('[Device Command Queue] device_commands insert failed, trying device_logs fallback:', cmdErr.message);
     }
 
-    // 2. Fallback: Persist into device_logs so getrequest API route still works
+    // Legacy fallback must carry the tenant ID too; /iclock/getrequest filters
+    // this queue by school_id before returning a command to any terminal.
     const { error: insertErr } = await admin
       .from('device_logs')
       .insert({
+        school_id: schoolId,
         device_id: deviceId,
         raw_serial_number: cleanSn,
         device_user_id: 'COMMAND',
@@ -106,7 +134,7 @@ export async function enqueueDeviceCommand(
       });
 
     if (insertErr) {
-      console.warn('[Device Command Queue] Persisting command to device_logs warning:', insertErr.message);
+      console.warn('[Device Command Queue] Persisting command to DB failed:', insertErr.message);
       return { success: false, commandId };
     }
   } catch (e: any) {
@@ -121,6 +149,7 @@ export async function enqueueDeviceCommand(
  * Convenience wrapper: push one raw command to every device a school owns.
  */
 export async function enqueueDeviceCommandForSchool(command: string, schoolId: string) {
+  if (!schoolId) return { success: false, commandIds: [] };
   const serials = await getDeviceSerialsForSchool(schoolId);
   if (serials.length === 0) {
     console.warn(`[Device Command Queue] No active devices found for school ${schoolId}, command not sent.`);
@@ -136,11 +165,15 @@ export async function enqueueDeviceCommandForSchool(command: string, schoolId: s
  */
 export async function enqueuePersonEnrollmentForSchool(
   person: EnrollPersonInput,
-  schoolId: string
+  schoolId: string,
+  knownDevices?: DeviceRecord[]
 ) {
-  const devices = await getActiveDevicesForSchool(schoolId);
+  const devices = knownDevices ?? await getActiveDevicesForSchool(schoolId);
+  if (devices.some(device => device.school_id !== schoolId)) {
+    return { success: false, queuedCount: 0, totalDevices: devices.length, message: 'A target device belongs to a different school.' };
+  }
   if (devices.length === 0) {
-    return { success: false, queuedCount: 0, message: 'No active devices registered.' };
+    return { success: false, queuedCount: 0, totalDevices: 0, message: 'No active devices registered.' };
   }
 
   let successCount = 0;
@@ -150,7 +183,7 @@ export async function enqueuePersonEnrollmentForSchool(
 
     if (enrollResult.transportType === 'adms_command' || enrollResult.transportType === 'rest_api') {
       const res = await enqueueDeviceCommand(
-        enrollResult.command, 
+        enrollResult.command,
         dev.serial_number,
         {
           schoolId,

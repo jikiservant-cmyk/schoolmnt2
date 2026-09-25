@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
+import { normalizeDeviceSerialNumber } from '@/lib/devices/serial';
 
 // Device polling for server commands (ADMS /iclock/getrequest)
 // Required config to prevent caching the polling endpoint
@@ -12,11 +13,11 @@ export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const sn = searchParams.get('SN');
   
-  if (!sn || !sn.trim()) {
-    return new NextResponse('OK', { status: 200, headers: { 'Content-Type': 'text/plain' } });
+  const cleanSn = normalizeDeviceSerialNumber(sn);
+  if (!cleanSn) {
+    return new NextResponse('ERROR: INVALID_OR_MISSING_SN', { status: 400, headers: { 'Content-Type': 'text/plain' } });
   }
 
-  const cleanSn = sn.trim().toUpperCase().replace(/[%_]/g, '');
   const supabase = createAdminClient();
 
   // Validate device exists and is active
@@ -60,6 +61,10 @@ export async function GET(req: NextRequest) {
     .order('created_at', { ascending: true })
     .limit(50);
 
+  if (dbCmdsErr) {
+    console.warn('[ZKTeco ADMS] Primary school command queue query failed; trying the legacy queue:', dbCmdsErr.message);
+  }
+
   const commandList: { id: string | number; text: string }[] = [];
   const sentCommandIds: string[] = [];
 
@@ -73,15 +78,20 @@ export async function GET(req: NextRequest) {
     });
 
     // Mark commands as sent to device
-    await supabase
+    const { error: markSentError } = await supabase
       .from('device_commands')
       .update({ status: 'sent', sent_at: new Date().toISOString() })
+      .eq('school_id', device.school_id)
       .in('id', sentCommandIds);
+    if (markSentError) {
+      console.error('[ZKTeco ADMS] Failed to mark school-scoped commands as sent:', markSentError);
+      return new NextResponse('ERROR: COMMAND_QUEUE_UNAVAILABLE', { status: 503 });
+    }
   }
 
   // Fallback: Check legacy device_logs queue if primary queue was empty
   if (commandList.length === 0) {
-    const { data: legacyCmds } = await supabase
+    const { data: legacyCmds, error: legacyQueryError } = await supabase
       .from('device_logs')
       .select('id, payload')
       .eq('processed', false)
@@ -90,6 +100,11 @@ export async function GET(req: NextRequest) {
       .in('raw_serial_number', [cleanSn, 'ALL'])
       .order('event_timestamp', { ascending: true })
       .limit(50);
+
+    if (legacyQueryError) {
+      console.error('[ZKTeco ADMS] Legacy command queue unavailable:', legacyQueryError);
+      return new NextResponse('ERROR: COMMAND_QUEUE_UNAVAILABLE', { status: 503 });
+    }
 
     const processedLogIds: string[] = [];
     if (legacyCmds && legacyCmds.length > 0) {
@@ -104,10 +119,15 @@ export async function GET(req: NextRequest) {
           });
         }
       });
-      await supabase
+      const { error: legacyUpdateError } = await supabase
         .from('device_logs')
         .update({ processed: true, processed_at: new Date().toISOString() })
+        .eq('school_id', device.school_id)
         .in('id', processedLogIds);
+      if (legacyUpdateError) {
+        console.error('[ZKTeco ADMS] Failed to mark legacy school-scoped commands as sent:', legacyUpdateError);
+        return new NextResponse('ERROR: COMMAND_QUEUE_UNAVAILABLE', { status: 503 });
+      }
     }
   }
 
@@ -117,7 +137,7 @@ export async function GET(req: NextRequest) {
       return `C:${c.id}:${c.text}`;
     }).join('\n');
     
-    console.log(`[ZKTeco ADMS] Sending ${commandList.length} commands to terminal SN ${cleanSn}:\n${responseBody}`);
+    console.log(`[ZKTeco ADMS] Sending ${commandList.length} queued command(s) to terminal SN ${cleanSn}.`);
     
     return new NextResponse(responseBody, {
       status: 200,

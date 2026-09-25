@@ -17,7 +17,7 @@ export class ZKTecoAdmsAdapter implements DeviceAdapter {
       url.searchParams.get('push_token') ||
       url.searchParams.get('PushToken');
 
-    return isAuthorizedToken(providedToken, device.device_secret, process.env.ZKTECO_DEVICE_SECRET);
+    return isAuthorizedToken(providedToken, device.device_secret_hash || device.device_secret);
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {

@@ -14,18 +14,28 @@ export default async function PeoplePage({ searchParams }: SearchProps) {
   // 1. Resolve school ID
   const { data: userData } = await supabase.auth.getUser();
   let schoolId: string | null = null;
-  if (userData?.user) {
-    const { data: rpcSchoolId } = await supabase.rpc('auth_school_id');
-    schoolId = rpcSchoolId || null;
-    if (!schoolId) {
-       const { data: stf } = await supabase.from('staff_users').select('people(school_id)').eq('auth_user_id', userData.user.id).maybeSingle();
-       if (stf?.people && (stf.people as any).school_id) schoolId = (stf.people as any).school_id;
-    }
+  if (!userData?.user) {
+    return <div className="p-6 text-sm text-red-600">Please sign in to view the school directory.</div>;
   }
 
-  // 2. Fetch school classes
-  const classesQuery = supabase.from('classes').select('id, name').order('name');
-  if (schoolId) classesQuery.eq('school_id', schoolId);
+  const { data: rpcSchoolId } = await supabase.rpc('auth_school_id');
+  schoolId = rpcSchoolId || null;
+  if (!schoolId) {
+    const { data: staff } = await supabase
+      .from('staff_users')
+      .select('people(school_id)')
+      .eq('auth_user_id', userData.user.id)
+      .maybeSingle();
+    const person = Array.isArray(staff?.people) ? staff.people[0] : staff?.people;
+    schoolId = (person as any)?.school_id || null;
+  }
+
+  if (!schoolId) {
+    return <div className="p-6 text-sm text-red-600">School context not found. Contact your administrator.</div>;
+  }
+
+  // 2. Fetch school classes; never leave this query unscoped.
+  const classesQuery = supabase.from('classes').select('id, name').eq('school_id', schoolId).order('name');
   const { data: classesData } = await classesQuery;
   const classes = classesData || [];
 

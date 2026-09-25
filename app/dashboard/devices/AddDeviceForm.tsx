@@ -1,19 +1,10 @@
 'use client';
 
-import { useState, useTransition, useEffect } from 'react';
+import { useState, useTransition } from 'react';
 import { addDeviceAction } from './actions';
-import { Plus, HelpCircle, Key, RefreshCw, Copy, Check, ShieldCheck, Cpu } from 'lucide-react';
+import { Plus, HelpCircle, Key, Copy, Check, ShieldCheck, Cpu } from 'lucide-react';
 import { SUPPORTED_DEVICE_TYPES, DeviceTypeOption } from '@/lib/devices/registry';
 import { DeviceType } from '@/lib/devices/types';
-
-function createRandomSecret(): string {
-  const chars = '0123456789abcdef';
-  let rand = '';
-  for (let i = 0; i < 16; i++) {
-    rand += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return `dev_sec_${rand}`;
-}
 
 export default function AddDeviceForm() {
   const [isPending, startTransition] = useTransition();
@@ -22,11 +13,8 @@ export default function AddDeviceForm() {
   const [copied, setCopied] = useState<boolean>(false);
 
   const [selectedType, setSelectedType] = useState<DeviceType>('zkteco_adms');
-  const [deviceSecret, setDeviceSecret] = useState<string>(createRandomSecret);
-
-  const generateSecret = () => {
-    setDeviceSecret(createRandomSecret());
-  };
+  // The server creates a one-time token after a device is registered.
+  const [deviceSecret, setDeviceSecret] = useState<string>('');
 
   const handleCopySecret = () => {
     if (!deviceSecret) return;
@@ -53,8 +41,10 @@ export default function AddDeviceForm() {
         } else {
           setSuccess(true);
           form.reset();
-          generateSecret();
-          setTimeout(() => setSuccess(false), 4000);
+          if ('deviceSecret' in res && typeof res.deviceSecret === 'string') {
+            setDeviceSecret(res.deviceSecret);
+          }
+          setTimeout(() => setSuccess(false), 8000);
         }
       } catch (err: any) {
         setError(err?.message || 'A network error occurred. Please try again.');
@@ -82,7 +72,7 @@ export default function AddDeviceForm() {
 
       {success && (
         <div className="p-3 text-xs font-mono text-meridian-gold bg-meridian-gold/15 rounded-lg border border-meridian-gold/30 animate-fade-in">
-          Terminal registered successfully with assigned security credentials.
+          Terminal registered. Copy the one-time token below now; it cannot be recovered after leaving this page.
         </div>
       )}
 
@@ -163,38 +153,30 @@ export default function AddDeviceForm() {
           <div className="flex justify-between items-center">
             <label htmlFor="deviceSecret" className="text-xs font-mono uppercase tracking-wider text-meridian-text-2 flex items-center gap-1.5">
               <Key className="w-3 h-3 text-meridian-gold" />
-              Per-Device Secret Token
+              One-Time Device Secret
             </label>
-            <button
-              type="button"
-              onClick={generateSecret}
-              title="Generate new secret token"
-              className="text-[10px] font-mono text-meridian-gold hover:text-meridian-gold-dim flex items-center gap-1 transition"
-            >
-              <RefreshCw className="w-2.5 h-2.5" />
-              Regenerate
-            </button>
           </div>
           <div className="relative flex items-center">
             <input
               id="deviceSecret"
-              name="deviceSecret"
               type="text"
               readOnly
+              placeholder="Generated securely after registration"
               value={deviceSecret}
-              className="w-full px-3 py-2 pr-10 bg-meridian-panel-raised border border-meridian-border text-xs rounded-lg font-mono text-meridian-gold select-all"
+              className="w-full px-3 py-2 pr-10 bg-meridian-panel-raised border border-meridian-border text-xs rounded-lg font-mono text-meridian-gold select-all placeholder:text-meridian-text-3"
             />
             <button
               type="button"
               onClick={handleCopySecret}
-              className="absolute right-2 p-1.5 text-meridian-text-3 hover:text-meridian-text-1 transition"
-              title="Copy secret to clipboard"
+              disabled={!deviceSecret}
+              className="absolute right-2 p-1.5 text-meridian-text-3 hover:text-meridian-text-1 transition disabled:opacity-40"
+              title="Copy one-time secret"
             >
               {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
             </button>
           </div>
           <p className="text-[10px] font-mono text-meridian-text-3">
-            Individual token for this unit. Authorizes HTTP push requests without exposing other terminals.
+            A cryptographically random token is returned once after registration. The database stores only its SHA-256 digest.
           </p>
         </div>
 
@@ -260,6 +242,7 @@ export default function AddDeviceForm() {
               <br />• Server Address: <code className="text-meridian-gold select-all">{typeof window !== 'undefined' ? window.location.hostname : 'your-cloud-domain.com'}</code>
               <br />• Server Port: <strong>443</strong> | HTTPS: <strong>ON</strong>
               <br />• Push Path: <code>/iclock/cdata</code>
+              <br />• Configure this device&apos;s token as <code>X-Device-Token</code> (or a <code>token</code> query parameter if the terminal only supports URLs): <strong className="text-meridian-gold">{deviceSecret || 'register the terminal to generate its token'}</strong>
             </p>
           </div>
         )}
@@ -274,7 +257,7 @@ export default function AddDeviceForm() {
               <code className="block bg-meridian-deep p-1.5 my-1 rounded text-meridian-gold break-all select-all">
                 {typeof window !== 'undefined' ? window.location.origin : 'https://your-domain.com'}/api/devices/push?sn=[SERIAL]
               </code>
-              Header: <code>X-Device-Token: {deviceSecret}</code>
+              Header: <code>X-Device-Token: {deviceSecret || 'register the terminal to generate its token'}</code>
             </p>
           </div>
         )}
@@ -289,7 +272,7 @@ export default function AddDeviceForm() {
               <code className="block bg-meridian-deep p-1.5 my-1 rounded text-meridian-gold break-all select-all">
                 {typeof window !== 'undefined' ? window.location.origin : 'https://your-domain.com'}/api/devices/push?sn=[SERIAL]
               </code>
-              Auth Token: <code>{deviceSecret}</code>
+              Auth Token: <code>{deviceSecret || 'register the terminal to generate its token'}</code>
             </p>
           </div>
         )}

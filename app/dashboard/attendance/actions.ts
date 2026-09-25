@@ -5,6 +5,9 @@ import { createClient } from '@/utils/supabase/server';
 import { createPublicAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
+import { getEatTodayRange } from '@/lib/attendance-window';
+import { createAttendanceIdentity } from '@/lib/attendance/idempotency';
+import { readRequestTextLimited, RequestBodyTooLargeError } from '@/lib/http/read-limited-body';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
   // 1. Try auth_school_id RPC
@@ -42,9 +45,19 @@ async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<str
 export async function getAttendanceData(dateFilterStr?: string) {
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
+    if (dateFilterStr) {
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateFilterStr);
+      if (!match) return { logs: [], school: null, classes: [], people: [], truncated: false, error: 'Date filter must use YYYY-MM-DD.' };
+      const parsedDate = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+      if (parsedDate.toISOString().slice(0, 10) !== dateFilterStr) {
+        return { logs: [], school: null, classes: [], people: [], truncated: false, error: 'Date filter is not a valid calendar date.' };
+      }
+    }
     
     // 1. Get attendance logs strictly scoped to this school
   let logs: any[] = [];
+  let logsTruncated = false;
+  const logLimit = dateFilterStr ? 2_000 : 500;
   
   let query = supabase
     .from('attendance_logs')
@@ -70,29 +83,37 @@ export async function getAttendanceData(dateFilterStr?: string) {
     // Expecting YYYY-MM-DD
     const startIso = `${dateFilterStr}T00:00:00+03:00`; // EAT Start
     const endIso = `${dateFilterStr}T23:59:59+03:00`;   // EAT End
-    query = query.gte('occurred_at', startIso).lte('occurred_at', endIso).limit(2000);
+    query = query.gte('occurred_at', startIso).lte('occurred_at', endIso).limit(logLimit + 1);
   } else {
-    query = query.limit(500);
+    query = query.limit(logLimit + 1);
   }
   
   const { data: logsData, error: logsError } = await query;
-
-  if (!logsError && logsData) {
-    logs = logsData;
+  if (logsError) {
+    console.error('Failed to load school-scoped attendance logs:', logsError);
+    return { logs: [], school: null, classes: [], people: [], truncated: false, error: 'Failed to load attendance records. Please retry.' };
+  }
+  if (logsData) {
+    logsTruncated = logsData.length > logLimit;
+    logs = logsData.slice(0, logLimit);
   }
 
   // 2. Fetch classes strictly scoped to this school
   let classes: any[] = [];
-  const { data: classData } = await supabase
+  const { data: classData, error: classError } = await supabase
     .from('classes')
     .select('id, name')
     .eq('school_id', schoolId)
     .order('name');
+  if (classError) {
+    console.error('Failed to load school-scoped classes:', classError);
+    return { logs: [], school: null, classes: [], people: [], truncated: logsTruncated, error: 'Failed to load classes. Please retry.' };
+  }
   if (classData) classes = classData;
 
   // 3. Fetch all registered people strictly scoped to this school
   let people: any[] = [];
-  const { data: peopleData } = await supabase
+  const { data: peopleData, error: peopleError } = await supabase
     .from('people')
     .select(`
       id,
@@ -108,16 +129,24 @@ export async function getAttendanceData(dateFilterStr?: string) {
     `)
     .eq('school_id', schoolId)
     .order('full_name');
+  if (peopleError) {
+    console.error('Failed to load school-scoped people:', peopleError);
+    return { logs: [], school: null, classes: [], people: [], truncated: logsTruncated, error: 'Failed to load the school roster. Please retry.' };
+  }
   if (peopleData) people = peopleData;
 
   // 4. Fetch school details strictly for this school
   let school: any = null;
-  const { data: schoolRecord } = await supabase
+  const { data: schoolRecord, error: schoolError } = await supabase
     .from('schools')
     .select('id, name, settings')
     .eq('id', schoolId)
     .maybeSingle();
 
+  if (schoolError) {
+    console.error('Failed to load the authenticated school record:', schoolError);
+    return { logs: [], school: null, classes: [], people: [], truncated: logsTruncated, error: 'Failed to load school details. Please retry.' };
+  }
   if (schoolRecord) {
     school = schoolRecord;
   }
@@ -147,6 +176,7 @@ export async function getAttendanceData(dateFilterStr?: string) {
       school,
       classes: classes || [],
       people: people || [],
+      truncated: logsTruncated,
       error: undefined as string | undefined
     };
   } catch (err: any) {
@@ -155,6 +185,7 @@ export async function getAttendanceData(dateFilterStr?: string) {
       school: null,
       classes: [],
       people: [],
+      truncated: false,
       error: err.message || 'Unauthorized'
     };
   }
@@ -164,28 +195,63 @@ export async function recordTeacherAttendance(personId: string, status?: 'presen
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
     
+    if (typeof personId !== 'string' || !personId || (status && !['present', 'late', 'excused'].includes(status))) {
+      return { error: 'Invalid teacher attendance request.' };
+    }
+
+    const { data: person, error: personError } = await supabase
+      .from('people')
+      .select('id, role')
+      .eq('id', personId)
+      .eq('school_id', schoolId)
+      .maybeSingle();
+    if (personError || !person || !['teacher', 'admin', 'support_staff'].includes(person.role)) {
+      return { error: 'Staff record not found or access denied.' };
+    }
+
     const now = new Date();
-    // Default rule: if checking in after 08:30 AM East Africa Time, mark as late unless specified
+    // Default rule: if checking in after 08:30 AM East Africa Time, mark as late unless specified.
     const eatHours = (now.getUTCHours() + 3) % 24;
     const eatMinutes = now.getUTCMinutes();
     const isLate = eatHours > 8 || (eatHours === 8 && eatMinutes > 30);
     const finalStatus = status || (isLate ? 'late' : 'present');
+    const { startIso, endIso } = getEatTodayRange(now);
+    const { data: existingMark, error: existingError } = await supabase
+      .from('attendance_logs')
+      .select('id')
+      .eq('school_id', schoolId)
+      .eq('person_id', personId)
+      .eq('attendance_type', 'check_in')
+      .gte('occurred_at', startIso)
+      .lte('occurred_at', endIso)
+      .limit(1)
+      .maybeSingle();
+    if (existingError) return { error: 'Could not verify today\'s attendance mark.' };
+    if (existingMark) return { error: 'Attendance has already been recorded for this staff member today.' };
 
+    const identity = createAttendanceIdentity(schoolId, personId, 'check_in', now);
     const { data, error } = await supabase
       .from('attendance_logs')
-      .insert({
+      .upsert({
+        ...identity,
         school_id: schoolId,
         person_id: personId,
         status: finalStatus,
         attendance_type: 'check_in',
         source: 'manual',
         occurred_at: now.toISOString()
+      }, {
+        onConflict: 'school_id,idempotency_key',
+        ignoreDuplicates: true,
       })
       .select()
       .maybeSingle();
 
     if (error) {
       return { error: error.message };
+    }
+    if (!data) {
+      return { error: 'Attendance was already recorded for this staff member today.' };
     }
 
     revalidatePath('/dashboard/attendance');
@@ -248,8 +314,23 @@ export async function getSchoolBalance() {
   }
 }
 
-export async function topUpBalance(amount: number, phoneNumber: string) {
+export async function topUpBalance(amount: number, phoneNumber: string, requestId?: string) {
   try {
+    if (!Number.isSafeInteger(amount) || amount <= 0) {
+      return { error: 'Enter a valid positive whole-number top-up amount.' };
+    }
+    if (typeof phoneNumber !== 'string' || !phoneNumber.trim()) {
+      return { error: 'Enter a valid mobile money phone number.' };
+    }
+    if (requestId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
+      return { error: 'Invalid payment request reference.' };
+    }
+
+    const apiKey = process.env.NAJIKI_API_KEY?.trim();
+    if (!apiKey || /^(test[-_]?key|changeme|placeholder|your[-_])/i.test(apiKey)) {
+      return { error: 'Payment provider credentials are not configured.' };
+    }
+
     const { supabase, schoolId, user } = await requireSchoolAdmin();
     const publicAdmin = createPublicAdminClient();
     const userData = { user };
@@ -308,35 +389,97 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
 
   tenantCode = tenantCode.trim();
 
-  console.log(`[NaJiki STK Push] Resolved tenant code: "${tenantCode}" for user ${userData.user.email} / school ${school.id}`);
+  console.log('[NaJiki STK Push] Resolved school and provider tenant configuration:', {
+    schoolId: school.id,
+    hasProviderTenantCode: Boolean(tenantCode),
+  });
 
-  // 2. Ensure row exists in public.wallets for this school
-  try {
-    const { data: existingWallet } = await publicAdmin
+  // 2. Verify a school wallet exists before initiating a payment. The deployed
+  // schema may use either tenant_id or school_id, so check each explicitly and
+  // fail closed on any non-schema error.
+  const missingWalletColumnCodes = new Set(['42703', 'PGRST204']);
+  const walletByTenantId = await publicAdmin
+    .from('wallets')
+    .select('id, balance')
+    .eq('tenant_id', school.id)
+    .maybeSingle();
+  const walletBySchoolId = await publicAdmin
+    .from('wallets')
+    .select('id, balance')
+    .eq('school_id', school.id)
+    .maybeSingle();
+
+  const tenantColumnAvailable = !walletByTenantId.error;
+  const schoolColumnAvailable = !walletBySchoolId.error;
+  const unexpectedWalletError = [walletByTenantId.error, walletBySchoolId.error].find(
+    error => error && !missingWalletColumnCodes.has(error.code || ''),
+  );
+  if (unexpectedWalletError || (!tenantColumnAvailable && !schoolColumnAvailable)) {
+    console.error('[NaJiki STK Push] Could not verify the school wallet:', unexpectedWalletError);
+    return { error: 'Could not verify the school wallet. No payment was initiated.' };
+  }
+
+  if (
+    walletByTenantId.data && walletBySchoolId.data &&
+    walletByTenantId.data.id !== walletBySchoolId.data.id
+  ) {
+    console.error('[NaJiki STK Push] Conflicting wallet rows exist for the school.');
+    return { error: 'Wallet configuration is ambiguous. Contact support before initiating a payment.' };
+  }
+
+  let existingWallet = walletByTenantId.data || walletBySchoolId.data;
+  if (!existingWallet) {
+    const walletRecord: Record<string, unknown> = {
+      id: crypto.randomUUID(),
+      balance: school.settings?.balance || 0,
+      currency: 'UGX',
+      sms_rate: 50,
+    };
+    if (tenantColumnAvailable) walletRecord.tenant_id = school.id;
+    if (schoolColumnAvailable) walletRecord.school_id = school.id;
+
+    let { error: walletInsertError } = await publicAdmin
       .from('wallets')
-      .select('id, balance')
-      .or(`tenant_id.eq.${school.id},school_id.eq.${school.id}`)
-      .maybeSingle();
+      .insert(walletRecord);
+    if (
+      walletInsertError &&
+      missingWalletColumnCodes.has(walletInsertError.code || '') &&
+      /currency|sms_rate/i.test(walletInsertError.message)
+    ) {
+      const fallbackWalletRecord = { ...walletRecord };
+      delete fallbackWalletRecord.currency;
+      delete fallbackWalletRecord.sms_rate;
+      const fallbackInsert = await publicAdmin.from('wallets').insert(fallbackWalletRecord);
+      walletInsertError = fallbackInsert.error;
+    }
+
+    if (walletInsertError && walletInsertError.code === '23505') {
+      const [retryTenant, retrySchool] = await Promise.all([
+        tenantColumnAvailable
+          ? publicAdmin.from('wallets').select('id, balance').eq('tenant_id', school.id).maybeSingle()
+          : Promise.resolve({ data: null, error: null }),
+        schoolColumnAvailable
+          ? publicAdmin.from('wallets').select('id, balance').eq('school_id', school.id).maybeSingle()
+          : Promise.resolve({ data: null, error: null }),
+      ]);
+      existingWallet = retryTenant.data || retrySchool.data;
+    } else if (walletInsertError) {
+      console.error('[NaJiki STK Push] Could not initialize the school wallet:', walletInsertError);
+      return { error: 'Could not initialize the school wallet. No payment was initiated.' };
+    }
 
     if (!existingWallet) {
-      const generatedWalletId = crypto.randomUUID();
-      try {
-        await publicAdmin
-          .from('wallets')
-          .insert({
-            id: generatedWalletId,
-            tenant_id: school.id,
-            school_id: school.id,
-            balance: school.settings?.balance || 0,
-            currency: 'UGX',
-            sms_rate: 50
-          });
-      } catch (wInsertErr) {
-        console.warn('Wallet insertion note:', wInsertErr);
+      const { data: insertedWallet, error: verifyWalletError } = await publicAdmin
+        .from('wallets')
+        .select('id, balance')
+        .eq('id', walletRecord.id)
+        .maybeSingle();
+      if (verifyWalletError || !insertedWallet) {
+        console.error('[NaJiki STK Push] Wallet initialization was not confirmed:', verifyWalletError);
+        return { error: 'Could not confirm school wallet initialization. No payment was initiated.' };
       }
+      existingWallet = insertedWallet;
     }
-  } catch (wErr) {
-    console.warn('Notice ensuring public.wallets record:', wErr);
   }
 
   // 3. Clean and standardize phone number
@@ -353,26 +496,37 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
     formattedPhoneNumeric = `256${rawPhone}`;
   }
 
+  if (!/^256\d{9}$/.test(formattedPhoneNumeric)) {
+    return { error: 'Enter a valid Ugandan mobile money number.' };
+  }
+
   const phoneWithPlus = `+${formattedPhoneNumeric}`;
   const phoneLocal07 = formattedPhoneNumeric.startsWith('256') 
     ? `0${formattedPhoneNumeric.slice(3)}` 
     : formattedPhoneNumeric;
 
   // 4. Generate unique transaction / idempotency key
-  const idempotencyKey = `sch_topup_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+  const idempotencyKey = `sch_topup_${requestId?.toLowerCase() || crypto.randomUUID()}`;
 
   // 5. Determine NaJiki API Endpoint
-  let endpointUrl = process.env.NAJIKI_API_URL;
-  if (!endpointUrl && process.env.NAJIKI_DOMAIN) {
-    const domain = process.env.NAJIKI_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  let endpointUrl = process.env.NAJIKI_API_URL?.trim();
+  if (!endpointUrl && process.env.NAJIKI_DOMAIN?.trim()) {
+    const domain = process.env.NAJIKI_DOMAIN.trim().replace(/^https?:\/\//i, '').replace(/\/$/, '');
     endpointUrl = `https://${domain}/api/payments`;
   }
   if (!endpointUrl) {
-    endpointUrl = 'https://najiki.vercel.app/api/payments';
+    return { error: 'Payment provider endpoint is not configured. Set NAJIKI_API_URL or NAJIKI_DOMAIN.' };
+  }
+  try {
+    const parsedEndpoint = new URL(endpointUrl);
+    if (parsedEndpoint.protocol !== 'https:' || parsedEndpoint.username || parsedEndpoint.password) {
+      return { error: 'Payment provider endpoint must be a trusted HTTPS URL.' };
+    }
+  } catch {
+    return { error: 'Payment provider endpoint is invalid.' };
   }
 
-  const apiKey = process.env.NAJIKI_API_KEY || 'test_key';
-  const appCode = process.env.NAJIKI_APP_CODE || "school";
+  const appCode = process.env.NAJIKI_APP_CODE || 'school';
 
   // Build clean, full-spec STK push payload for NaJiki
   const payload = {
@@ -409,10 +563,18 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   };
 
   try {
-    console.log(`[NaJiki STK Push] Sending request to ${endpointUrl} for ${formattedPhoneNumeric} (${amount} UGX) with tenant "${tenantCode}"`);
+    const parsedEndpoint = new URL(endpointUrl);
+    console.log('[NaJiki STK Push] Initiating payment request:', {
+      providerHost: parsedEndpoint.host,
+      schoolId: school.id,
+      amount,
+      reference: idempotencyKey,
+    });
 
     const response = await fetch(endpointUrl, {
       method: 'POST',
+      redirect: 'error',
+      signal: AbortSignal.timeout(15_000),
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -428,31 +590,38 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
     });
 
     let textData = '';
-    let resData: any = {};
+    let resData: Record<string, unknown> = {};
     try {
-      textData = await response.text();
+      textData = await readRequestTextLimited(response, 64 * 1024);
       if (textData) {
-        resData = JSON.parse(textData);
+        const parsedResponse: unknown = JSON.parse(textData);
+        if (parsedResponse && typeof parsedResponse === 'object' && !Array.isArray(parsedResponse)) {
+          resData = parsedResponse as Record<string, unknown>;
+        }
       }
-    } catch (parseErr) {
-      console.warn('[NaJiki API] Failed to parse JSON response. Raw text:', textData.substring(0, 200));
+    } catch (responseReadError) {
+      const reason = responseReadError instanceof RequestBodyTooLargeError
+        ? 'response exceeded 64 KiB'
+        : 'response could not be read or parsed';
+      console.warn(`[NaJiki API] Provider ${reason}; HTTP status ${response.status}.`);
     }
 
     if (!response.ok) {
-      console.error(`[NaJiki TopUp API] Failed with status ${response.status}:`, resData || textData);
-      
-      // If payment provider returned a message or error
-      const errorMsg = resData.message || resData.error || resData.detail || `Payment provider returned status ${response.status}. Please verify your phone number and try again.`;
-      return { 
-        error: errorMsg
+      console.error(`[NaJiki TopUp API] Provider returned HTTP status ${response.status}.`);
+      return {
+        error: `Payment provider returned status ${response.status}. Please verify the payment details or contact support.`,
       };
     }
 
-    console.log('[NaJiki STK Push] Successfully initiated:', resData);
+    console.log('[NaJiki STK Push] Payment request accepted by provider.');
+    const providerTransactionId = resData.transactionId || resData.reference || resData.id;
+    const transactionId = (typeof providerTransactionId === 'string' || typeof providerTransactionId === 'number')
+      ? String(providerTransactionId).slice(0, 200)
+      : idempotencyKey;
 
     return {
       success: true,
-      transactionId: resData.transactionId || resData.reference || resData.id || idempotencyKey,
+      transactionId,
       message: `Mobile Money PIN prompt sent to ${phoneLocal07}! Please enter your PIN on your phone to complete payment.`
     };
   } catch (err: any) {
@@ -463,6 +632,6 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   }
   } catch (err: any) {
     console.error('topUpBalance error:', err);
-    return { error: err.message || 'Failed to top up balance' };
+    return { error: 'Could not initiate the top-up. Please contact support if the problem persists.' };
   }
 }

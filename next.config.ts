@@ -2,6 +2,8 @@ import type {NextConfig} from 'next';
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  // The npm build script runs `npm run lint` before Next build. This avoids the
+  // Next ESLint worker's parser serialization warning with the flat config.
   eslint: {
     ignoreDuringBuilds: true,
   },
@@ -18,6 +20,19 @@ const nextConfig: NextConfig = {
         pathname: '/**', // This allows any path under the hostname
       },
     ],
+  },
+  async headers() {
+    return [
+      {
+        source: '/:path*',
+        headers: [
+          { key: 'Strict-Transport-Security', value: 'max-age=31536000; includeSubDomains' },
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
+          { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
+          { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=()' },
+        ],
+      },
+    ];
   },
   output: 'standalone',
   transpilePackages: ['motion'],

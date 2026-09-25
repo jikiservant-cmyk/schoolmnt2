@@ -1,20 +1,13 @@
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
+import { getSupabasePublicConfig } from '@/utils/supabase/public-config'
 
 export async function updateSession(request: NextRequest) {
   let supabaseResponse = NextResponse.next({
     request,
   })
 
-  const supabaseUrl = 
-    process.env.NEXT_PUBLIC_SUPABASE_URL || 
-    process.env.SUPABASE_URL || 
-    'https://placeholder-project.supabase.co'
-
-  const supabaseAnonKey = 
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 
-    process.env.SUPABASE_ANON_KEY || 
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder'
+  const { supabaseUrl, supabaseAnonKey } = getSupabasePublicConfig()
 
   const supabase = createServerClient(
     supabaseUrl,
@@ -38,8 +31,8 @@ export async function updateSession(request: NextRequest) {
             supabaseResponse.cookies.set(name, value, {
               ...options,
               path: '/',
-              sameSite: 'none',
-              secure: true,
+              sameSite: 'lax',
+              secure: process.env.NODE_ENV === 'production',
             })
           )
         },

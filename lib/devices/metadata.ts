@@ -1,4 +1,4 @@
-import { DeviceRecord, DeviceType, DeviceConfig } from './types';
+import type { DeviceRecord, DeviceType, DeviceConfig } from './types';
 import crypto from 'crypto';
 
 /**
@@ -140,23 +140,32 @@ export function parseDeviceMetadata(device: any): DeviceRecord {
 }
 
 /**
- * Checks if a provided token matches the device's per-device secret hash,
- * the legacy cleartext secret, or the legacy global environment secret.
+ * Checks only the device-specific secret hash (or a legacy per-device secret).
+ * A shared global fallback is deliberately not accepted because it would let
+ * one school's device impersonate another school's device by serial number.
  */
+export function getClientSafeDeviceMetadata(device: any): Omit<DeviceRecord, 'device_secret' | 'device_secret_hash'> {
+  const safeRecord = { ...parseDeviceMetadata(device) } as Record<string, any>;
+  delete safeRecord.device_secret;
+  delete safeRecord.device_secret_hash;
+  // Packed legacy metadata may include credentials in the firmware field.
+  safeRecord.firmware_version = String(device?.firmware_version || '').split('|META:')[0] || null;
+  return safeRecord as Omit<DeviceRecord, 'device_secret' | 'device_secret_hash'>;
+}
+
 export function isAuthorizedToken(
   providedToken: string | null,
-  deviceSecretOrHash: string | null,
-  globalSecret: string | undefined = process.env.ZKTECO_DEVICE_SECRET
+  deviceSecretOrHash: string | null
 ): boolean {
   if (!providedToken || !providedToken.trim()) {
     return false; // Fail-closed: Never permit anonymous device pushes
   }
 
   const cleanProvided = providedToken.trim();
-  const target = deviceSecretOrHash?.trim() || globalSecret?.trim();
+  const target = deviceSecretOrHash?.trim();
 
   if (!target) {
-    return false; // Fail-closed if no secret configured on server
+    return false; // Fail-closed: every device must have its own secret
   }
 
   // 1. Check if stored target is a SHA-256 hash (64 hex characters)

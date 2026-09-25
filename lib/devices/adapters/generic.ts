@@ -16,7 +16,7 @@ export class GenericWebhookAdapter implements DeviceAdapter {
       url.searchParams.get('token') ||
       url.searchParams.get('api_key');
 
-    return isAuthorizedToken(providedToken, device.device_secret);
+    return isAuthorizedToken(providedToken, device.device_secret_hash || device.device_secret);
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {

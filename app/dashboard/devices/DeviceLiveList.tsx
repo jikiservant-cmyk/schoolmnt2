@@ -50,7 +50,6 @@ interface DeviceItem {
   school_id?: string | null;
   schools?: { id?: string; name?: string } | null;
   device_type?: string;
-  device_secret?: string | null;
   config?: {
     lateCutoffHour?: number;
     lateCutoffMinute?: number;
@@ -105,6 +104,7 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
 
   // Per-Device Secret state
   const [revealedSecrets, setRevealedSecrets] = useState<Record<string, boolean>>({});
+  const [newDeviceSecrets, setNewDeviceSecrets] = useState<Record<string, string>>({});
   const [copiedSecretId, setCopiedSecretId] = useState<string | null>(null);
   const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
 
@@ -125,9 +125,11 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
     setRegeneratingId(deviceId);
     try {
       const res = await regenerateDeviceSecretAction(deviceId);
-      if (res && (res as any).error) {
-        alert((res as any).error);
-      } else {
+      if (res && 'error' in res) {
+        alert(res.error);
+      } else if (res && 'newSecret' in res && typeof res.newSecret === 'string') {
+        setNewDeviceSecrets(prev => ({ ...prev, [deviceId]: res.newSecret }));
+        setRevealedSecrets(prev => ({ ...prev, [deviceId]: true }));
         router.refresh();
       }
     } catch (err: any) {
@@ -372,7 +374,7 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
           manufacturer: 'Universal',
           description: ''
         };
-        const secretToken = dev.device_secret || 'dev_sec_default';
+        const secretToken = newDeviceSecrets[dev.id] || '';
         const isSecretVisible = !!revealedSecrets[dev.id];
         const lateH = dev.config?.lateCutoffHour ?? 8;
         const lateM = dev.config?.lateCutoffMinute ?? 0;
@@ -481,21 +483,25 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
                 <Key className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                 <span className="text-gray-500 text-[11px]">Secret:</span>
                 <span className="font-semibold text-gray-800 tracking-wider select-all text-xs">
-                  {isSecretVisible ? secretToken : '••••••••••••••••'}
+                  {secretToken
+                    ? (isSecretVisible ? secretToken : '••••••••••••••••')
+                    : 'hidden; rotate to issue a new token'}
                 </span>
                 <button
                   type="button"
                   onClick={() => toggleSecretVisibility(dev.id)}
-                  className="text-gray-400 hover:text-gray-600 p-0.5 transition"
-                  title={isSecretVisible ? "Hide token" : "Reveal token"}
+                  disabled={!secretToken}
+                  className="text-gray-400 hover:text-gray-600 p-0.5 transition disabled:opacity-40"
+                  title={secretToken ? (isSecretVisible ? 'Hide token' : 'Reveal one-time token') : 'Stored token cannot be recovered; rotate to issue a new one'}
                 >
                   {isSecretVisible ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
                 </button>
                 <button
                   type="button"
                   onClick={() => handleCopyToken(dev.id, secretToken)}
-                  className="text-gray-400 hover:text-gray-600 p-0.5 transition"
-                  title="Copy token"
+                  disabled={!secretToken}
+                  className="text-gray-400 hover:text-gray-600 p-0.5 transition disabled:opacity-40"
+                  title={secretToken ? 'Copy one-time token' : 'Rotate to issue a new token'}
                 >
                   {copiedSecretId === dev.id ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                 </button>

@@ -1,18 +1,11 @@
 import { createServerClient } from '@supabase/ssr';
 import { cookies } from 'next/headers';
+import { getSupabasePublicConfig } from '@/utils/supabase/public-config';
 
 export async function createClient() {
   const cookieStore = await cookies();
 
-  const supabaseUrl = 
-    process.env.NEXT_PUBLIC_SUPABASE_URL || 
-    process.env.SUPABASE_URL || 
-    'https://placeholder-project.supabase.co';
-
-  const supabaseAnonKey = 
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 
-    process.env.SUPABASE_ANON_KEY || 
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder';
+  const { supabaseUrl, supabaseAnonKey } = getSupabasePublicConfig();
 
   return createServerClient(
     supabaseUrl,
@@ -31,8 +24,8 @@ export async function createClient() {
               cookieStore.set(name, value, {
                 ...options,
                 path: '/',
-                sameSite: 'none',
-                secure: true,
+                sameSite: 'lax',
+                secure: process.env.NODE_ENV === 'production',
               })
             );
           } catch {

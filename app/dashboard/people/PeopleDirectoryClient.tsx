@@ -175,11 +175,18 @@ export default function PeopleDirectoryClient({
         if (res && res.error) {
           setUidError(res.error);
         } else {
-          setUidSuccess('Biometric Hardware UID updated and synced with terminal!');
-          setTimeout(() => {
-            setEditingPerson(null);
-            setUidSuccess(null);
-          }, 1200);
+          const warnings = res?.warnings || [];
+          setUidSuccess(warnings.length > 0
+            ? `UID saved. ${warnings.join(' ')}`
+            : newDeviceUid.trim()
+              ? 'UID saved and enrollment queued to active devices.'
+              : 'Biometric UID cleared.');
+          if (warnings.length === 0) {
+            setTimeout(() => {
+              setEditingPerson(null);
+              setUidSuccess(null);
+            }, 1200);
+          }
         }
       } catch (err: any) {
         setUidError(err.message || 'Failed to update UID.');

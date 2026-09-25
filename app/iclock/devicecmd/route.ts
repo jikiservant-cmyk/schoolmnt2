@@ -2,21 +2,23 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
+import { normalizeDeviceSerialNumber } from '@/lib/devices/serial';
+import { readRequestTextLimited, RequestBodyTooLargeError } from '@/lib/http/read-limited-body';
+
+const MAX_ACK_BODY_BYTES = 128 * 1024;
+const MAX_ACK_LINES = 1_000;
 
 // Device responding with the execution status of a command (ZKTeco ADMS /iclock/devicecmd)
 export async function POST(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const sn = searchParams.get('SN');
   
-  if (!sn || !sn.trim()) {
-    return new NextResponse('ERROR: Missing SN', { status: 400 });
+  const cleanSn = normalizeDeviceSerialNumber(sn);
+  if (!cleanSn) {
+    return new NextResponse('ERROR: Missing or invalid SN', { status: 400 });
   }
 
-  const rawBody = await req.text();
-  console.log(`[ZKTeco ADMS] DeviceCmd POST from SN: ${sn}`);
-
   const supabase = createAdminClient();
-  const cleanSn = sn.trim().toUpperCase().replace(/[%_]/g, '');
 
   // Validate device exists and is active
   const { data: rawDevice } = await supabase
@@ -40,10 +42,24 @@ export async function POST(req: NextRequest) {
     return new NextResponse('ERROR: INVALID_CREDENTIALS', { status: 401 });
   }
 
+  let rawBody: string;
+  try {
+    rawBody = await readRequestTextLimited(req, MAX_ACK_BODY_BYTES);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return new NextResponse('ERROR: ACK_PAYLOAD_TOO_LARGE', { status: 413 });
+    }
+    console.error('[ZKTeco ADMS] Could not read command acknowledgment:', error);
+    return new NextResponse('ERROR: INVALID_PAYLOAD', { status: 400 });
+  }
+  console.log(`[ZKTeco ADMS] DeviceCmd POST from SN: ${cleanSn}`);
+
   if (rawBody && rawBody.trim()) {
     try {
-      const supabase = createAdminClient();
       const lines = rawBody.split('\n').map(l => l.trim()).filter(Boolean);
+      if (lines.length > MAX_ACK_LINES) {
+        return new NextResponse('ERROR: TOO_MANY_ACKNOWLEDGEMENTS', { status: 413 });
+      }
 
       for (const line of lines) {
         // Line format: ID=<cmdId>&Return=<0|other>&CMD=...
@@ -64,16 +80,27 @@ export async function POST(req: NextRequest) {
           // If cmdId is a UUID, update primary school.device_commands table
           const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cmdId);
           if (isUuid) {
-            await supabase
+            const { data: acknowledgedCommand, error: acknowledgementError } = await supabase
               .from('device_commands')
               .update(updatePayload)
               .eq('id', cmdId)
-              .eq('school_id', device.school_id);
+              .eq('school_id', device.school_id)
+              .in('target_serial', [cleanSn, 'ALL'])
+              .select('id')
+              .maybeSingle();
+            if (acknowledgementError) {
+              console.error('[ZKTeco ADMS] Command acknowledgement update failed:', acknowledgementError);
+              return new NextResponse('ERROR: COMMAND_ACK_UNAVAILABLE', { status: 503 });
+            }
+            if (!acknowledgedCommand) {
+              return new NextResponse('ERROR: COMMAND_NOT_FOUND', { status: 404 });
+            }
           }
         }
       }
     } catch (err) {
-      console.warn('[ZKTeco ADMS] Error updating command acknowledgment:', err);
+      console.error('[ZKTeco ADMS] Error updating command acknowledgment:', err);
+      return new NextResponse('ERROR: COMMAND_ACK_UNAVAILABLE', { status: 503 });
     }
   }
 

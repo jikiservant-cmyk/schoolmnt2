@@ -3,7 +3,7 @@ import AddDeviceForm from './AddDeviceForm';
 import DeviceLiveList from './DeviceLiveList';
 import { Smartphone, ArrowLeft, ShieldCheck, RefreshCw } from 'lucide-react';
 import Link from 'next/link';
-import { parseDeviceMetadata } from '@/lib/devices/metadata';
+import { getClientSafeDeviceMetadata } from '@/lib/devices/metadata';
 
 export default async function DevicesPage() {
   const supabase = await createClient();
@@ -29,7 +29,7 @@ export default async function DevicesPage() {
     .eq('school_id', schoolId)
     .order('name');
 
-  const registeredDevices = (devicesData || []).map(d => parseDeviceMetadata(d));
+  const registeredDevices = (devicesData || []).map(getClientSafeDeviceMetadata);
   const classesList = classesData || [];
 
   return (

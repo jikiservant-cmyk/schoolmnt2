@@ -27,7 +27,7 @@ export class HikvisionIsapiAdapter implements DeviceAdapter {
       }
     }
 
-    return isAuthorizedToken(providedToken, device.device_secret);
+    return isAuthorizedToken(providedToken, device.device_secret_hash || device.device_secret);
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {
