@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { getAttendanceData, topUpBalance, getSchoolBalance } from './actions';
 import { 
   Clock, 
@@ -63,10 +63,6 @@ export default function AttendancePage() {
   const [classFilter, setClassFilter] = useState<string>('all');
   const [dateFilter, setDateFilter] = useState<string>(''); // YYYY-MM-DD
 
-  useEffect(() => {
-    loadData();
-  }, [dateFilter]);
-
   // Poll for balance updates when waiting for Mobile Money PIN confirmation
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
@@ -99,7 +95,7 @@ export default function AttendancePage() {
     };
   }, [showTopUpModal, topUpStep, initialBalance]);
 
-  async function loadData() {
+  const loadData = useCallback(async () => {
     try {
       setLoading(true);
       const data = await getAttendanceData(dateFilter || undefined);
@@ -117,7 +113,14 @@ export default function AttendancePage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [dateFilter]);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      void loadData();
+    }, 0);
+    return () => window.clearTimeout(timeout);
+  }, [loadData]);
 
   const openTopUpModal = () => {
     setTopUpStep('form');
