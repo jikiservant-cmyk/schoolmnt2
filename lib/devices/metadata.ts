@@ -10,6 +10,13 @@ export function hashDeviceSecret(secret: string): string {
   return crypto.createHash('sha256').update(secret.trim()).digest('hex');
 }
 
+export function normalizeDeviceSerial(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const serial = value.trim().toUpperCase();
+  if (!serial || serial.length > 100 || /[%_\r\n]/.test(serial)) return null;
+  return serial;
+}
+
 /**
  * Generates a secure, cryptographically random per-device authentication token.
  * Example: dev_sec_9f4e2b810d7a31c5

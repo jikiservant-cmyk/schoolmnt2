@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/utils/supabase/admin';
-import { parseDeviceMetadata } from '@/lib/devices/metadata';
+import { normalizeDeviceSerial, parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
 import { processAttendanceEvents } from '@/lib/devices/processor';
 import { DeviceRecord, DeviceAdapter } from '@/lib/devices/types';
@@ -12,7 +12,10 @@ async function authenticateDevice(req: NextRequest, sn: string | null) {
     return { authenticated: false, reason: 'Missing device serial number (SN)' };
   }
 
-  const cleanSn = sn.trim().toUpperCase().replace(/[%_]/g, '');
+  const cleanSn = normalizeDeviceSerial(sn);
+  if (!cleanSn) {
+    return { authenticated: false, reason: 'Invalid device serial number' };
+  }
   const supabase = createAdminClient();
 
   const { data: rawDevice, error } = await supabase

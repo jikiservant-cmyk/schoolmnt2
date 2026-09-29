@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/utils/supabase/admin';
-import { parseDeviceMetadata } from '@/lib/devices/metadata';
+import { normalizeDeviceSerial, parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
 
 // Device polling for server commands (ADMS /iclock/getrequest)
@@ -16,7 +16,10 @@ export async function GET(req: NextRequest) {
     return new NextResponse('OK', { status: 200, headers: { 'Content-Type': 'text/plain' } });
   }
 
-  const cleanSn = sn.trim().toUpperCase().replace(/[%_]/g, '');
+  const cleanSn = normalizeDeviceSerial(sn);
+  if (!cleanSn) {
+    return new NextResponse('ERROR: Invalid SN', { status: 400 });
+  }
   const supabase = createAdminClient();
 
   // Validate device exists and is active

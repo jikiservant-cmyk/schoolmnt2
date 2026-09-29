@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/utils/supabase/admin';
-import { parseDeviceMetadata } from '@/lib/devices/metadata';
+import { normalizeDeviceSerial, parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
 import { processAttendanceEvents } from '@/lib/devices/processor';
 import { exceedsBodyLimit, exceedsContentLength, MAX_DEVICE_BODY_BYTES, MAX_DEVICE_EVENTS } from '@/lib/request-limits';
@@ -36,16 +36,23 @@ async function resolveDevice(req: NextRequest, rawBody?: string) {
     return { error: 'Missing device serial number (provide via ?sn=..., x-device-sn header, or payload serialNumber)', status: 400 };
   }
 
-  const cleanSn = sn.trim().toUpperCase();
+  const cleanSn = normalizeDeviceSerial(sn);
+  if (!cleanSn) {
+    return { error: 'Invalid device serial number', status: 400 };
+  }
   const supabase = createAdminClient();
 
   const { data: rawDevice, error } = await supabase
     .from('devices')
     .select('*')
-    .ilike('serial_number', cleanSn)
+    .eq('serial_number', cleanSn)
     .maybeSingle();
 
-  if (error || !rawDevice) {
+  if (error) {
+    console.error('[Device Push] Device lookup failed:', error.code);
+    return { error: 'Device lookup unavailable', status: 503 };
+  }
+  if (!rawDevice) {
     return { error: `Device with serial number "${cleanSn}" is not registered in the system`, status: 404 };
   }
 

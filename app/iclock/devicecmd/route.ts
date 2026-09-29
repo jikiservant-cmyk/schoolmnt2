@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createAdminClient } from '@/utils/supabase/admin';
-import { parseDeviceMetadata } from '@/lib/devices/metadata';
+import { normalizeDeviceSerial, parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
 
 // Device responding with the execution status of a command (ZKTeco ADMS /iclock/devicecmd)
@@ -12,11 +12,15 @@ export async function POST(req: NextRequest) {
     return new NextResponse('ERROR: Missing SN', { status: 400 });
   }
 
+  const cleanSn = normalizeDeviceSerial(sn);
+  if (!cleanSn) {
+    return new NextResponse('ERROR: Invalid SN', { status: 400 });
+  }
+
   const rawBody = await req.text();
-  console.log(`[ZKTeco ADMS] DeviceCmd POST from SN: ${sn}`);
+  console.log(`[ZKTeco ADMS] DeviceCmd POST from SN: ${cleanSn}`);
 
   const supabase = createAdminClient();
-  const cleanSn = sn.trim().toUpperCase().replace(/[%_]/g, '');
 
   // Validate device exists and is active
   const { data: rawDevice } = await supabase
