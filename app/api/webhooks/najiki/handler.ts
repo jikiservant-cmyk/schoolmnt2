@@ -1,10 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createPublicAdminClient } from '@/utils/supabase/admin';
 import crypto from 'crypto';
+import { exceedsBodyLimit, exceedsContentLength, MAX_WEBHOOK_BODY_BYTES } from '@/lib/request-limits';
 
 export async function handleNajikiWebhook(req: NextRequest) {
   try {
+    if (exceedsContentLength(req, MAX_WEBHOOK_BODY_BYTES)) {
+      return NextResponse.json({ error: 'Request body is too large' }, { status: 413 });
+    }
+
     const rawBody = await req.text();
+    if (exceedsBodyLimit(rawBody, MAX_WEBHOOK_BODY_BYTES)) {
+      return NextResponse.json({ error: 'Request body is too large' }, { status: 413 });
+    }
     const headersList = req.headers;
 
     // Secret key for verification

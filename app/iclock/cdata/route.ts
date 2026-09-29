@@ -4,6 +4,7 @@ import { parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
 import { processAttendanceEvents } from '@/lib/devices/processor';
 import { DeviceRecord, DeviceAdapter } from '@/lib/devices/types';
+import { exceedsBodyLimit, exceedsContentLength, MAX_DEVICE_BODY_BYTES, MAX_DEVICE_EVENTS } from '@/lib/request-limits';
 
 // Multi-Vendor Biometric Device Authenticator
 async function authenticateDevice(req: NextRequest, sn: string | null) {
@@ -93,7 +94,14 @@ export async function POST(req: NextRequest) {
   }
 
   const { device, adapter, supabase } = authResult;
+  if (exceedsContentLength(req, MAX_DEVICE_BODY_BYTES)) {
+    return new NextResponse('ERROR: REQUEST_TOO_LARGE', { status: 413 });
+  }
+
   const rawBody = await req.text();
+  if (exceedsBodyLimit(rawBody, MAX_DEVICE_BODY_BYTES)) {
+    return new NextResponse('ERROR: REQUEST_TOO_LARGE', { status: 413 });
+  }
   console.log(`[Device Bridge] POST from SN: ${sn} (${adapter.displayName}), Table: ${table || 'DEFAULT'}, Body Length: ${rawBody.length}`);
 
   // Fire-and-forget heartbeat update
@@ -105,6 +113,9 @@ export async function POST(req: NextRequest) {
 
   // Parse incoming push using device's vendor adapter
   const events = await adapter.parseIncomingPush(rawBody, req.headers, new URL(req.url), device);
+  if (events.length > MAX_DEVICE_EVENTS) {
+    return new NextResponse('ERROR: TOO_MANY_EVENTS', { status: 413 });
+  }
 
   if (events && events.length > 0) {
     console.log(`[Device Bridge] Adapter ${adapter.displayName} produced ${events.length} normalized attendance events`);

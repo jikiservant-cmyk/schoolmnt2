@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { AttendanceEvent, DeviceRecord } from './types';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { isWithinAttendanceSmsWindow } from '@/lib/attendance-window';
@@ -41,6 +42,7 @@ export async function processAttendanceEvents(
     .from('people')
     .select('id, full_name, role, class_id, is_active, device_user_id, classes:class_id(id, name)')
     .eq('school_id', device.school_id)
+    .eq('is_active', true)
     .not('device_user_id', 'is', null);
 
   if (peopleErr) {
@@ -96,8 +98,8 @@ export async function processAttendanceEvents(
     logDate: Date;
   }[] = [];
 
-  let earliestDate = new Date();
-  let latestDate = new Date('2000-01-01');
+  let earliestDate = new Date('9999-12-31T23:59:59.999Z');
+  let latestDate = new Date(0);
 
   for (const ev of events) {
     const cleanPin = ev.person_external_id.trim().toLowerCase();
@@ -111,8 +113,13 @@ export async function processAttendanceEvents(
       continue;
     }
 
+    if (!(ev.timestamp instanceof Date) || isNaN(ev.timestamp.getTime())) {
+      console.warn(`[Device Processor] Ignoring event with invalid timestamp for ${cleanPin}`);
+      continue;
+    }
+
     result.matchedCount++;
-    const logDate = ev.timestamp instanceof Date && !isNaN(ev.timestamp.getTime()) ? ev.timestamp : new Date();
+    const logDate = ev.timestamp;
     const isoString = logDate.toISOString();
 
     if (logDate < earliestDate) earliestDate = logDate;
@@ -187,8 +194,8 @@ export async function processAttendanceEvents(
         verify_type: item.event.verify_type || 'biometric',
         raw_event: item.event.raw_payload || null
       },
-      processed: true,
-      processed_at: nowIso
+      processed: false,
+      processed_at: null
     });
 
     // Determine status (present vs. late) according to per-school/device cutoff
@@ -235,15 +242,34 @@ export async function processAttendanceEvents(
     }
   }
 
-  // 5. Batch Inserts
+  // 5. Batch Inserts. Do not acknowledge a device event as processed when a
+  // database write failed; the device can retry it safely.
   if (deviceLogsToInsert.length > 0) {
-    await supabase.from('device_logs').insert(deviceLogsToInsert);
+    const { error: deviceLogError } = await supabase.from('device_logs').insert(deviceLogsToInsert);
+    if (deviceLogError) {
+      console.error('[Device Processor] Failed to save device audit logs:', deviceLogError);
+      throw new Error('Failed to save device audit logs');
+    }
     result.insertedDeviceLogs = deviceLogsToInsert.length;
   }
 
   if (attendanceLogsToInsert.length > 0) {
-    await supabase.from('attendance_logs').insert(attendanceLogsToInsert);
+    const { error: attendanceError } = await supabase.from('attendance_logs').insert(attendanceLogsToInsert);
+    if (attendanceError) {
+      console.error('[Device Processor] Failed to save attendance records:', attendanceError);
+      throw new Error('Failed to save attendance records');
+    }
     result.insertedAttendanceLogs = attendanceLogsToInsert.length;
+
+    const deviceLogIds = deviceLogsToInsert.map(log => log.id);
+    const { error: markProcessedError } = await supabase
+      .from('device_logs')
+      .update({ processed: true, processed_at: nowIso })
+      .in('id', deviceLogIds);
+    if (markProcessedError) {
+      console.error('[Device Processor] Attendance saved but audit status update failed:', markProcessedError);
+    }
+
     console.log(`[Device Processor] Saved ${attendanceLogsToInsert.length} attendance records from device ${device.serial_number} (${device.device_type})`);
   }
 
