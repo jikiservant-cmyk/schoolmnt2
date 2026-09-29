@@ -250,6 +250,17 @@ export async function getSchoolBalance() {
 
 export async function topUpBalance(amount: number, phoneNumber: string) {
   try {
+    if (!Number.isSafeInteger(amount) || amount <= 0) {
+      return { error: 'Top-up amount must be a positive whole number.' };
+    }
+    const configuredMax = Number(process.env.NAJIKI_MAX_TOPUP_UGX || 100_000_000);
+    if (!Number.isSafeInteger(configuredMax) || amount > configuredMax) {
+      return { error: 'Top-up amount exceeds the configured limit.' };
+    }
+    if (typeof phoneNumber !== 'string' || !phoneNumber.trim()) {
+      return { error: 'A mobile money phone number is required.' };
+    }
+
     const { supabase, schoolId, user } = await requireSchoolAdmin();
     const publicAdmin = createPublicAdminClient();
     const userData = { user };
@@ -353,6 +364,10 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
     formattedPhoneNumeric = `256${rawPhone}`;
   }
 
+  if (!/^256\d{9}$/.test(formattedPhoneNumeric)) {
+    return { error: 'Enter a valid Ugandan mobile money phone number.' };
+  }
+
   const phoneWithPlus = `+${formattedPhoneNumeric}`;
   const phoneLocal07 = formattedPhoneNumeric.startsWith('256') 
     ? `0${formattedPhoneNumeric.slice(3)}` 
@@ -368,10 +383,22 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
     endpointUrl = `https://${domain}/api/payments`;
   }
   if (!endpointUrl) {
-    endpointUrl = 'https://najiki.vercel.app/api/payments';
+    return { error: 'Payment gateway is not configured.' };
   }
 
-  const apiKey = process.env.NAJIKI_API_KEY || 'test_key';
+  try {
+    const parsedEndpoint = new URL(endpointUrl);
+    if (parsedEndpoint.protocol !== 'https:') {
+      return { error: 'Payment gateway must use HTTPS.' };
+    }
+  } catch {
+    return { error: 'Payment gateway URL is invalid.' };
+  }
+
+  const apiKey = process.env.NAJIKI_API_KEY?.trim();
+  if (!apiKey) {
+    return { error: 'Payment gateway credentials are not configured.' };
+  }
   const appCode = process.env.NAJIKI_APP_CODE || "school";
 
   // Build clean, full-spec STK push payload for NaJiki
@@ -409,10 +436,11 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   };
 
   try {
-    console.log(`[NaJiki STK Push] Sending request to ${endpointUrl} for ${formattedPhoneNumeric} (${amount} UGX) with tenant "${tenantCode}"`);
+    console.log(`[NaJiki STK Push] Sending payment request for ${amount} UGX`);
 
     const response = await fetch(endpointUrl, {
       method: 'POST',
+      signal: AbortSignal.timeout(10_000),
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -434,35 +462,38 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
       if (textData) {
         resData = JSON.parse(textData);
       }
-    } catch (parseErr) {
-      console.warn('[NaJiki API] Failed to parse JSON response. Raw text:', textData.substring(0, 200));
+    } catch {
+      console.warn('[NaJiki API] Payment provider returned a non-JSON response.');
     }
 
     if (!response.ok) {
-      console.error(`[NaJiki TopUp API] Failed with status ${response.status}:`, resData || textData);
-      
-      // If payment provider returned a message or error
-      const errorMsg = resData.message || resData.error || resData.detail || `Payment provider returned status ${response.status}. Please verify your phone number and try again.`;
-      return { 
-        error: errorMsg
+      console.error(`[NaJiki TopUp API] Provider returned status ${response.status}`);
+      return {
+        error: `Payment provider returned status ${response.status}. Please verify your phone number and try again.`
       };
     }
 
-    console.log('[NaJiki STK Push] Successfully initiated:', resData);
+    console.log('[NaJiki STK Push] Payment request accepted.');
 
     return {
       success: true,
       transactionId: resData.transactionId || resData.reference || resData.id || idempotencyKey,
       message: `Mobile Money PIN prompt sent to ${phoneLocal07}! Please enter your PIN on your phone to complete payment.`
     };
-  } catch (err: any) {
-    console.error('NaJiki TopUp API connection error:', err);
-    return { 
-      error: 'Could not connect to payment gateway. Please check your network connection and try again.' 
+  } catch (err) {
+    console.error(
+      'NaJiki TopUp API connection error:',
+      err instanceof Error ? err.message : 'unknown error'
+    );
+    return {
+      error: 'Could not connect to payment gateway. Please check your network connection and try again.'
     };
   }
-  } catch (err: any) {
-    console.error('topUpBalance error:', err);
-    return { error: err.message || 'Failed to top up balance' };
+  } catch (err) {
+    console.error(
+      'topUpBalance error:',
+      err instanceof Error ? err.message : 'unknown error'
+    );
+    return { error: 'Failed to top up balance' };
   }
 }
