@@ -59,7 +59,7 @@ The repository does not contain a full baseline schema. The Supabase project mus
 1. [`supabase_migrations/01_add_multi_vendor_device_columns.sql`](supabase_migrations/01_add_multi_vendor_device_columns.sql) adds device protocol, credential, location, and configuration columns.
 2. [`supabase_migrations/02_production_safety_indexes.sql`](supabase_migrations/02_production_safety_indexes.sql) adds payment idempotency and attendance/device lookup indexes.
 
-Before applying migration 02, reconcile any existing duplicate transaction references. The unique index intentionally fails rather than deleting or rewriting financial records.
+Before applying migration 02, reconcile any existing duplicate transaction references or device attendance events. The unique indexes intentionally fail rather than deleting or rewriting records. Device ingestion ignores exact duplicate attendance conflicts and avoids sending a second parent SMS for a mixed duplicate batch.
 
 The payment webhook requires a database-side `credit_wallet` RPC that atomically inserts the transaction and updates the wallet. If that RPC is unavailable, callbacks return `503` and do not perform an unsafe read-then-write fallback.
 

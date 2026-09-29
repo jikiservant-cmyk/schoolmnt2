@@ -254,12 +254,18 @@ export async function processAttendanceEvents(
   }
 
   if (attendanceLogsToInsert.length > 0) {
-    const { error: attendanceError } = await supabase.from('attendance_logs').insert(attendanceLogsToInsert);
+    const { data: insertedAttendance, error: attendanceError } = await supabase
+      .from('attendance_logs')
+      .upsert(attendanceLogsToInsert, {
+        onConflict: 'school_id,person_id,occurred_at,attendance_type',
+        ignoreDuplicates: true,
+      })
+      .select('id');
     if (attendanceError) {
       console.error('[Device Processor] Failed to save attendance records:', attendanceError);
       throw new Error('Failed to save attendance records');
     }
-    result.insertedAttendanceLogs = attendanceLogsToInsert.length;
+    result.insertedAttendanceLogs = insertedAttendance?.length || 0;
 
     const deviceLogIds = deviceLogsToInsert.map(log => log.id);
     const { error: markProcessedError } = await supabase
@@ -274,7 +280,10 @@ export async function processAttendanceEvents(
   }
 
   // 6. Queue SMS Notifications for Parents
-  if (validStudentRecords.length > 0) {
+  if (
+    validStudentRecords.length > 0 &&
+    result.insertedAttendanceLogs === attendanceLogsToInsert.length
+  ) {
     const sIds = Array.from(new Set(validStudentRecords.map(r => r.person.id)));
     const { data: parentsData } = await supabase
       .from('student_parents')
