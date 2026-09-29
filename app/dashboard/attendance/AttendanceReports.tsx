@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useMemo } from 'react';
-import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
 import { 
   FileText, 
   Download, 
@@ -318,12 +318,15 @@ export default function AttendanceReports({
   }, [reportMode, selectedClassId, selectedPersonId, selectedGroup, people, classMap]);
 
   // EXCEL (.XLSX) Export Handler
-  const handleExportExcel = () => {
+  const handleExportExcel = async () => {
     try {
-      const wb = XLSX.utils.book_new();
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet(
+        reportMode === 'class_daily_sheet' ? 'Class_Daily_Register' : 'Attendance_Audit'
+      );
 
       if (reportMode === 'class_daily_sheet') {
-        const headerInfo = [
+        worksheet.addRows([
           ['OFFICIAL CLASS ATTENDANCE SHEET'],
           ['School:', schoolName],
           ['Class:', classMap.get(selectedClassId) || 'All Classes'],
@@ -333,28 +336,23 @@ export default function AttendanceReports({
           ['Late:', stats.lateCount],
           ['Absent:', stats.absentCount],
           ['Attendance Rate:', `${stats.attendanceRate}%`],
-          [] // empty separator
-        ];
-
-        const tableHeaders = ['Roll #', 'Student Full Name', 'Admission / Device UID', 'Class', 'Arrival Time', 'Status', 'Check-In Type', 'Parent Phone', 'Teacher Remarks'];
-        const tableRows = classDailyRoster.map(row => [
-          row.rollNumber,
-          row.fullName,
-          row.deviceUserId,
-          row.className,
-          row.checkInTime,
-          row.status.toUpperCase(),
-          row.checkInType,
-          row.phone,
-          '' // Empty for remarks
+          [],
+          ['Roll #', 'Student Full Name', 'Admission / Device UID', 'Class', 'Arrival Time', 'Status', 'Check-In Type', 'Parent Phone', 'Teacher Remarks'],
+          ...classDailyRoster.map(row => [
+            row.rollNumber,
+            row.fullName,
+            row.deviceUserId,
+            row.className,
+            row.checkInTime,
+            row.status.toUpperCase(),
+            row.checkInType,
+            row.phone,
+            ''
+          ])
         ]);
-
-        const wsData = [...headerInfo, tableHeaders, ...tableRows];
-        const ws = XLSX.utils.aoa_to_sheet(wsData);
-        XLSX.utils.book_append_sheet(wb, ws, 'Class_Daily_Register');
       } else {
-        const headerInfo = [
-          ['NA\'JIKI TECH ATTENDANCE AUDIT REPORT'],
+        worksheet.addRows([
+          ["NA'JIKI TECH ATTENDANCE AUDIT REPORT"],
           ['School:', schoolName],
           ['Target Scope:', targetLabel],
           ['Period:', dateRangeLabel],
@@ -362,12 +360,9 @@ export default function AttendanceReports({
           ['On-Time Count:', stats.presentCount],
           ['Late Count:', stats.lateCount],
           ['On-Time Rate:', `${stats.onTimeRate}%`],
-          []
-        ];
-
-        const tableHeaders = ['Date', 'Time', 'Person Name', 'Role', 'Class / Scope', 'Status', 'Channel', 'Device UID', 'Parent Phone'];
-        const tableRows = filteredReportLogs.map(log => {
-          return [
+          [],
+          ['Date', 'Time', 'Person Name', 'Role', 'Class / Scope', 'Status', 'Channel', 'Device UID', 'Parent Phone'],
+          ...filteredReportLogs.map(log => [
             formatEATDate(log.occurred_at, { month: '2-digit', day: '2-digit', year: 'numeric' }),
             formatEATTime(log.occurred_at, { hour: '2-digit', minute: '2-digit' }),
             log.people?.full_name || 'Unknown',
@@ -377,16 +372,26 @@ export default function AttendanceReports({
             (log.attendance_type || 'check_in').replace(/_/g, ' '),
             log.people?.device_user_id || 'N/A',
             log.people?.phone || 'N/A'
-          ];
-        });
-
-        const wsData = [...headerInfo, tableHeaders, ...tableRows];
-        const ws = XLSX.utils.aoa_to_sheet(wsData);
-        XLSX.utils.book_append_sheet(wb, ws, 'Attendance_Audit');
+          ])
+        ]);
       }
 
-      const fileName = `NajikiTech_${targetLabel.replace(/[^a-zA-Z0-9]/g, '_')}_${reportMode === 'class_daily_sheet' ? selectedDayDate : datePreset}.xlsx`;
-      XLSX.writeFile(wb, fileName);
+      worksheet.columns.forEach(column => {
+        column.width = Math.min(32, Math.max(12, (column.header?.length || 12) + 4));
+      });
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buffer], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      });
+      const downloadUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = `NajikiTech_${targetLabel.replace(/[^a-zA-Z0-9]/g, '_')}_${reportMode === 'class_daily_sheet' ? selectedDayDate : datePreset}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(downloadUrl);
     } catch (err) {
       console.error('Failed to export Excel file:', err);
       alert('Could not generate Excel export. Falling back to CSV export.');
