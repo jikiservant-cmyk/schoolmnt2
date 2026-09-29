@@ -1,42 +1,45 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = 
-  process.env.NEXT_PUBLIC_SUPABASE_URL || 
-  process.env.SUPABASE_URL || 
-  'https://placeholder-project.supabase.co';
+function requiredServerEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+}
 
-const serviceRoleKey = 
-  process.env.SUPABASE_SERVICE_ROLE_KEY || 
-  process.env.SUPABASE_SERVICE_KEY || 
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder';
+function getSupabaseConfig() {
+  const url = requiredServerEnv('NEXT_PUBLIC_SUPABASE_URL');
+  const serviceRoleKey = requiredServerEnv('SUPABASE_SERVICE_ROLE_KEY');
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
 
-/**
- * Admin client configured with service role for the 'school' schema
- */
-export function createAdminClient() {
-  return createClient(supabaseUrl, serviceRoleKey, {
+  // Never silently downgrade an admin client to an anon key.
+  if (anonKey && serviceRoleKey === anonKey) {
+    throw new Error('SUPABASE_SERVICE_ROLE_KEY must not equal NEXT_PUBLIC_SUPABASE_ANON_KEY');
+  }
+
+  return { url, serviceRoleKey };
+}
+
+function createConfiguredAdminClient(schema: 'school' | 'public') {
+  const { url, serviceRoleKey } = getSupabaseConfig();
+  return createClient(url, serviceRoleKey, {
     auth: {
       persistSession: false,
       autoRefreshToken: false,
     },
     db: {
-      schema: 'school',
+      schema,
     },
   });
 }
 
-/**
- * Admin client configured with service role for the 'public' schema (wallets, tenants, etc.)
- */
+/** Admin client configured with the service role for the school schema. */
+export function createAdminClient() {
+  return createConfiguredAdminClient('school');
+}
+
+/** Admin client configured with the service role for public tables. */
 export function createPublicAdminClient() {
-  return createClient(supabaseUrl, serviceRoleKey, {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-    },
-    db: {
-      schema: 'public',
-    },
-  });
+  return createConfiguredAdminClient('public');
 }

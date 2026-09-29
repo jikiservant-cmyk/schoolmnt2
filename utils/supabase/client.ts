@@ -1,19 +1,21 @@
 import { createBrowserClient } from '@supabase/ssr';
 
+function requiredPublicEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+}
+
 export function createClient() {
-  const supabaseUrl = 
-    process.env.NEXT_PUBLIC_SUPABASE_URL || 
-    process.env.SUPABASE_URL || 
-    'https://placeholder-project.supabase.co';
-
-  const supabaseAnonKey = 
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 
-    process.env.SUPABASE_ANON_KEY || 
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder';
-
-  return createBrowserClient(supabaseUrl, supabaseAnonKey, {
-    db: {
-      schema: 'school',
-    },
-  });
+  return createBrowserClient(
+    requiredPublicEnv('NEXT_PUBLIC_SUPABASE_URL'),
+    requiredPublicEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY'),
+    {
+      db: {
+        schema: 'school',
+      },
+    }
+  );
 }

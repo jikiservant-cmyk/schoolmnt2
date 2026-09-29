@@ -37,7 +37,11 @@ export async function loginAction(formData: FormData) {
         return { error: 'Access denied. You do not have the required admin role.' };
       }
     } catch (profileErr) {
-      console.warn('Admin profile verification warning:', profileErr);
+      // Authorization must fail closed. A database or service-role failure must
+      // never turn into an authenticated dashboard session.
+      console.error('Admin profile verification failed:', profileErr);
+      await supabase.auth.signOut();
+      return { error: 'Unable to verify administrator access. Please try again.' };
     }
   }
 

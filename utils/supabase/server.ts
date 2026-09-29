@@ -1,22 +1,20 @@
 import { createServerClient } from '@supabase/ssr';
 import { cookies } from 'next/headers';
 
+function requiredPublicEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+}
+
 export async function createClient() {
   const cookieStore = await cookies();
 
-  const supabaseUrl = 
-    process.env.NEXT_PUBLIC_SUPABASE_URL || 
-    process.env.SUPABASE_URL || 
-    'https://placeholder-project.supabase.co';
-
-  const supabaseAnonKey = 
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 
-    process.env.SUPABASE_ANON_KEY || 
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.placeholder';
-
   return createServerClient(
-    supabaseUrl,
-    supabaseAnonKey,
+    requiredPublicEnv('NEXT_PUBLIC_SUPABASE_URL'),
+    requiredPublicEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY'),
     {
       db: {
         schema: 'school',
@@ -31,13 +29,13 @@ export async function createClient() {
               cookieStore.set(name, value, {
                 ...options,
                 path: '/',
-                sameSite: 'none',
-                secure: true,
+                sameSite: 'lax',
+                secure: process.env.NODE_ENV === 'production',
               })
             );
           } catch {
-            // The `setAll` method was called from a Server Component.
-            // This can be ignored if you have middleware refreshing user sessions.
+            // Server Components cannot always write cookies. Middleware refreshes
+            // the session for those requests.
           }
         },
       },
