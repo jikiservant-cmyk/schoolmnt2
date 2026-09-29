@@ -75,7 +75,7 @@ type PushCategory = 'teachers' | 'support_staff' | 'class' | 'all_students' | 'a
 
 export default function DeviceLiveList({ devices, classes = [] }: Props) {
   const router = useRouter();
-  const [now, setNow] = useState<number | null>(null);
+  const [now, setNow] = useState<number>(() => Date.now());
   const [syncStatus, setSyncStatus] = useState<{ msg: string; isError?: boolean; details?: string[] } | null>(null);
 
   // Modal State for Selective Device Push
@@ -139,7 +139,6 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
 
   // Periodically refresh the server data and clock every 5 seconds
   useEffect(() => {
-    setNow(Date.now());
     const interval = setInterval(() => {
       setNow(Date.now());
       router.refresh();
