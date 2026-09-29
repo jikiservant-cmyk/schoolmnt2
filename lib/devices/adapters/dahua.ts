@@ -1,5 +1,5 @@
 import { DeviceAdapter, DeviceRecord, AttendanceEvent, EnrollPersonInput, EnrollCommandResult, HandshakeResponse } from '../types';
-import { isAuthorizedToken } from '../metadata';
+import { getDeviceAuthTarget, isAuthorizedToken } from '../metadata';
 
 export class DahuaIsapiAdapter implements DeviceAdapter {
   readonly deviceType = 'dahua_isapi';
@@ -14,7 +14,7 @@ export class DahuaIsapiAdapter implements DeviceAdapter {
       req.headers.get('authorization')?.replace(/^Bearer\s+/i, '') ||
       url.searchParams.get('token');
 
-    return isAuthorizedToken(providedToken, device.device_secret);
+    return isAuthorizedToken(providedToken, getDeviceAuthTarget(device));
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {
@@ -73,12 +73,16 @@ export class DahuaIsapiAdapter implements DeviceAdapter {
         eventType = 'check_out';
       }
 
+      if (isNaN(timestamp.getTime())) {
+        continue;
+      }
+
       events.push({
         school_id: device.school_id,
         device_id: device.id,
         raw_serial_number: device.serial_number,
         person_external_id: String(pin).trim().toLowerCase(),
-        timestamp: isNaN(timestamp.getTime()) ? new Date() : timestamp,
+        timestamp,
         event_type: eventType,
         verify_type: data.Method || 'face',
         raw_payload: data

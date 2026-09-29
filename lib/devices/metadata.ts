@@ -143,6 +143,10 @@ export function parseDeviceMetadata(device: any): DeviceRecord {
  * Checks if a provided token matches the device's per-device secret hash,
  * the legacy cleartext secret, or the legacy global environment secret.
  */
+export function getDeviceAuthTarget(device: Pick<DeviceRecord, 'device_secret' | 'device_secret_hash'>): string | null {
+  return device.device_secret?.trim() || device.device_secret_hash?.trim() || null;
+}
+
 export function isAuthorizedToken(
   providedToken: string | null,
   deviceSecretOrHash: string | null,

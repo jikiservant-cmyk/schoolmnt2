@@ -1,5 +1,5 @@
 import { DeviceAdapter, DeviceRecord, AttendanceEvent, EnrollPersonInput, EnrollCommandResult, HandshakeResponse } from '../types';
-import { isAuthorizedToken } from '../metadata';
+import { getDeviceAuthTarget, isAuthorizedToken } from '../metadata';
 
 export class HikvisionIsapiAdapter implements DeviceAdapter {
   readonly deviceType = 'hikvision_isapi';
@@ -27,7 +27,7 @@ export class HikvisionIsapiAdapter implements DeviceAdapter {
       }
     }
 
-    return isAuthorizedToken(providedToken, device.device_secret);
+    return isAuthorizedToken(providedToken, getDeviceAuthTarget(device));
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {
@@ -103,12 +103,16 @@ export class HikvisionIsapiAdapter implements DeviceAdapter {
         eventType = device.status_code_map[String(subType)];
       }
 
+      if (isNaN(timestamp.getTime())) {
+        continue;
+      }
+
       events.push({
         school_id: device.school_id,
         device_id: device.id,
         raw_serial_number: device.serial_number,
         person_external_id: String(pin).trim().toLowerCase(),
-        timestamp: isNaN(timestamp.getTime()) ? new Date() : timestamp,
+        timestamp,
         event_type: eventType,
         verify_type: eventObj.currentVerifyMode || eventObj.verifyType || 'face',
         raw_payload: eventObj

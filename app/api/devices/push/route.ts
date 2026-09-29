@@ -3,6 +3,7 @@ import { createAdminClient } from '@/utils/supabase/admin';
 import { parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
 import { processAttendanceEvents } from '@/lib/devices/processor';
+import { exceedsBodyLimit, exceedsContentLength, MAX_DEVICE_BODY_BYTES, MAX_DEVICE_EVENTS } from '@/lib/request-limits';
 
 async function resolveDevice(req: NextRequest, rawBody?: string) {
   const url = new URL(req.url);
@@ -80,7 +81,15 @@ export async function GET(req: NextRequest) {
     .then();
 
   const handshake = adapter.buildHandshakeResponse(device);
-  const body = typeof handshake.body === 'string' ? JSON.parse(handshake.body) : handshake.body;
+  let handshakeBody: unknown = handshake.body;
+  if (typeof handshake.body === 'string') {
+    try {
+      handshakeBody = JSON.parse(handshake.body);
+    } catch {
+      // Some device protocols intentionally return line-oriented text.
+      handshakeBody = handshake.body;
+    }
+  }
 
   return NextResponse.json({
     status: 'online',
@@ -90,13 +99,20 @@ export async function GET(req: NextRequest) {
       protocol: device.device_type,
       adapter: adapter.displayName,
     },
-    handshake: body
+    handshake: handshakeBody
   });
 }
 
 // POST: Universal push ingestion
 export async function POST(req: NextRequest) {
+  if (exceedsContentLength(req, MAX_DEVICE_BODY_BYTES)) {
+    return NextResponse.json({ error: 'Request body is too large' }, { status: 413 });
+  }
+
   const rawBody = await req.text();
+  if (exceedsBodyLimit(rawBody, MAX_DEVICE_BODY_BYTES)) {
+    return NextResponse.json({ error: 'Request body is too large' }, { status: 413 });
+  }
   const resolved = await resolveDevice(req, rawBody);
 
   if ('error' in resolved) {
@@ -114,6 +130,9 @@ export async function POST(req: NextRequest) {
 
   // Parse incoming events using the resolved vendor adapter
   const events = await adapter.parseIncomingPush(rawBody, req.headers, new URL(req.url), device);
+  if (events.length > MAX_DEVICE_EVENTS) {
+    return NextResponse.json({ error: 'Too many attendance events in one request' }, { status: 413 });
+  }
 
   let stats = {
     totalReceived: events.length,
