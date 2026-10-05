@@ -43,6 +43,16 @@ if (require.main === module) (async () => {
     await c.query("INSERT INTO school.device_commands(school_id,device_id,target_serial,raw_command,status) VALUES ($1,$2,$3,$4,'pending')",
       [t.school, t.device, 'SN' + k + '0001', `DATA UPDATE USERINFO PIN=999\tName=${k}-SECRETCMD`]);
   }
+  await c.query(fs.readFileSync(__dirname + '/supabase-base.sql', 'utf8'));
+  if (process.env.RLS === '1') {
+    // Emulate a sloppy pre-existing setup: RLS on, plus a wide-open policy.
+    await c.query("ALTER TABLE school.people ENABLE ROW LEVEL SECURITY; CREATE POLICY legacy_open ON school.people FOR SELECT TO authenticated USING (true)");
+    const mig = '/home/user/schoolmnt2/supabase_migrations/';
+    await c.query(fs.readFileSync(mig + '03_tenant_integrity.sql', 'utf8'));
+    await c.query("SET smartskoolz.harden_public = 'on'");
+    await c.query(fs.readFileSync(mig + '04_rls_tenant_isolation.sql', 'utf8'));
+    console.log('RLS migrations applied');
+  }
   console.log('seeded');
   await c.end();
 })().catch((e) => { console.error(e); process.exit(1); });

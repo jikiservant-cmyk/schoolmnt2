@@ -1,0 +1,168 @@
+{
+ "vuln": 32,
+ "total": 32,
+ "svcOk": true,
+ "ownOk": true,
+ "results": [
+  {
+   "name": "read B people",
+   "vulnerable": true,
+   "detail": "200 rows=4"
+  },
+  {
+   "name": "read B classes",
+   "vulnerable": true,
+   "detail": "200 rows=2"
+  },
+  {
+   "name": "read B academic_years",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "read B devices",
+   "vulnerable": true,
+   "detail": "200 rows=2"
+  },
+  {
+   "name": "read B device_commands",
+   "vulnerable": true,
+   "detail": "200 rows=2"
+  },
+  {
+   "name": "read B device_logs",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "read B attendance_logs",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "read B parents",
+   "vulnerable": true,
+   "detail": "200 rows=2"
+  },
+  {
+   "name": "read B person_credentials",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "read B notifications",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "read B staff_users",
+   "vulnerable": true,
+   "detail": "200 rows=2"
+  },
+  {
+   "name": "read B student_parents",
+   "vulnerable": true,
+   "detail": "200 rows=2"
+  },
+  {
+   "name": "read B schools row",
+   "vulnerable": true,
+   "detail": "rows=2"
+  },
+  {
+   "name": "read staff pin_hash",
+   "vulnerable": true,
+   "detail": "200 "
+  },
+  {
+   "name": "read device_secret",
+   "vulnerable": true,
+   "detail": "200 "
+  },
+  {
+   "name": "insert person into B",
+   "vulnerable": true,
+   "detail": 201
+  },
+  {
+   "name": "update B student",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "move own student into B",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "queue command on B device",
+   "vulnerable": true,
+   "detail": 201
+  },
+  {
+   "name": "steal B device",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "delete B attendance",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "re-home own admin into B",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "grant self admin in B",
+   "vulnerable": true,
+   "detail": 201
+  },
+  {
+   "name": "self-credit SMS balance (schools.settings)",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "write own pin_hash/lockout directly",
+   "vulnerable": true,
+   "detail": "200 rows=2"
+  },
+  {
+   "name": "self-credit wallet",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "read B wallet",
+   "vulnerable": true,
+   "detail": "rows=2"
+  },
+  {
+   "name": "re-point own admin_profile to B",
+   "vulnerable": true,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "anon read people",
+   "vulnerable": true,
+   "detail": "200 rows=5"
+  },
+  {
+   "name": "anon read devices",
+   "vulnerable": true,
+   "detail": "200 rows=2"
+  },
+  {
+   "name": "anon read staff_users",
+   "vulnerable": true,
+   "detail": "200 rows=3"
+  },
+  {
+   "name": "anon read schools",
+   "vulnerable": true,
+   "detail": "200 rows=2"
+  }
+ ]
+}

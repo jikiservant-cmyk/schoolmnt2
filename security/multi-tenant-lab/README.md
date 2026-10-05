@@ -44,3 +44,16 @@ The raw output is in `results-*.json`.
 |---|---|
 | Before (commit ac010ba) | **11 / 14** |
 | After | **0 / 15** (legitimate ZKTeco, webhook, ack and handshake flows still pass) |
+
+## RLS round (Part 4)
+
+`seed.js` always loads `supabase-base.sql` (Supabase roles, `auth.uid()`, default
+grants). `shim.js` runs each REST call as `anon` / `authenticated` (with JWT
+claims) / `service_role`, so RLS is really enforced.
+
+- Baseline: `node seed.js && node rls-attack.mjs before` → 32/32 vulnerable
+- After: `RLS=1 node seed.js && node rls-attack.mjs after` → 0/32
+  (`RLS=1` adds a legacy `USING(true)` policy, then applies `03` + `04`)
+- App under RLS: `regress.mjs` 17/17, `render-check.mjs`, `attack.mjs` 1/42,
+  `RLS=1 node device-attack.mjs … rls` 0/15
+- `orphan-check.mjs`: a user with no school opening `/dashboard/people`

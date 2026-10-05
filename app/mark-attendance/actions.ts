@@ -75,6 +75,7 @@ export async function submitClockInAction(deviceUserId: string) {
     const { data: rawLog, error: rawLogErr } = await adminClient
       .from('device_logs')
       .insert({
+        school_id: schoolId,
         device_id: deviceId,
         raw_serial_number: serialNumber,
         device_user_id: cleanUserId,

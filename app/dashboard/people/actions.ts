@@ -306,6 +306,7 @@ export async function addPersonAction(formData: FormData) {
             await adminClient
               .from('staff_users')
               .insert({
+                school_id: schoolId,
                 person_id: newPerson.id,
                 pin_hash: pinHash,
                 role: 'teacher'

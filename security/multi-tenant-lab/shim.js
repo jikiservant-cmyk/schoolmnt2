@@ -4,6 +4,9 @@
 const http = require('http');
 const crypto = require('crypto');
 const { Pool } = require('pg');
+const { AsyncLocalStorage } = require('async_hooks');
+const als = new AsyncLocalStorage();
+const dbq = (sql, p) => (als.getStore() || pool).query(sql, p);
 
 const pool = new Pool({ host: '127.0.0.1', port: 54329, user: 'postgres', password: 'pw', database: 'mtlab' });
 const SECRET = 'lab-secret';
@@ -187,13 +190,13 @@ async function project(schema, table, rows, sel) {
     const e = resolveEmbed(schema, table, item);
     if (e.kind === 'one') {
       const ids = [...new Set(rows.map((r) => r[e.col]).filter((x) => x !== null && x !== undefined))];
-      const ref = ids.length ? (await pool.query('SELECT * FROM ' + qi(e.rs) + '.' + qi(e.rt) + ' WHERE id = ANY($1)', [ids])).rows : [];
+      const ref = ids.length ? (await dbq('SELECT * FROM ' + qi(e.rs) + '.' + qi(e.rt) + ' WHERE id = ANY($1)', [ids])).rows : [];
       const projected = await project(e.rs, e.rt, ref, item.sub);
       const byId = new Map(ref.map((r, i) => [String(r.id), projected[i]]));
       rows.forEach((r, i) => { out[i][item.alias] = r[e.col] == null ? null : byId.get(String(r[e.col])) || null; });
     } else {
       const ids = rows.map((r) => r.id);
-      const ref = ids.length ? (await pool.query('SELECT * FROM ' + qi(e.rs) + '.' + qi(e.rt) + ' WHERE ' + qi(e.col) + ' = ANY($1)', [ids])).rows : [];
+      const ref = ids.length ? (await dbq('SELECT * FROM ' + qi(e.rs) + '.' + qi(e.rt) + ' WHERE ' + qi(e.col) + ' = ANY($1)', [ids])).rows : [];
       const projected = await project(e.rs, e.rt, ref, item.sub);
       rows.forEach((r, i) => {
         out[i][item.alias] = ref.map((x, j) => (String(x[e.col]) === String(r.id) ? projected[j] : null)).filter(Boolean);
@@ -212,7 +215,8 @@ function pgError(res, e) {
 async function handleRpc(req, res, name, args, jwt) {
   if (name === 'auth_school_id') {
     if (!jwt || !jwt.sub) return send(res, 200, null);
-    const r = await pool.query('SELECT school_id FROM school.staff_users WHERE auth_user_id = $1 LIMIT 1', [jwt.sub]);
+    const hasFn = (await pool.query("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='school' AND p.proname='auth_school_id'")).rowCount;
+    const r = hasFn ? await dbq('SELECT school.auth_school_id() AS school_id') : await dbq('SELECT school_id FROM school.staff_users WHERE auth_user_id = $1 LIMIT 1', [jwt.sub]);
     return send(res, 200, r.rows[0] ? r.rows[0].school_id : null);
   }
   // Every other RPC (fn_add_person, credit_wallet, ...) is "not deployed", which makes the
@@ -240,10 +244,10 @@ async function handleRest(req, res, url, body) {
   if (req.method === 'GET' || req.method === 'HEAD') {
     const w = buildWhere(sp, t.cols);
     let sql = 'SELECT * FROM ' + fq + w.sql + buildOrder(sp.get('order'), t.cols);
-    const total = prefer.includes('count=') ? Number((await pool.query('SELECT count(*) FROM ' + fq + w.sql, w.params)).rows[0].count) : null;
+    const total = prefer.includes('count=') ? Number((await dbq('SELECT count(*) FROM ' + fq + w.sql, w.params)).rows[0].count) : null;
     if (sp.get('limit')) sql += ' LIMIT ' + Number(sp.get('limit'));
     if (sp.get('offset')) sql += ' OFFSET ' + Number(sp.get('offset'));
-    rows = (await pool.query(sql, w.params)).rows;
+    rows = (await dbq(sql, w.params)).rows;
     const headers = {};
     const off = Number(sp.get('offset') || 0);
     headers['content-range'] = (rows.length ? off + '-' + (off + rows.length - 1) : '*') + '/' + (total === null ? '*' : total);
@@ -276,7 +280,7 @@ async function handleRest(req, res, url, body) {
     } else if (prefer.includes('resolution=ignore-duplicates')) {
       sql += ' ON CONFLICT DO NOTHING';
     }
-    rows = (await pool.query(sql + ' RETURNING *', params)).rows;
+    rows = (await dbq(sql + ' RETURNING *', params)).rows;
   } else if (req.method === 'PATCH') {
     const payload = body ? JSON.parse(body) : {};
     await ensureColumns(schema, table, payload);
@@ -289,10 +293,10 @@ async function handleRest(req, res, url, body) {
       return qi(k) + ' = $' + params.length;
     });
     if (!sets.length) return send(res, 204);
-    rows = (await pool.query('UPDATE ' + fq + ' SET ' + sets.join(',') + w.sql + ' RETURNING *', params)).rows;
+    rows = (await dbq('UPDATE ' + fq + ' SET ' + sets.join(',') + w.sql + ' RETURNING *', params)).rows;
   } else if (req.method === 'DELETE') {
     const w = buildWhere(sp, t.cols);
-    rows = (await pool.query('DELETE FROM ' + fq + w.sql + ' RETURNING *', w.params)).rows;
+    rows = (await dbq('DELETE FROM ' + fq + w.sql + ' RETURNING *', w.params)).rows;
   } else {
     return send(res, 405, {});
   }
@@ -339,7 +343,26 @@ http.createServer((req, res) => {
       if (url.pathname === '/__session') { const u = USERS[JSON.parse(body).email]; return send(res, 200, sessionFor(u)); }
       if (url.pathname === '/__reload') { await loadCatalog(); return send(res, 200, { ok: true }); }
       if (url.pathname.startsWith('/auth/v1/')) return handleAuth(req, res, url, body);
-      if (url.pathname.startsWith('/rest/v1/')) return await handleRest(req, res, url, body);
+      if (url.pathname.startsWith('/rest/v1/')) {
+        // Run as the Supabase role implied by the credentials, inside one transaction.
+        const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+        const jwt = verifyJwt(token);
+        const role = jwt ? 'authenticated' : (token === 'lab-service-key' || req.headers.apikey === 'lab-service-key') ? 'service_role' : 'anon';
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query('SET LOCAL ROLE ' + role);
+          await client.query("SELECT set_config('request.jwt.claims', $1, true)", [JSON.stringify(jwt || { role })]);
+          await als.run(client, () => handleRest(req, res, url, body));
+          await client.query('COMMIT');
+        } catch (e) {
+          try { await client.query('ROLLBACK'); } catch {}
+          throw e;
+        } finally {
+          client.release();
+        }
+        return;
+      }
       send(res, 404, {});
     } catch (e) {
       if (!e.code) console.error('[shim]', req.method, url.pathname + url.search, e.message);

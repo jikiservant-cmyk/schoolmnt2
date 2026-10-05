@@ -159,3 +159,77 @@ command check). Tests: `security/multi-tenant-lab/device-attack.mjs`.
 
 Note: the throttle is in-memory, per instance. Behind a proxy, make sure
 `X-Forwarded-For` is set by your platform (Vercel / Cloud Run do this).
+
+---
+
+# Part 4: Multi-tenant round 2 — database-level isolation (RLS)
+
+## Why this round
+
+Parts 1–3 made the **app** check tenancy everywhere. However, every admin's
+browser holds a Supabase login token (JWT) and the public anon key. Anyone can
+copy those and call the Supabase REST API **directly**, skipping all app code.
+At that point only Postgres Row Level Security (RLS) stands between schools.
+Signup is open, so anyone can get such a token.
+
+The real database's RLS state is unknown: `types/supabase.ts` is empty, and
+there are no RLS migrations in the repo. So this round tests the worst case.
+
+## Test method
+
+- The lab now emulates Supabase roles: `anon`, `authenticated`, and
+  `service_role` (BYPASSRLS). It also emulates `auth.uid()` and the default
+  grants (`supabase-base.sql`).
+- The lab shim runs every REST request inside a transaction, with
+  `SET LOCAL ROLE <role>` and the JWT claims set. This is the same model as
+  PostgREST, so RLS is genuinely enforced.
+- `rls-attack.mjs` (32 checks) logs in as school A's admin, then attacks
+  school B with A's own token straight against REST. Before running, the
+  service role gives B rows in every table, so "0 rows" really means blocked.
+- The "after" run deliberately adds a legacy wide-open policy
+  (`USING (true)` on `people`) before migration 04. This proves the
+  restrictive guard still holds when someone has left an old policy behind.
+
+## Findings
+
+| # | Finding | Fix |
+|---|---|---|
+| R1 | Without RLS, A's token could read **every table** of school B (people, staff, devices, commands, logs, parents, credentials, notifications, links). | `04`: RLS on all school tables. The policy is `school_id = school.auth_school_id()`, and a RESTRICTIVE guard overrides any old permissive policy. |
+| R2 | A's token could insert, update, move or delete B rows: inject students, deface records, steal B's device, queue `CLEAR DATA` on B's device, add itself as admin of B. | Same policies, with `WITH CHECK`. Trigger `03` also still blocks cross-tenant references. |
+| R3 | Any admin could credit their own SMS balance by patching `schools.settings`, or their own `public.wallets.balance`. | `schools`: authenticated may only SELECT its own row (writes are revoked). Wallets/transactions/admin_profiles are read-only for their own tenant (opt-in hardening, see below). |
+| R4 | `staff_users.pin_hash` was readable (allowing offline cracking of 6-char PINs) and writable (allowing reset of lockout counters). The same applied to `devices.device_secret`. | Column privileges: these columns are hidden from `authenticated` for both read and write. The server uses the service role. |
+| R5 | The anon key alone (it's public, in the JS bundle) could read people, staff, devices and schools. | `REVOKE ALL … FROM anon` on tenant tables. |
+| R6 | `/dashboard/people`: a logged-in user **without a school** got every school's class names in the response (the query ran unscoped when `schoolId` was null). Verified with `orphan-check.mjs`: old code leaked, new code does not. | The page now uses `requireSchoolAdminPage()` and always filters by `school_id`. |
+| R7 | Some inserts didn't set `school_id` (the `staff_users` fallback insert in people actions, and kiosk `device_logs`). Under RLS these would fail, or leave orphan rows. | Both inserts now set `school_id`. |
+| R8 | `processPendingNotificationsAction` updated notifications by id only. | Now also filters `.eq('school_id', schoolId)`. **Note:** this function only *simulates* sending (it marks items sent with fake provider data). Wire it to the real SMS gateway before relying on it. |
+
+## Results
+
+| Run | Vulnerable |
+|---|---|
+| Direct-REST attack, no RLS (baseline) | **32 / 32** |
+| Direct-REST attack, after `03` + `04` (with a legacy `USING(true)` policy present) | **0 / 32** |
+| Sanity: service role still sees all; A still sees own data | pass |
+| App legit flows (`regress.mjs`) running **under RLS** | 17 / 17 OK, zero permission errors in the Postgres log |
+| Pages under RLS (`render-check.mjs`): dashboard, people, classes, devices, attendance | show A's data, none of B's |
+| App-layer attack (`attack.mjs`) under RLS | 1 / 42 (the intentional transition-mode check, same as before) |
+| Device pentest (`device-attack.mjs`) under RLS | 0 / 15 |
+| `tsc` / `eslint` | clean / 0 errors |
+
+## Deployment steps (Part 4)
+
+1. **Back up first**, then run `supabase_migrations/04_rls_tenant_isolation.sql`
+   on **staging** after `03`.
+2. Read the NOTICE/WARNING output. If `school.auth_school_id()` already exists,
+   the migration keeps it, but warns if it reads `user_metadata`. Users can
+   edit `user_metadata` themselves, so that would let them pick any school.
+   It must look up `staff_users` (as the default the migration creates does).
+3. Run the audit queries at the bottom of the file. Every tenant table should
+   show `rowsecurity = true`, and no `anon` grants should remain.
+4. Optional: run `SET smartskoolz.harden_public = 'on';` before the migration
+   to also lock `public.wallets` / `transactions` / `admin_profiles`. Only do
+   this if no other app writes those tables with a user token.
+5. Click through the dashboard on staging (add student, push to device, mark
+   attendance), then deploy to production.
+6. Rotate the anon key that leaked in git history (commit `2fb2bd6`). It is
+   less dangerous after `04`, but should still be replaced.

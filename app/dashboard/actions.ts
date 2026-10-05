@@ -42,7 +42,8 @@ export async function processPendingNotificationsAction() {
             cost: '22 UGX'
           })
         })
-        .eq('id', item.id);
+        .eq('id', item.id)
+        .eq('school_id', schoolId);
 
       if (updateErr) {
         console.error(`Failed to update notification ${item.id}:`, updateErr);
