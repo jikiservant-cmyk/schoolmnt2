@@ -224,8 +224,8 @@ there are no RLS migrations in the repo. So this round tests the worst case.
    the migration keeps it, but warns if it reads `user_metadata`. Users can
    edit `user_metadata` themselves, so that would let them pick any school.
    It must look up `staff_users` (as the default the migration creates does).
-3. Run the audit queries at the bottom of the file. Every tenant table should
-   show `rowsecurity = true`, and no `anon` grants should remain.
+3. Run the audit queries at the bottom of the file. The "tables without RLS"
+   query should list no tenant tables, and no `anon` grants should remain.
 4. Optional: run `SET smartskoolz.harden_public = 'on';` before the migration
    to also lock `public.wallets` / `transactions` / `admin_profiles`. Only do
    this if no other app writes those tables with a user token.
