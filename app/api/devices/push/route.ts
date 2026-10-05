@@ -1,145 +1,79 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createAdminClient } from '@/utils/supabase/admin';
-import { parseDeviceMetadata } from '@/lib/devices/metadata';
-import { getDeviceAdapter } from '@/lib/devices/registry';
 import { processAttendanceEvents } from '@/lib/devices/processor';
+import { authenticateDeviceRequest, readDeviceBody } from '@/lib/devices/gateway';
 
-async function resolveDevice(req: NextRequest, rawBody?: string) {
+export const dynamic = 'force-dynamic';
+
+function serialFromRequest(req: NextRequest, rawBody?: string): unknown {
   const url = new URL(req.url);
-  
-  // Extract serial number from query, header, or body
-  let sn = 
+  const sn =
     url.searchParams.get('sn') ||
     url.searchParams.get('SN') ||
     url.searchParams.get('serial') ||
     url.searchParams.get('device_id') ||
     req.headers.get('x-device-sn') ||
     req.headers.get('x-serial-number');
-
-  if (!sn && rawBody) {
-    try {
-      const parsed = JSON.parse(rawBody);
-      sn = parsed.serialNumber || 
-           parsed.serial_number || 
-           parsed.sn || 
-           parsed.SN || 
-           parsed.terminal_id || 
-           parsed.deviceId ||
-           parsed.AccessControllerEvent?.serialNo;
-    } catch {
-      // ignore
-    }
+  if (sn || !rawBody) return sn;
+  try {
+    const p = JSON.parse(rawBody);
+    return p.serialNumber || p.serial_number || p.sn || p.SN || p.terminal_id || p.deviceId || p.AccessControllerEvent?.serialNo;
+  } catch {
+    return null;
   }
-
-  if (!sn || !sn.trim()) {
-    return { error: 'Missing device serial number (provide via ?sn=..., x-device-sn header, or payload serialNumber)', status: 400 };
-  }
-
-  const cleanSn = sn.trim().toUpperCase();
-  // Serial numbers are alphanumeric; reject anything else (previously `.ilike()`
-  // let "%" / "_" act as wildcards to probe for registered devices).
-  if (!/^[A-Z0-9._-]{1,64}$/.test(cleanSn)) {
-    return { error: 'Invalid device serial number', status: 400 };
-  }
-  const supabase = createAdminClient();
-
-  const { data: rawDevice, error } = await supabase
-    .from('devices')
-    .select('*')
-    .eq('serial_number', cleanSn)
-    .maybeSingle();
-
-  if (error || !rawDevice) {
-    return { error: 'Invalid device credentials', status: 401 };
-  }
-
-  if (!rawDevice.is_active) {
-    return { error: 'Invalid device credentials', status: 401 };
-  }
-
-  const device = parseDeviceMetadata(rawDevice);
-  const adapter = getDeviceAdapter(device.device_type);
-
-  const isAuth = await adapter.buildAuthCheck(req, device);
-  if (!isAuth) {
-    return { error: 'Invalid or missing authentication token for this device', status: 401 };
-  }
-
-  return { device, adapter, supabase };
 }
 
-// GET: Probe / Handshake / Healthcheck endpoint
+const jsonError = (error: string, status: number, headers?: Record<string, string>) =>
+  NextResponse.json({ error }, { status, headers });
+
+async function authFailureAsJson(res: NextResponse) {
+  const map: Record<number, string> = { 401: 'Invalid device credentials', 429: 'Too many failed attempts', 503: 'Temporarily unavailable' };
+  const retry = res.headers.get('Retry-After');
+  return jsonError(map[res.status] || 'Unauthorized', res.status, retry ? { 'Retry-After': retry } : undefined);
+}
+
+// GET: probe / handshake / health check
 export async function GET(req: NextRequest) {
-  const resolved = await resolveDevice(req);
-  if ('error' in resolved) {
-    return NextResponse.json({ error: resolved.error }, { status: resolved.status });
-  }
+  const auth = await authenticateDeviceRequest(req, serialFromRequest(req), 'push GET');
+  if (!auth.ok) return authFailureAsJson(auth.response);
+  const { device, adapter, supabase } = auth;
 
-  const { device, adapter, supabase } = resolved;
-
-  // Heartbeat
-  supabase
-    .from('devices')
-    .update({ last_seen_at: new Date().toISOString() })
-    .eq('id', device.id)
-    .then();
+  supabase.from('devices').update({ last_seen_at: new Date().toISOString() }).eq('id', device.id).then(() => undefined);
 
   const handshake = adapter.buildHandshakeResponse(device);
-  const body = typeof handshake.body === 'string' ? JSON.parse(handshake.body) : handshake.body;
-
+  let body: unknown = handshake.body;
+  if (typeof body === 'string') {
+    try { body = JSON.parse(body); } catch { /* plain-text handshake */ }
+  }
   return NextResponse.json({
     status: 'online',
-    device: {
-      serial_number: device.serial_number,
-      label: device.label,
-      protocol: device.device_type,
-      adapter: adapter.displayName,
-    },
-    handshake: body
+    device: { serial_number: device.serial_number, label: device.label, protocol: device.device_type, adapter: adapter.displayName },
+    handshake: body,
   });
 }
 
-// POST: Universal push ingestion
+// POST: universal push ingestion
 export async function POST(req: NextRequest) {
-  const rawBody = await req.text();
-  const resolved = await resolveDevice(req, rawBody);
+  // The serial may be inside the JSON body, so read it first, but with a
+  // hard size cap (it used to read unlimited bodies before authenticating).
+  const rawBody = await readDeviceBody(req);
+  if (rawBody === null) return jsonError('Payload too large', 413);
 
-  if ('error' in resolved) {
-    return NextResponse.json({ error: resolved.error }, { status: resolved.status });
-  }
+  const auth = await authenticateDeviceRequest(req, serialFromRequest(req, rawBody), 'push POST');
+  if (!auth.ok) return authFailureAsJson(auth.response);
+  const { device, adapter, supabase } = auth;
 
-  const { device, adapter, supabase } = resolved;
+  supabase.from('devices').update({ last_seen_at: new Date().toISOString() }).eq('id', device.id).then(() => undefined);
 
-  // Update heartbeat asynchronously
-  supabase
-    .from('devices')
-    .update({ last_seen_at: new Date().toISOString() })
-    .eq('id', device.id)
-    .then();
-
-  // Parse incoming events using the resolved vendor adapter
   const events = await adapter.parseIncomingPush(rawBody, req.headers, new URL(req.url), device);
-
-  let stats = {
-    totalReceived: events.length,
-    insertedAttendanceLogs: 0,
-    queuedSmsCount: 0,
-    skippedDuplicates: 0
-  };
-
+  let stats = { totalReceived: events.length, insertedAttendanceLogs: 0, queuedSmsCount: 0, skippedDuplicates: 0 };
   if (events.length > 0) {
-    const processResult = await processAttendanceEvents(events, device);
-    stats = {
-      totalReceived: processResult.totalReceived,
-      insertedAttendanceLogs: processResult.insertedAttendanceLogs,
-      queuedSmsCount: processResult.queuedSmsCount,
-      skippedDuplicates: processResult.skippedDuplicates
-    };
+    try {
+      const r = await processAttendanceEvents(events, device);
+      stats = { totalReceived: r.totalReceived, insertedAttendanceLogs: r.insertedAttendanceLogs, queuedSmsCount: r.queuedSmsCount, skippedDuplicates: r.skippedDuplicates };
+    } catch (err) {
+      console.error(`[Device Push] Failed to store events from ${device.serial_number}:`, err instanceof Error ? err.message : err);
+      return jsonError('Could not store events, retry later', 503, { 'Retry-After': '60' });
+    }
   }
-
-  return NextResponse.json({
-    success: true,
-    message: `Processed ${events.length} event(s) using ${adapter.displayName}`,
-    stats
-  });
+  return NextResponse.json({ success: true, message: `Processed ${events.length} event(s) using ${adapter.displayName}`, stats });
 }

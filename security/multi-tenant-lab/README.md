@@ -35,3 +35,12 @@ your layout differs.
 | DB triggers (`test-triggers.js`) | 16 / 16 OK |
 
 The raw output is in `results-*.json`.
+
+## Device endpoint pentest (`device-attack.mjs`)
+
+`node device-attack.mjs http://127.0.0.1:3201 <label>` (re-seeds the DB first)
+
+| Build | Vulnerable checks |
+|---|---|
+| Before (commit ac010ba) | **11 / 14** |
+| After | **0 / 15** (legitimate ZKTeco, webhook, ack and handshake flows still pass) |

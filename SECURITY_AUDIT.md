@@ -130,3 +130,32 @@ still work.
    shared secret logs a `[Device Auth] ... SHARED global secret` warning.
 4. Make sure the payment provider sends back a `reference`/`transactionId` and
    `externalEntityId`/`metadata.schoolId`. Webhooks without them now get `400`.
+
+---
+
+# Part 3: Biometric device endpoint pentest
+
+Scope: `/iclock/cdata`, `/iclock/getrequest`, `/iclock/devicecmd`,
+`/api/devices/push`, all vendor adapters and the attendance processor.
+Result: **11/14 attacks worked before → 0/15 after.** Normal device traffic
+still works.
+
+| # | Severity | Issue | Fix |
+|---|---|---|---|
+| D1 | Medium | Error messages showed whether a serial existed or was deactivated (serial enumeration). | Every failure returns the same `ERROR: UNAUTHORIZED`. Details go to server logs only. |
+| D2 | Medium | Unlimited device-secret guessing. | Failures throttled per IP+serial (20 per 10 min) and per IP (100), then `429 Retry-After`. Working devices are never throttled. |
+| D3 | High | `/api/devices/push` and `/iclock/devicecmd` read unlimited bodies **before** authenticating (memory DoS). | 1 MB cap (256 KB for acks). devicecmd now authenticates first. |
+| D4 | Medium | Webhook devices (Hikvision/Suprema/Dahua/generic) could write attendance dated 2099 or 1999. | Processor drops events more than 10 min in the future or 60 days in the past. Batch capped at 2000 events, IDs at 64 chars. |
+| D5 | Medium | Deactivated (left/expelled) people were still recorded and their parents still got SMS. | Inactive people are skipped. |
+| D6 | High (cost) | Each tap of the reader sent a paid SMS (5 taps = 5 SMS). Replayed uploads did the same. | One SMS per child per direction per local day. Every punch is still stored. |
+| D7 | Low | OPERLOG/USERINFO/BIODATA uploads were parsed as punches. | Only `ATTLOG` (or no table) is processed. Others are acknowledged. |
+| D8 | High | A queued command with a line break could smuggle extra ADMS commands (e.g. `CLEAR ALL DATA`). | Refused when queued, and again when sent (marked `failed`). |
+| D9 | High (data loss) | DB write failures were ignored and the device got `OK`, so it deleted punches that were never saved. | The device now gets `503 RETRY_LATER` and keeps the punches. Duplicate conflicts are skipped row by row. |
+
+Also: command contents (names/PINs) are no longer written to logs.
+
+Shared code: `lib/devices/gateway.ts` (authentication, throttling, body cap,
+command check). Tests: `security/multi-tenant-lab/device-attack.mjs`.
+
+Note: the throttle is in-memory, per instance. Behind a proxy, make sure
+`X-Forwarded-For` is set by your platform (Vercel / Cloud Run do this).

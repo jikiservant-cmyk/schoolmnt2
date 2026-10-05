@@ -1,0 +1,72 @@
+[
+  {
+    "name": "D1 cdata error text reveals whether a serial exists / is deactivated",
+    "vulnerable": true,
+    "detail": "ERROR: Unregistered device serial number: NOPE9999 | ERROR: Invalid or missing device authentication token | ERROR: Device SNA0003 is deactivated in portal"
+  },
+  {
+    "name": "D1b getrequest error text reveals whether a serial exists",
+    "vulnerable": true,
+    "detail": "ERROR: UNAUTHORIZED_DEVICE | ERROR: INVALID_CREDENTIALS"
+  },
+  {
+    "name": "D2 unlimited device-secret guessing (60 tries, no 429)",
+    "vulnerable": true,
+    "detail": "never throttled"
+  },
+  {
+    "name": "D2b (baseline) real device from another IP still works",
+    "vulnerable": false,
+    "detail": "200"
+  },
+  {
+    "name": "D3 /api/devices/push: 8MB unauthenticated body not rejected with 413",
+    "vulnerable": true,
+    "detail": "401"
+  },
+  {
+    "name": "D3 /iclock/devicecmd: 8MB unauthenticated body not rejected with 413",
+    "vulnerable": true,
+    "detail": "401"
+  },
+  {
+    "name": "D4 webhook device can write attendance dated 2099 / 1999",
+    "vulnerable": true,
+    "detail": "2099-01-01T07:00:00.000Z,1999-01-01T07:00:00.000Z"
+  },
+  {
+    "name": "D5 deactivated student still recorded by device",
+    "vulnerable": true,
+    "detail": "1"
+  },
+  {
+    "name": "D6 repeated punches send repeated paid SMS to the parent",
+    "vulnerable": true,
+    "detail": "5 SMS for 5 punches"
+  },
+  {
+    "name": "D7 OPERLOG/USERINFO uploads treated as attendance",
+    "vulnerable": true,
+    "detail": "8->9"
+  },
+  {
+    "name": "D8 getrequest relays newline-smuggled command (CLEAR ALL DATA)",
+    "vulnerable": true,
+    "detail": "C:ceb5dda4-2d69-4a8a-891a-9303724dfd33:DATA UPDATE USERINFO PIN=999\tName=A-SECRETCMD | C:1e2ff892-7b0d-4416-9c73-0095aea"
+  },
+  {
+    "name": "D9 failed DB write still answered \"OK\" (punches lost forever)",
+    "vulnerable": true,
+    "detail": "200 OK"
+  },
+  {
+    "name": "D10 (baseline) legit ZKTeco + webhook punches + ack work",
+    "vulnerable": false,
+    "detail": "200/200/200 rows=2"
+  },
+  {
+    "name": "D10b (baseline) handshake works",
+    "vulnerable": false,
+    "detail": "200"
+  }
+]

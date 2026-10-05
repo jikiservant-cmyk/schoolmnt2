@@ -62,6 +62,13 @@ export async function enqueueDeviceCommand(
     return { success: false, commandId };
   }
 
+  // ADMS sends commands as newline-separated "C:<id>:<cmd>" lines; a CR/LF in
+  // the text would smuggle extra commands (e.g. CLEAR ALL DATA) to the device.
+  if (typeof command !== 'string' || !command.trim() || /[\r\n\0]/.test(command) || command.length > 4096) {
+    console.error('[Device Command Queue] Refusing unsafe or empty device command.');
+    return { success: false, commandId };
+  }
+
   const isBroadcast = typeof deviceSerialNumber === 'string' && deviceSerialNumber.trim().toUpperCase() === 'ALL';
   const cleanSn = isBroadcast ? 'ALL' : normalizeSerial(deviceSerialNumber);
   if (!cleanSn) {
