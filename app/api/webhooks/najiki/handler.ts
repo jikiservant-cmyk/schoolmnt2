@@ -54,22 +54,68 @@ function webhookSecret(): { secret: string | null; dedicated: boolean } {
   return { secret: legacy, dedicated: false };
 }
 
-function isAuthorized(req: NextRequest, rawBody: string, secret: string): boolean {
-  const authHeader = req.headers.get('authorization');
-  if (authHeader) {
-    const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-    const a = crypto.createHash('sha256').update(token).digest();
-    const b = crypto.createHash('sha256').update(secret).digest();
-    if (crypto.timingSafeEqual(a, b)) return true;
+const safeEqual = (a: string, b: string): boolean => {
+  const x = crypto.createHash('sha256').update(a).digest();
+  const y = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(x, y);
+};
+
+/**
+ * NaJiki signs every outbound notification (payment completion AND SMS
+ * delivery) the same way (najiki-finance2 src/lib/notification-signature.ts):
+ *
+ *   X-Najiki-Timestamp: <unix ms>
+ *   X-Najiki-Signature: t=<unix ms>,v=<hex HMAC-SHA256(secret, "<t>.<raw body>")>
+ *
+ * The timestamp is inside the signed string, so it cannot be swapped. The age
+ * window is deliberately generous (default 72h): NaJiki's QStash retries
+ * re-send the ORIGINAL headers for up to ~2 days, and rejecting them would
+ * strand paid top-ups. Replays inside the window are harmless because
+ * school.apply_payment() credits each payment at most once.
+ */
+const FUTURE_SKEW_MS = 5 * 60 * 1000;
+function maxSignatureAgeMs(): number {
+  const h = Number(process.env.NAJIKI_WEBHOOK_MAX_AGE_HOURS);
+  return (Number.isFinite(h) && h > 0 ? h : 72) * 60 * 60 * 1000;
+}
+
+type AuthResult = { ok: true; scheme: 'timestamped' | 'legacy' } | { ok: false; reason: string };
+
+export function verifyNajikiSignature(
+  headers: { get(name: string): string | null },
+  rawBody: string,
+  secret: string,
+  now: number = Date.now(),
+): AuthResult {
+  const sigHeader = (headers.get('x-najiki-signature') || '').trim();
+  const m = /^t=(\d{9,16})\s*,\s*v=([0-9a-fA-F]{64})$/.exec(sigHeader);
+  if (m) {
+    const t = m[1];
+    const tsHeader = headers.get('x-najiki-timestamp');
+    if (tsHeader !== null && tsHeader.trim() !== t) return { ok: false, reason: 'timestamp header does not match signed timestamp' };
+    const expected = crypto.createHmac('sha256', secret).update(`${t}.${rawBody}`).digest('hex');
+    if (!safeEqual(expected, m[2].toLowerCase())) return { ok: false, reason: 'bad signature' };
+    const tsMs = Number(t) < 1e11 ? Number(t) * 1000 : Number(t); // tolerate seconds
+    if (tsMs - now > FUTURE_SKEW_MS) return { ok: false, reason: 'timestamp in the future' };
+    if (now - tsMs > maxSignatureAgeMs()) return { ok: false, reason: 'signature too old (replay window exceeded)' };
+    return { ok: true, scheme: 'timestamped' };
   }
-  const sig = req.headers.get('x-najiki-signature') || req.headers.get('x-signature') || req.headers.get('x-webhook-signature');
-  if (sig) {
+
+  // Older NaJiki builds: bare HMAC of the body, or the secret itself as a
+  // Bearer token. Neither has replay protection and the second puts the secret
+  // in a header, so they are OFF unless explicitly enabled for a migration.
+  const legacyAllowed = process.env.NAJIKI_WEBHOOK_ALLOW_LEGACY_SIGNATURE === 'true';
+  let legacyValid = false;
+  const authHeader = headers.get('authorization');
+  if (authHeader && safeEqual(authHeader.replace(/^Bearer\s+/i, '').trim(), secret)) legacyValid = true;
+  const bare = sigHeader || headers.get('x-signature') || headers.get('x-webhook-signature') || '';
+  if (!legacyValid && bare) {
     const digest = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
-    const provided = Buffer.from(sig.replace(/^sha256=/i, '').trim().toLowerCase(), 'utf8');
-    const expected = Buffer.from(digest, 'utf8');
-    if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) return true;
+    if (safeEqual(digest, bare.replace(/^sha256=/i, '').trim().toLowerCase())) legacyValid = true;
   }
-  return false;
+  if (legacyValid && legacyAllowed) return { ok: true, scheme: 'legacy' };
+  if (legacyValid) return { ok: false, reason: 'legacy (untimestamped) signature format; set NAJIKI_WEBHOOK_ALLOW_LEGACY_SIGNATURE=true only if your NaJiki build predates timestamped signatures' };
+  return { ok: false, reason: sigHeader ? 'unrecognised signature' : 'missing signature' };
 }
 
 /**
@@ -146,12 +192,16 @@ export async function handleNajikiWebhook(req: NextRequest) {
     if (!hasAuth) {
       return NextResponse.json({ error: 'Unauthorized: Missing authentication headers' }, { status: 401 });
     }
-    if (!isAuthorized(req, rawBody, secret)) {
-      console.warn('[NaJiki Webhook] Unauthorized NaJiki webhook attempt.');
+    const auth = verifyNajikiSignature(req.headers, rawBody, secret);
+    if (!auth.ok) {
+      console.warn(`[NaJiki Webhook] Unauthorized NaJiki webhook attempt: ${auth.reason}.`);
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (auth.scheme === 'legacy') {
+      console.warn('[NaJiki Webhook] Accepted a LEGACY untimestamped signature (NAJIKI_WEBHOOK_ALLOW_LEGACY_SIGNATURE=true). Upgrade NaJiki and turn this off.');
+    }
     if (!dedicated) {
-      console.warn('[NaJiki Webhook] Authenticated with the outbound API key. Set NAJIKI_WEBHOOK_SECRET to a separate secret.');
+      console.warn('[NaJiki Webhook] Verified with NAJIKI_API_KEY. Copy the application\'s webhook secret (njk_whsec_...) from NaJiki into NAJIKI_WEBHOOK_SECRET.');
     }
 
     let payload: Json;
@@ -200,9 +250,11 @@ async function handlePayment(eventData: Json, cls: ReturnType<typeof classifyPay
   const amount = paidAmount(eventData);
   const currency = paidCurrency(eventData);
   if (refs.length === 0 && !providerRef) {
+    await recordRejectedPayment('rejected_no_reference', eventData, amount, currency);
     return NextResponse.json({ error: 'Missing transaction reference' }, { status: 400 });
   }
   if (!Number.isFinite(amount) || amount <= 0 || amount > 50_000_000) {
+    await recordRejectedPayment('rejected_invalid_amount', eventData, amount, currency);
     return NextResponse.json({ error: 'Invalid amount' }, { status: 400 });
   }
 
@@ -212,6 +264,7 @@ async function handlePayment(eventData: Json, cls: ReturnType<typeof classifyPay
   const resolved = await resolveWebhookSchool(publicAdmin, eventData);
   if ('error' in resolved && resolved.error.startsWith('Conflicting')) {
     console.warn('[NaJiki Webhook] Conflicting school identifiers in payment payload.');
+    await recordRejectedPayment('rejected_conflicting_school', eventData, amount, currency);
     return NextResponse.json({ error: resolved.error }, { status: 400 });
   }
   const claimedSchool = 'schoolId' in resolved ? resolved.schoolId : null;
@@ -340,6 +393,30 @@ async function legacyCreditNow(p: { refs: string[]; providerRef: string | null; 
   // Couldn't apply the balance: undo the ledger row so NaJiki's retry can credit it.
   await publicAdmin.from('transactions').delete().eq('reference', txRef).eq('wallet_id', walletId);
   throw new Error('balance update failed after retries');
+}
+
+/**
+ * Signed payment notifications we refuse with a 4xx are never retried by
+ * NaJiki (najiki-finance2 backoff.ts: 4xx = permanent). Record them so no
+ * money event disappears without a trace. Best effort: never throws.
+ */
+async function recordRejectedPayment(outcome: string, eventData: Json, amount: number, currency: string) {
+  try {
+    const { refs, providerRef } = collectReferences(eventData);
+    const sid = [eventData?.externalEntityId, eventData?.metadata?.schoolId].find((v) => typeof v === 'string' && UUID_RE.test(v)) || null;
+    const { error } = await createAdminClient().from('payment_events').insert({
+      outcome,
+      idempotency_key: refs[0] ?? null,
+      provider_ref: providerRef,
+      school_id: sid,
+      amount: Number.isFinite(amount) ? amount : null,
+      currency: currency || null,
+      detail: { status: eventData?.status ?? null, refs: refs.slice(0, 5), schoolIds: [eventData?.externalEntityId ?? null, eventData?.metadata?.schoolId ?? null, eventData?.schoolId ?? null] },
+    });
+    if (error) console.warn('[NaJiki Webhook] Could not record rejected payment:', error.message);
+  } catch (e) {
+    console.warn('[NaJiki Webhook] Could not record rejected payment:', e);
+  }
 }
 
 async function handleDeliveryReport(eventData: Json) {

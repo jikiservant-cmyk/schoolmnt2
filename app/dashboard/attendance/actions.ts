@@ -464,9 +464,25 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
 
     console.log('[NaJiki STK Push] Successfully initiated:', resData);
 
+    // NaJiki replies { paymentId, reference, status }. Keep its paymentId on our
+    // intent: the completion webhook carries it as paymentIntentId, so the
+    // payment still matches even if the echoed metadata were ever lost.
+    const najikiPaymentId = typeof resData?.paymentId === 'string' ? resData.paymentId.slice(0, 200) : '';
+    if (intentRecorded && najikiPaymentId) {
+      const { error: refErr } = await adminSchool.from('payment_intents')
+        .update({ provider_ref: najikiPaymentId })
+        .eq('reference', idempotencyKey)
+        .is('provider_ref', null);
+      if (refErr) console.warn('[NaJiki STK Push] Could not store NaJiki paymentId on intent:', refErr.message);
+    }
+    if (String(resData?.status || '').toLowerCase() === 'failed') {
+      await markIntentFailed();
+      return { error: 'The payment could not be started. Please check the phone number and try again.' };
+    }
+
     return {
       success: true,
-      transactionId: resData.transactionId || resData.reference || resData.id || idempotencyKey,
+      transactionId: resData.reference || resData.paymentId || resData.transactionId || idempotencyKey,
       message: `Mobile Money PIN prompt sent to ${phoneLocal07}! Please enter your PIN on your phone to complete payment.`
     };
   } catch (err: any) {

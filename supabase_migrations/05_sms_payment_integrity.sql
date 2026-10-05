@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS school.payment_intents (
 );
 CREATE INDEX IF NOT EXISTS payment_intents_school_status_idx
   ON school.payment_intents (school_id, status, created_at);
+-- (added after first draft; ALTER keeps re-runs safe on DBs that ran the older 05)
+ALTER TABLE school.payment_intents ADD COLUMN IF NOT EXISTS provider_ref text;
+CREATE INDEX IF NOT EXISTS payment_intents_provider_ref_idx
+  ON school.payment_intents (provider_ref) WHERE provider_ref IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS school.payment_events (
   id              bigserial PRIMARY KEY,
@@ -107,9 +111,12 @@ BEGIN
     RETURN jsonb_build_object('outcome', 'duplicate');
   END IF;
 
-  -- 1. Match the payment to a top-up the app started: by reference first...
+  -- 1. Match the payment to a top-up the app started: by our reference (NaJiki
+  --    echoes it in metadata.idempotencyKey), or by NaJiki's paymentId, which
+  --    the app stores on the intent when NaJiki accepts the request...
   SELECT * INTO v_intent FROM school.payment_intents
    WHERE reference = ANY (v_refs)
+      OR (provider_ref IS NOT NULL AND (provider_ref = ANY (v_refs) OR provider_ref = p_provider_ref))
    ORDER BY created_at LIMIT 1 FOR UPDATE;
   -- ...or, if the provider didn't echo our reference, the school's oldest
   -- pending top-up of exactly this amount from the last 48 hours.
@@ -192,7 +199,7 @@ BEGIN
   IF v_intent.id IS NOT NULL THEN
     UPDATE school.payment_intents
        SET status = 'credited', credited_amount = v_credit, credited_at = now(),
-           provider_ref = coalesce(p_provider_ref, provider_ref)
+           provider_ref = coalesce(provider_ref, p_provider_ref)
      WHERE id = v_intent.id;
   END IF;
 

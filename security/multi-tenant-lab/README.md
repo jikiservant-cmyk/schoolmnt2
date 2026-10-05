@@ -76,3 +76,10 @@ node pay-rls-check.mjs                                                      # di
 node topup-limit-check.mjs http://127.0.0.1:3201 /path/to/schoolmnt2       # app started WITHOUT TOPUP_MAX_PER_10_MIN
 ```
 The shim also impersonates NaJiki (`/__najiki/payments`) and runs real Postgres functions for `/rest/v1/rpc/*`.
+
+### Checked against the real NaJiki (najiki-finance2)
+```bash
+node genuine-najiki-check.mjs "now:"     # one genuine NaJiki-signed payment -> must be HTTP 200 + credited
+NAJIKI_REPO=/path/to/najiki-finance2 node --experimental-strip-types najiki-own-signer-check.mjs   # signed by NaJiki's own source file
+```
+The fake NaJiki in shim.js enforces NaJiki's CreatePaymentRequestSchema and replies `{paymentId, reference, status}`.

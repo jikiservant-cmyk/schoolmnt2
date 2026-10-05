@@ -316,14 +316,77 @@ Regression (everything from Parts 1–4, re-run with 05 applied): legit flows 17
 
 1. **Back up the database**, then run `supabase_migrations/05_sms_payment_integrity.sql` (after 03 and 04). It is safe to re-run.
 2. Read the migration output. If it prints a `WARNING` about duplicate transaction references or duplicate wallets, fix those rows (queries are in the comments at the bottom of 05) and re-run 05 so the UNIQUE index gets created.
-3. Generate a long random secret, set it as `NAJIKI_WEBHOOK_SECRET` in the app, and configure the **same** value as the webhook signing secret in the NaJiki dashboard. It must be different from `NAJIKI_API_KEY`.
+3. In NaJiki, open the school application and copy its **webhook secret** (`njk_whsec_...`). NaJiki shows it when the application is created, or when the key is rotated with "rotate webhook secret". Set it as `NAJIKI_WEBHOOK_SECRET` in the school app. Don't invent your own: NaJiki signs with the secret it generated. If the application has no webhook secret, NaJiki signs with its legacy API key, or sends **unsigned** notifications that this app rejects.
+3b. In NaJiki, check that the school application's **base URL + webhook path** points to `https://<school-app-domain>/api/internal/payment-completed` (or `/api/webhooks/najiki`; both are the same handler). Check that the **application code** equals `NAJIKI_APP_CODE` (default `school`), that a payment type `general` exists, and that every school has an active NaJiki **tenant** whose code matches `public.tenants.code`. Otherwise NaJiki refuses the top-up (400/404) before any PIN prompt.
 4. Make sure `NAJIKI_API_KEY` is set (top-ups now refuse without it).
 5. Leave `NAJIKI_REQUIRE_PAYMENT_INTENT` unset (the default, `true`). Top-ups started before this release have no intent and will be **held**, not lost. Credit them by hand after checking.
 6. Do **not** set `SMS_SIMULATION_MODE`.
-7. Do one real small top-up (e.g. 500 UGX) on day one. Check the balance went up exactly once and that `school.payment_events` shows `credited`.
+7. Do one real small top-up (e.g. 500 UGX) on day one. **Important:** NaJiki never retries a 4xx. If the secret is wrong, the notification gets a 401 and is dropped NaJiki-side: the school app logs `Unauthorized NaJiki webhook attempt: bad signature`, and the intent stays `pending` with NaJiki's `paymentId` in `provider_ref`. Fix the secret, then re-send it from NaJiki or credit it by hand. Check the balance went up exactly once and that `school.payment_events` shows `credited`.
 8. Daily for the first weeks: check `school.payment_events` for anything that is not `credited` / `duplicate` (the reconciliation query is in 05). Each such row is real money that needs a human decision.
 
 **Known limits (not blockers):**
 - The top-up rate limit is in memory, per server instance. With several instances the real limit is 6 × instances.
 - The kiosk can queue the same SMS twice on a fast double-tap.
 - SMS are queued without checking the school still has enough balance; sending is charged by NaJiki.
+
+## Part 5b: checked against NaJiki's real source (najiki-finance2)
+
+After the first pass I went through the provider's code (`jikiservant-cmyk/najiki-finance2`): `src/lib/notification-signature.ts`, `src/lib/payments.ts`, `src/app/api/payments/route.ts`, `src/lib/sms-queue.ts` and `src/lib/backoff.ts`. Then I re-tested with payloads and signatures exactly as NaJiki produces them.
+
+### Critical finding: every real payment notification would have been rejected
+
+| | Format NaJiki actually sends | What this app checked |
+|---|---|---|
+| Signature | `X-Najiki-Signature: t=<ms>,v=<hex HMAC-SHA256(secret, "<t>.<body>")>` plus `X-Najiki-Timestamp` | bare `HMAC(body)` or `Authorization: Bearer <secret>` |
+| Body | flat: `{paymentIntentId, reference, status:"success"/"failed", amount, currency, providerPaymentId, externalEntityId, metadata}` | handled (lowercase status, flat shape) |
+| Our reference | only inside `metadata.idempotencyKey` (NaJiki makes its own `reference`) | handled |
+
+Proof: one genuine NaJiki-signed 2,000 UGX payment sent to each version (`genuine-najiki-check.mjs`):
+
+| Version | Response | Credited |
+|---|---|---|
+| Original code | 401 | **0** |
+| First fix in this audit (`323ca55`) | 401 | **0** |
+| **Now** | **200** | **2,000** |
+
+NaJiki treats 4xx as permanent and never retries (`backoff.ts`). Every school's paid top-up would have been silently lost from day one. A payment signed by **NaJiki's own source file** (imported directly, `najiki-own-signer-check.mjs`) is now credited correctly, and NaJiki's own verifier confirms the signature.
+
+### Fixes in this pass
+
+- **Signature check rewritten** for NaJiki's scheme: HMAC over `"<t>.<body>"`, timing-safe compare, `X-Najiki-Timestamp` must equal the signed `t`, and a timestamp more than 5 min in the future is rejected.
+- **Replay window: 72h by default** (`NAJIKI_WEBHOOK_MAX_AGE_HOURS`). NaJiki's QStash retries re-send the *original* headers for up to ~2 days, so a 5-minute window would reject legitimate retries. Replays inside the window cannot add money, because `apply_payment()` credits each payment once.
+- **Old formats off by default:** bare body HMAC and secret-as-Bearer. Neither has replay protection, and the second leaks the secret into logs. `NAJIKI_WEBHOOK_ALLOW_LEGACY_SIGNATURE=true` re-enables them, only for an old NaJiki build.
+- **NaJiki's `paymentId` is stored on the intent** (`payment_intents.provider_ref`) when NaJiki accepts the top-up, and `apply_payment()` matches on it as well as on our reference. A payment still matches if metadata were ever lost.
+- **NaJiki returning `status: failed` immediately** marks the intent failed and shows the school an error.
+- **Refused payment notifications** (conflicting school, missing reference, invalid amount: 4xx, so never retried) are now written to `payment_events` (`rejected_*`), so nothing disappears without a trace.
+- The lab's fake NaJiki now enforces NaJiki's real request schema (`CreatePaymentRequestSchema`) and response shape `{paymentId, reference, status}`. The top-up request passes it.
+
+### Results (payloads exactly as NaJiki sends them)
+
+| Run | Attacks that worked | Legit flows broken |
+|---|---|---|
+| **Code + migration 05 + `NAJIKI_WEBHOOK_SECRET`** | **0 / 20** (P1–P12 + S1–S6, run 3×) | **0 / 12** |
+| Code only, migration 05 **not** run | 4 / 20 (P1, P2, P3b, P7) | 0 |
+
+New signature attacks, all blocked:
+- S1: replay after 72h;
+- S2: body altered after signing;
+- S3: timestamp header swapped;
+- S4: legacy bare HMAC;
+- S5: raw secret as Bearer;
+- S6: pre-signed future timestamp.
+
+New legit flows, all passing:
+- the top-up request passes NaJiki validation;
+- NaJiki's `paymentId` is stored;
+- a QStash retry with a 47h-old signature still credits;
+- a payment is matched by `paymentId` when metadata is missing;
+- NaJiki's `SMS_DELIVERY_UPDATE` is accepted;
+- a refused notification is recorded.
+
+Regression after this pass: legit flows 17/17, app attacks 1/42 (known device transition item), direct REST money attacks 0/8, RLS policies active.
+
+### Not fixed here: needs a decision
+
+- **Nothing sends the queued SMS.** The school app writes SMS into `school.notifications`, but neither this repo nor najiki-finance2 has code that passes them to NaJiki `POST /api/messaging/send`. The only thing that touched them was the simulation action (now disabled), which just marked them "sent". Real SMS sending needs a dispatcher with a per-SMS price and a wallet debit. Building it needs the business rules: price per SMS/part, and what happens at zero balance.
+- **NaJiki side (other repo):** `POST /api/messaging/send` does not check or debit any wallet. Anyone holding the school app's `NAJIKI_API_KEY` can send unlimited SMS billed to NaJiki's SMS account. Keep that key server-side only (it is), and rotate it if it was ever exposed.

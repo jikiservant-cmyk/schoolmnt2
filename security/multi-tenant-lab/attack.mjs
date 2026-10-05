@@ -190,8 +190,10 @@ const ic = (path, qs, body) => fetch(BASE + path + '?' + new URLSearchParams(qs)
 import crypto from 'crypto';
 const hook = async (payload) => {
   const body = JSON.stringify(payload);
-  const sig = crypto.createHmac('sha256', process.env.NAJIKI_WEBHOOK_SECRET || 'lab-najiki-secret').update(body).digest('hex');
-  const r = await fetch(BASE + '/api/webhooks/najiki', { method: 'POST', body, headers: { 'content-type': 'application/json', 'x-najiki-signature': sig } });
+  // Signed exactly like najiki-finance2 buildNotificationHeaders(): t=<ms>,v=HMAC("<t>.<body>")
+  const t = Date.now();
+  const sig = crypto.createHmac('sha256', process.env.NAJIKI_WEBHOOK_SECRET || 'lab-najiki-secret').update(`${t}.${body}`).digest('hex');
+  const r = await fetch(BASE + '/api/webhooks/najiki', { method: 'POST', body, headers: { 'content-type': 'application/json', 'x-najiki-timestamp': String(t), 'x-najiki-signature': `t=${t},v=${sig}` } });
   return { status: r.status, body: await r.text() };
 };
 const bal = async (s) => Number((await one("SELECT balance FROM public.wallets WHERE tenant_id=$1", [s]))[0]?.balance ?? 0);

@@ -373,7 +373,26 @@ http.createServer((req, res) => {
       if (url.pathname === '/__users') { Object.assign(USERS, JSON.parse(body)); return send(res, 200, Object.keys(USERS)); }
       if (url.pathname === '/__session') { const u = USERS[JSON.parse(body).email]; return send(res, 200, sessionFor(u)); }
       // Fake NaJiki payments API: records STK push requests from the app.
-      if (url.pathname === '/__najiki/payments') { NAJIKI.push({ headers: { authorization: req.headers.authorization || '' }, body: JSON.parse(body || '{}') }); return send(res, 200, { transactionId: 'nj_' + crypto.randomUUID(), status: 'PENDING' }); }
+      if (url.pathname === '/__najiki/payments') {
+        // Mirrors najiki-finance2 POST /api/payments (CreatePaymentRequestSchema + response shape).
+        const b = JSON.parse(body || '{}');
+        const auth = req.headers.authorization || '';
+        if (!auth.startsWith('Bearer ') || !auth.slice(7).trim()) return send(res, 401, { error: 'Missing or invalid authorization header' });
+        const bad = [];
+        if (typeof b.applicationCode !== 'string' || !b.applicationCode) bad.push('applicationCode');
+        if (typeof b.paymentTypeCode !== 'string' || !b.paymentTypeCode) bad.push('paymentTypeCode');
+        if (typeof b.externalEntityId !== 'string' || !b.externalEntityId) bad.push('externalEntityId');
+        if (typeof b.amount !== 'number' || !(b.amount > 0)) bad.push('amount');
+        if (b.currency !== undefined && !/^[A-Za-z]{3}$/.test(String(b.currency).trim())) bad.push('currency');
+        if (typeof b.phoneNumber !== 'string' || b.phoneNumber.length < 9 || b.phoneNumber.length > 15) bad.push('phoneNumber');
+        if (typeof b.idempotencyKey !== 'string' || b.idempotencyKey.length < 8) bad.push('idempotencyKey');
+        if (b.metadata !== undefined && (typeof b.metadata !== 'object' || Array.isArray(b.metadata))) bad.push('metadata');
+        if (bad.length) return send(res, 400, { error: 'Validation failed', details: bad });
+        const paymentId = crypto.randomUUID();
+        const reference = String(b.applicationCode).slice(0, 6).toUpperCase() + '-PAY-' + Date.now().toString(16).slice(-8).toUpperCase() + '-' + crypto.randomBytes(5).toString('hex').toUpperCase();
+        NAJIKI.push({ headers: { authorization: auth }, body: b, response: { paymentId, reference } });
+        return send(res, 200, { paymentId, reference, status: 'pending' });
+      }
       if (url.pathname === '/__najiki/log') { if (req.method === 'DELETE') NAJIKI.length = 0; return send(res, 200, NAJIKI); }
       if (url.pathname === '/__reload') { await loadCatalog(); return send(res, 200, { ok: true }); }
       if (url.pathname.startsWith('/auth/v1/')) return handleAuth(req, res, url, body);
