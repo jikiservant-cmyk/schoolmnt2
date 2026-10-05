@@ -1,6 +1,7 @@
 import { AttendanceEvent, DeviceRecord } from './types';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { isWithinAttendanceSmsWindow } from '@/lib/attendance-window';
+import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
 import { isMissingColumnError } from '@/lib/tenant';
 
 export interface ProcessEventsResult {
@@ -380,6 +381,7 @@ export async function processAttendanceEvents(
         const timeFormatted = record.timeFormatted || record.logDate.toLocaleTimeString([], { timeZone, hour: '2-digit', minute: '2-digit' });
 
         notificationsToInsert.push({
+          dedupe_key: attendanceSmsKey(record.person.id, record.attendanceType, record.logDate, timeZone),
           school_id: device.school_id,
           recipient_type: 'parent',
           recipient_id: pInfo.parent_id,
@@ -393,9 +395,14 @@ export async function processAttendanceEvents(
     }
 
     if (notificationsToInsert.length > 0) {
-      await supabase.from('notifications').insert(notificationsToInsert);
-      result.queuedSmsCount = notificationsToInsert.length;
-      console.log(`[Device Processor] Queued ${notificationsToInsert.length} parent SMS notifications from device ${device.serial_number}`);
+      // Never fail the upload over SMS (the punches are already saved).
+      try {
+        const { queued, duplicates } = await queueNotifications(supabase, notificationsToInsert);
+        result.queuedSmsCount = queued;
+        console.log(`[Device Processor] Queued ${queued} parent SMS notifications from device ${device.serial_number}${duplicates ? ` (${duplicates} already queued today)` : ''}`);
+      } catch (e) {
+        console.error(`[Device Processor] SMS queue failed for ${device.serial_number}:`, e);
+      }
     }
   }
 

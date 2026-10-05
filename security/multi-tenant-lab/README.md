@@ -83,3 +83,14 @@ node genuine-najiki-check.mjs "now:"     # one genuine NaJiki-signed payment -> 
 NAJIKI_REPO=/path/to/najiki-finance2 node --experimental-strip-types najiki-own-signer-check.mjs   # signed by NaJiki's own source file
 ```
 The fake NaJiki in shim.js enforces NaJiki's CreatePaymentRequestSchema and replies `{paymentId, reference, status}`.
+
+## Round 3: rogue money pentest (Part 6)
+
+```
+RLS=1 HARDEN=0 MIG06=0 node rogue-attack.mjs http://127.0.0.1:3201 /path/to/schoolmnt2 before   # 17/23 (04 optional step skipped)
+RLS=1 MIG06=0          node rogue-attack.mjs ... before-with-optional                          # 11/23
+RLS=1 HARDEN=0         node rogue-attack.mjs ... after                                         # 0/23, 9 legit OK
+```
+- K1/K2 (kiosk / register races) only run between 16:00 and 22:00 EAT (check-out SMS window).
+- `prod-like-functions.sql` creates a production-style `public.credit_wallet` (SECURITY DEFINER, executable by PUBLIC). `PRODFN=0` skips it.
+- seed.js env: `HARDEN=0` (skip 04's optional public step), `MIG05=0`, `MIG06=0`. It also creates a teacher login (`teacherA@lab.io`).

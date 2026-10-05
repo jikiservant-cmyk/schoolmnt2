@@ -2,6 +2,7 @@
 
 import { checkSchoolAdmin } from '@/lib/auth-guard';
 import { createAdminClient } from '@/utils/supabase/admin';
+import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
 import { isMissingColumnError } from '@/lib/tenant';
 import { isWithinAttendanceSmsWindow, getEatTodayRange, getAttendanceStatusForCheckIn } from '@/lib/attendance-window';
 
@@ -238,10 +239,12 @@ export async function submitClockInAction(deviceUserId: string) {
             ? `Dear Parent, your child ${person.full_name} checked in successfully at ${timestampStr}.`
             : `Dear Parent, your child ${person.full_name} checked OUT of school successfully at ${timestampStr}.`;
 
-          // Queue the notification in school.notifications
-          const { error: queueErr } = await adminClient
-            .from('notifications')
-            .insert({
+          // Queue the notification in school.notifications (one per child,
+          // direction and day: simultaneous taps cannot queue a second paid SMS)
+          let queueErr: unknown = null;
+          try {
+            await queueNotifications(adminClient, [{
+              dedupe_key: attendanceSmsKey(person.id, attendanceType, now),
               school_id: schoolId,
               recipient_type: 'parent',
               recipient_id: parentId,
@@ -252,7 +255,10 @@ export async function submitClockInAction(deviceUserId: string) {
               related_id: attendanceLog.id,
               message: smsMessageText,
               status: 'pending'
-            });
+            }]);
+          } catch (e) {
+            queueErr = e;
+          }
 
           if (queueErr) {
             console.error('Error writing outbound notification queue row:', queueErr);

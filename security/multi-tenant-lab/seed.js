@@ -37,6 +37,7 @@ if (require.main === module) (async () => {
     await c.query("INSERT INTO school.parents(id,school_id,full_name,phone) VALUES ($1,$2,$3,$4)", [t.parent, t.school, `Parent ${k}`, k === 'A' ? '+256711111111' : '+256722222222']);
     await c.query("INSERT INTO school.student_parents(student_id,parent_id,is_primary_contact) VALUES ($1,$2,true)", [t.student, t.parent]);
     await c.query("INSERT INTO school.staff_users(school_id,auth_user_id,person_id,staff_role) VALUES ($1,$2,$3,'admin')", [t.school, t.admin, t.teacher]);
+    if (k === 'A') await c.query("INSERT INTO school.staff_users(school_id,auth_user_id,person_id,staff_role) VALUES ($1,'aaaaaaaa-0000-4000-8000-0000000000a2',NULL,'teacher')", [t.school]);
     await c.query("UPDATE school.staff_users SET pin_hash=$1 WHERE person_id=$2", [bcrypt.hashSync(k === 'A' ? '482913' : '739164', 4), t.teacher]);
     await c.query("INSERT INTO school.devices(id,school_id,serial_number,label,device_type,device_secret_hash,is_active) VALUES ($1,$2,$3,$4,'zkteco',$5,true)",
       [t.device, t.school, 'SN' + k + '0001', 'Gate ' + k, sha(SECRETS[k])]);
@@ -44,14 +45,16 @@ if (require.main === module) (async () => {
       [t.school, t.device, 'SN' + k + '0001', `DATA UPDATE USERINFO PIN=999\tName=${k}-SECRETCMD`]);
   }
   await c.query(fs.readFileSync(__dirname + '/supabase-base.sql', 'utf8'));
+  if (process.env.PRODFN !== '0') await c.query(fs.readFileSync(__dirname + '/prod-like-functions.sql', 'utf8'));
   if (process.env.RLS === '1') {
     // Emulate a sloppy pre-existing setup: RLS on, plus a wide-open policy.
     await c.query("ALTER TABLE school.people ENABLE ROW LEVEL SECURITY; CREATE POLICY legacy_open ON school.people FOR SELECT TO authenticated USING (true)");
     const mig = '/home/user/schoolmnt2/supabase_migrations/';
     await c.query(fs.readFileSync(mig + '03_tenant_integrity.sql', 'utf8'));
-    await c.query("SET smartskoolz.harden_public = 'on'");
+    if (process.env.HARDEN !== '0') await c.query("SET smartskoolz.harden_public = 'on'");
     await c.query(fs.readFileSync(mig + '04_rls_tenant_isolation.sql', 'utf8'));
     if (process.env.MIG05 !== '0') await c.query(fs.readFileSync(mig + '05_sms_payment_integrity.sql', 'utf8'));
+    if (process.env.MIG06 !== '0' && fs.existsSync(mig + '06_money_lockdown.sql')) await c.query(fs.readFileSync(mig + '06_money_lockdown.sql', 'utf8'));
     console.log('RLS migrations applied');
   }
   console.log('seeded');

@@ -397,6 +397,25 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   // 6. Record the top-up BEFORE asking for money. The payment webhook only
   //    credits payments that match one of these (school, amount, reference).
   const adminSchool = createAdminClient();
+
+  // Durable limit: the in-memory counter above is per server instance, so
+  // with several instances (or after a restart) it can be bypassed. The
+  // intents table is shared by every instance.
+  const since = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const { data: recent, error: recentErr } = await adminSchool
+    .from('payment_intents')
+    .select('id')
+    .eq('school_id', school.id)
+    .gte('created_at', since)
+    .limit(maxTopUps);
+  if (!recentErr && (recent?.length ?? 0) >= maxTopUps) {
+    return { error: 'Too many top-up attempts. Please wait 10 minute(s) and try again.' };
+  }
+  if (recentErr && !isMissingTable(recentErr)) {
+    console.error('[NaJiki STK Push] Could not check recent top-ups:', recentErr.message);
+    return { error: 'Could not start the payment. Please try again.' };
+  }
+
   let intentRecorded = false;
   const { error: intentErr } = await adminSchool.from('payment_intents').insert({
     school_id: school.id,

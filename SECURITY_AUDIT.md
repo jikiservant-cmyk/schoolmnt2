@@ -325,8 +325,8 @@ Regression (everything from Parts 1–4, re-run with 05 applied): legit flows 17
 8. Daily for the first weeks: check `school.payment_events` for anything that is not `credited` / `duplicate` (the reconciliation query is in 05). Each such row is real money that needs a human decision.
 
 **Known limits (not blockers):**
-- The top-up rate limit is in memory, per server instance. With several instances the real limit is 6 × instances.
-- The kiosk can queue the same SMS twice on a fast double-tap.
+- ~~The top-up rate limit is in memory, per server instance.~~ Fixed in Part 6: it is also counted in the database.
+- ~~The kiosk can queue the same SMS twice on a fast double-tap.~~ Fixed in Part 6 (one attendance SMS per child, direction and day).
 - SMS are queued without checking the school still has enough balance; sending is charged by NaJiki.
 
 ## Part 5b: checked against NaJiki's real source (najiki-finance2)
@@ -390,3 +390,91 @@ Regression after this pass: legit flows 17/17, app attacks 1/42 (known device tr
 
 - **SMS sending happens in a Supabase Edge Function** (confirmed by the owner). It is not in this repo, so it was not reviewed. Things to check there: it should use the service-role key, because migration 04 RLS blocks anon access to `school.notifications`. It should charge the school's wallet atomically, once per SMS. It should mark a row as sent only after NaJiki accepts it. NaJiki delivery reports update `school.notifications.status` to `sent`/`failed`, matched by `provider_ref` (store NaJiki's `smsId` there) or the notification id.
 - **NaJiki side (other repo):** `POST /api/messaging/send` does not check or debit any wallet. Anyone holding the school app's `NAJIKI_API_KEY` can send unlimited SMS billed to NaJiki's SMS account. Keep that key server-side only (it is), and rotate it if it was ever exposed.
+
+# Part 6: Money round 3 ("rogue" pentest): public key, teacher, races
+
+## How it was tested
+
+New suite `security/multi-tenant-lab/rogue-attack.mjs` (23 attacks + 9 legit flows). It attacks like a real person would:
+
+- **Anonymous visitor:** only the public anon key, which ships inside every browser bundle.
+- **Teacher:** a logged-in teacher account.
+- **School admin:** a logged-in admin account.
+- **Races:** many identical requests at the same moment against the kiosk, the class register and the device endpoint.
+
+Writes use `Prefer: return=minimal`, as an attacker would, and every result is checked in the database, not from the HTTP status. The lab now also contains a `public.credit_wallet` function created the way it would be in production. The original webhook called it, so production very likely has it. Like any Supabase function, it is executable by everyone unless someone revoked it.
+
+Two starting points were measured:
+
+- **"Optional step skipped"** (`HARDEN=0`): 04 was run without `smartskoolz.harden_public = 'on'`. The step was optional, so this is a realistic production state.
+- **"Optional step done":** the best case from Part 4/5.
+
+## Findings (all fixed)
+
+| # | Attack | Before (skipped / done) |
+|---|---|---|
+| M1 | Anonymous visitor sets **any school's wallet balance** to 99,999,999 | vulnerable / ok |
+| M2 | School admin sets own wallet balance | vulnerable / ok |
+| M3 | Anonymous visitor **mints 5,000,000 UGX** for any school via `rpc/credit_wallet` | vulnerable / **vulnerable** |
+| M4 | Teacher mints credit via `credit_wallet` | vulnerable / **vulnerable** |
+| M5 / M6 / M16 | Anonymous visitor inserts fake ledger rows, **erases the whole ledger**, reads it | vulnerable / ok |
+| M7 | Anonymous visitor rewrites school B's NaJiki **tenant code**: B's future top-ups are collected under the attacker's tenant | vulnerable / **vulnerable** |
+| M8 | School A admin rewrites school B's tenant code | vulnerable / **vulnerable** |
+| M9 | Admin rewrites own `profiles.code` / `school_id` (used as the tenant-code fallback) | vulnerable / **vulnerable** |
+| M11 | Teacher queues 50 free-text SMS to any number ("send school fees to 07…"), **paid by the school** | vulnerable / **vulnerable** |
+| M12 | A sent SMS flipped back to `pending`: sent and **charged again** | vulnerable / **vulnerable** |
+| M14 | **Teacher promotes self to school admin** (one REST call) | vulnerable / **vulnerable** |
+| M15 | Admin reads every school's wallet balance | vulnerable / ok |
+| K1 | Kiosk: 10 simultaneous check-outs → **4–9 paid SMS** for one child | vulnerable / **vulnerable** |
+| K2 | Class register: 6 simultaneous submits → **6 paid SMS** for one child | vulnerable / **vulnerable** |
+| T3 | Top-up limit was per server instance only | vulnerable / **vulnerable** |
+| M10, M13, K3, K4, T1, T2 | settings.balance write, anonymous SMS insert, device races/replays, teacher top-up, bad amounts | ok / ok |
+
+## Fixes
+
+1. **`supabase_migrations/06_money_lockdown.sql` (mandatory, idempotent)**:
+   - **Money functions are server-only.** Every function in `public`/`school` whose name contains wallet, credit, debit, balance, payment, topup, charge, refund, deduct, ledger or sms loses EXECUTE for PUBLIC/anon/authenticated and keeps it for `service_role`. Each one is listed in the migration output.
+   - **`public.wallets`, `public.transactions`:** RLS is on and users can read only their own school's rows. Clients can never write. This was optional in 04 and is now always applied.
+   - **`public.tenants`:** users can read only their own row. Clients can't write. The tenant code decides where a top-up's money is collected.
+   - **`public.profiles`, `public.admin_profiles`:** users can read their own row only. `school_id`, `code` and role columns are server-only. Harmless profile columns stay editable by their owner.
+   - **`school.schools`, `school.notifications`, `school.staff_users`, `school.payment_intents`, `school.payment_events`:** there are no client writes. The app already wrote all of these through the server (service role), so no app feature changes.
+   - **`school.notifications.dedupe_key`** plus a UNIQUE `(school_id, dedupe_key)` index.
+2. **One attendance SMS per child, per direction, per local day.** This uses the new `lib/notifications/queue.ts`, which the kiosk, the class register and the device processor all go through. Simultaneous requests can no longer queue (and pay for) a second SMS, and two paths firing for the same child (device + register) send one SMS. Without migration 06 the code falls back to the old behaviour and logs a warning; it never breaks.
+3. **Durable top-up limit.** `topUpBalance` also counts the school's top-ups from the last 10 minutes in `school.payment_intents`, which every server instance shares.
+4. The demo-only "simulate SMS sent" action now uses the server client, because clients can no longer write the SMS queue.
+
+## Results
+
+| Setup | Attacks | Legit flows broken |
+|---|---|---|
+| Before, optional step skipped | **17 / 23** | 0 |
+| Before, optional step done | **11 / 23** | 0 |
+| **After (code + 06), optional step skipped** | **0 / 23** | **0 / 9** |
+| Code only, 06 not run | 10 / 23 (all database-side) | 0 |
+
+All "secure" REST results were confirmed to be real `42501 permission denied` errors, not unrelated failures.
+
+Regression after this round:
+
+- payments 0/20 (12 legit OK);
+- 05 not run: 4/20, same as before;
+- REST money attacks 0/8;
+- legit app flows 17/17;
+- app attacks 1/42 (the known device transition item);
+- device 0/15;
+- RLS 0/32;
+- genuine NaJiki-signed payment: HTTP 200, credited;
+- signed by NaJiki's own source: credited 3100 of 3100;
+- all dashboard pages render own-school data only;
+- `tsc` and `eslint` are clean.
+
+## Go-live steps (Part 6)
+
+1. Run **06** after 05 (back up first). Read the NOTICE list of server-only functions.
+2. **SMS Edge Function:** it must use the `service_role` key (Supabase gives it `SUPABASE_SERVICE_ROLE_KEY` automatically). After 06, a function using the anon key or a user token can no longer update `school.notifications` or call wallet/balance functions. Send one test SMS after the migration.
+3. Run the two verification queries at the bottom of 06. Both must return no rows.
+4. If NaJiki shares this Supabase database: it uses Prisma over a direct Postgres connection, so 06 doesn't affect it.
+
+**Known limits (not blockers):**
+- Without migration 05, the legacy `credit_wallet` path may not carry an old `settings.balance` into a newly created wallet. Running 05, which is already required, avoids that path.
+- A child can still get one check-in and one check-out SMS per day; that is intended.

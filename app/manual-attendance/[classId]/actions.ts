@@ -3,6 +3,7 @@
 import { checkSchoolAdmin } from '@/lib/auth-guard';
 import { consumeRateLimit, resetRateLimit } from '@/lib/security/rate-limit';
 import { createAdminClient } from '@/utils/supabase/admin';
+import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
 import { 
   isWithinAttendanceSmsWindow, 
   getAttendanceStatusForCheckIn,
@@ -498,6 +499,7 @@ export async function submitClassAttendance(
               hour12: true 
             });
 
+            const smsRows: Record<string, unknown>[] = [];
             for (const notif of notificationsToSend) {
               let smsMessageText = `Dear Parent,`;
               if (attendanceType === 'check_in') {
@@ -508,21 +510,21 @@ export async function submitClassAttendance(
                 smsMessageText += ` your child ${notif.studentName} checked OUT of school and is heading home at ${timestampStr}.`;
               }
 
-              // Queue the notification in school.notifications
-              await adminClient
-                .from('notifications')
-                .insert({
-                  school_id: cls.school_id,
-                  recipient_type: 'parent',
-                  recipient_id: notif.parentId,
-                  recipient_phone_snapshot: notif.phone,
-                  channel: 'sms',
-                  notification_type: 'attendance',
-                  status: 'pending',
-                  message: smsMessageText
-                });
+              smsRows.push({
+                // One SMS per child, direction and day (double submissions can't double-charge)
+                dedupe_key: attendanceSmsKey(notif.studentId, attendanceType, now),
+                school_id: cls.school_id,
+                recipient_type: 'parent',
+                recipient_id: notif.parentId,
+                recipient_phone_snapshot: notif.phone,
+                channel: 'sms',
+                notification_type: 'attendance',
+                status: 'pending',
+                message: smsMessageText
+              });
             }
-            console.log(`[Class Manual Attendance] Queued ${notificationsToSend.length} SMS notifications for ${attendanceType} at ${timestampStr} EAT`);
+            const { queued, duplicates } = await queueNotifications(adminClient, smsRows);
+            console.log(`[Class Manual Attendance] Queued ${queued} SMS notifications for ${attendanceType} at ${timestampStr} EAT${duplicates ? ` (${duplicates} already queued today, skipped)` : ''}`);
           }
         }
       }

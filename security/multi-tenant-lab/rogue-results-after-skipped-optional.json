@@ -1,0 +1,122 @@
+{
+ "vulnerable": 0,
+ "total": 23,
+ "broken": [],
+ "results": [
+  {
+   "name": "M1 anonymous visitor sets any school wallet balance",
+   "vulnerable": false,
+   "detail": "B 1000 -> 1000"
+  },
+  {
+   "name": "M2 school admin sets own wallet balance",
+   "vulnerable": false,
+   "detail": "A 1000 -> 1000"
+  },
+  {
+   "name": "M3 anonymous visitor mints credit via public.credit_wallet RPC",
+   "vulnerable": false,
+   "detail": "400 B delta=0"
+  },
+  {
+   "name": "M4 teacher mints credit via credit_wallet RPC",
+   "vulnerable": false,
+   "detail": "400 A delta=0"
+  },
+  {
+   "name": "M16 anonymous visitor reads the money ledger",
+   "vulnerable": false,
+   "detail": "400 rows=0"
+  },
+  {
+   "name": "M5 anonymous visitor inserts fake ledger credit",
+   "vulnerable": false,
+   "detail": "400"
+  },
+  {
+   "name": "M6 anonymous visitor erases the money ledger",
+   "vulnerable": false,
+   "detail": "400 ledger rows 0 -> 0"
+  },
+  {
+   "name": "M7 anonymous visitor rewrites school B's NaJiki tenant code (B's top-ups paid to attacker tenant)",
+   "vulnerable": false,
+   "detail": "codeB -> codeB"
+  },
+  {
+   "name": "M8 school A admin rewrites school B's tenant code",
+   "vulnerable": false,
+   "detail": "codeB -> codeB"
+  },
+  {
+   "name": "M9 admin rewrites own profile code/school (tenant-code & webhook school resolution)",
+   "vulnerable": false,
+   "detail": "400 {\"code\":null,\"school_id\":\"aaaaaaaa-0000-4000-8000-000000000001\"}"
+  },
+  {
+   "name": "M10 admin writes school.settings.balance (legacy balance seeds new wallets)",
+   "vulnerable": false,
+   "detail": "400 {\"balance\":1000}"
+  },
+  {
+   "name": "M11 teacher queues 50 arbitrary paid SMS (phishing at school cost)",
+   "vulnerable": false,
+   "detail": "400 queued=0"
+  },
+  {
+   "name": "M12 sent SMS flipped back to pending (re-sent and re-charged)",
+   "vulnerable": false,
+   "detail": "status=sent"
+  },
+  {
+   "name": "M13 anonymous visitor queues SMS for any school",
+   "vulnerable": false,
+   "detail": "400"
+  },
+  {
+   "name": "M14 teacher promotes self to school admin (then can top up / edit parents)",
+   "vulnerable": false,
+   "detail": "400 role=teacher"
+  },
+  {
+   "name": "M15 admin reads other schools' wallet balances",
+   "vulnerable": false,
+   "detail": "200 rows=1"
+  },
+  {
+   "name": "K1 kiosk: 10 simultaneous check-outs queue several paid SMS",
+   "vulnerable": false,
+   "detail": "SMS queued=1 (should be 1)"
+  },
+  {
+   "name": "K2 manual attendance: 6 simultaneous submissions queue several paid SMS",
+   "vulnerable": false,
+   "detail": "SMS queued=1 (should be 1)"
+  },
+  {
+   "name": "K3 device: 5 simultaneous uploads of a check-out queue several paid SMS",
+   "vulnerable": false,
+   "detail": "SMS queued=1 (should be 1)"
+  },
+  {
+   "name": "K4 device: replayed check-out later the same day queues another SMS",
+   "vulnerable": false,
+   "detail": "SMS now=1"
+  },
+  {
+   "name": "T1 teacher starts a mobile-money top-up",
+   "vulnerable": false,
+   "detail": "{\"error\":\"Forbidden: Admin access required\"}"
+  },
+  {
+   "name": "T2 malformed top-up amounts accepted",
+   "vulnerable": false,
+   "detail": "new intents=0"
+  },
+  {
+   "name": "T3 top-up limit only per server instance (1000 recent top-ups on other instances, still allowed)",
+   "vulnerable": false,
+   "detail": "{\"error\":\"Too many top-up attempts. Please wait 10 minute(s) and try again.\"}"
+  }
+ ]
+}

@@ -2,6 +2,7 @@
 
 import { createClient } from '@/utils/supabase/server';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
+import { createAdminClient } from '@/utils/supabase/admin';
 import { revalidatePath } from 'next/cache';
 
 /**
@@ -37,7 +38,9 @@ export async function processPendingNotificationsAction() {
       // Simulate real latency of outbound SMS providers (e.g. Africa's Talking or Twilio)
       await new Promise((resolve) => setTimeout(resolve, 300));
 
-      const { error: updateErr } = await supabase
+      // Clients can no longer write the SMS queue (migration 06): use the
+      // server client, still scoped to this admin's school.
+      const { error: updateErr } = await createAdminClient()
         .from('notifications')
         .update({
           status: 'sent',

@@ -6,6 +6,7 @@ export async function setupUsers() {
   await fetch(SHIM + '/__users', { method: 'POST', body: JSON.stringify({
     'adminA@lab.io': { id: 'aaaaaaaa-0000-4000-8000-0000000000a1', email: 'adminA@lab.io', password: 'Passw0rd!' },
     'adminB@lab.io': { id: 'bbbbbbbb-0000-4000-8000-0000000000a1', email: 'adminB@lab.io', password: 'Passw0rd!' },
+    'teacherA@lab.io': { id: 'aaaaaaaa-0000-4000-8000-0000000000a2', email: 'teacherA@lab.io', password: 'Passw0rd!' },
   }) });
 }
 export async function sessionCookie(email) {
