@@ -1,49 +1,32 @@
 'use server';
 
-import { createClient } from '@/utils/supabase/server';
+import { checkSchoolAdmin } from '@/lib/auth-guard';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { isWithinAttendanceSmsWindow, getEatTodayRange, getAttendanceStatusForCheckIn } from '@/lib/attendance-window';
 
 async function getAuthenticatedSchoolId() {
-  const supabase = await createClient();
-  const { data: { user }, error: authErr } = await supabase.auth.getUser();
-  if (authErr || !user) {
-    return { user: null, schoolId: null, error: 'Unauthorized. Please sign in to your school account.' };
+  // SECURITY: previously any authenticated Supabase user (including accounts
+  // created directly against GoTrue with the public anon key, without an
+  // admin profile) could drive the kiosk. Require a verified school admin.
+  const result = await checkSchoolAdmin();
+  if (!result.ok) {
+    return {
+      user: null,
+      schoolId: null,
+      error: result.reason === 'unauthenticated'
+        ? 'Unauthorized. Please sign in to your school account.'
+        : 'Access denied. School admin session required.',
+    };
   }
-
-  // Try auth_school_id RPC
-  try {
-    const { data: rpcSchoolId } = await supabase.rpc('auth_school_id');
-    if (rpcSchoolId) {
-      return { user, schoolId: rpcSchoolId, error: null };
-    }
-  } catch (err) {
-    console.warn('auth_school_id check failed in kiosk action:', err);
-  }
-
-  // Try staff_users linked via person_id -> people -> school_id
-  try {
-    const { data: staffData } = await supabase
-      .from('staff_users')
-      .select('person_id, people(school_id)')
-      .eq('auth_user_id', user.id)
-      .maybeSingle();
-
-    const peopleObj = Array.isArray(staffData?.people) ? staffData.people[0] : staffData?.people;
-    const resolvedSchoolId = (peopleObj as any)?.school_id;
-    if (resolvedSchoolId) {
-      return { user, schoolId: resolvedSchoolId, error: null };
-    }
-  } catch (err) {
-    console.warn('Error resolving staff_users school context:', err);
-  }
-
-  return { user, schoolId: null, error: 'No school tenant context found for this account.' };
+  return { user: result.user, schoolId: result.schoolId, error: null };
 }
 
 export async function submitClockInAction(deviceUserId: string) {
-  if (!deviceUserId) {
+  if (typeof deviceUserId !== 'string' || !deviceUserId.trim()) {
     return { error: 'Please enter your Enrollment ID.' };
+  }
+  if (deviceUserId.length > 32 || !/^[A-Za-z0-9_-]+$/.test(deviceUserId.trim())) {
+    return { error: 'Invalid Enrollment ID format.' };
   }
 
   const { user, schoolId, error: authError } = await getAuthenticatedSchoolId();
@@ -183,7 +166,7 @@ export async function submitClockInAction(deviceUserId: string) {
 
     if (logErr) {
       console.error('Failed to commit attendance fact:', logErr);
-      return { error: `Transmission failed: ${logErr.message}` };
+      return { error: 'Transmission failed. Please try again.' };
     }
 
     // -------------------------------------------------------------

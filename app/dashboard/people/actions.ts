@@ -5,6 +5,7 @@ import { createAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 import bcrypt from 'bcryptjs';
+import { generateTeacherPin, PIN_BCRYPT_ROUNDS } from '@/lib/security/pin';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
   // 1. Try auth_school_id RPC
@@ -181,36 +182,8 @@ export async function addPersonAction(formData: FormData) {
         params.p_phone = null;
       }
 
-      // Auto-generate a globally unique Teacher Attendance Passcode / PIN (alphanumeric, e.g. T7K9M2)
-      const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-      const { data: existingStaff } = await adminClient
-        .from('staff_users')
-        .select('pin_hash')
-        .not('pin_hash', 'is', null);
-
-      let isUnique = false;
-      let attempts = 0;
-      while (!isUnique && attempts < 50) {
-        attempts++;
-        let candidate = 'T';
-        for (let i = 0; i < 5; i++) {
-          candidate += chars.charAt(Math.floor(Math.random() * chars.length));
-        }
-
-        let collision = false;
-        if (existingStaff && existingStaff.length > 0) {
-          for (const su of existingStaff) {
-            if (su.pin_hash && bcrypt.compareSync(candidate, su.pin_hash)) {
-              collision = true;
-              break;
-            }
-          }
-        }
-        if (!collision) {
-          generatedTeacherPin = candidate;
-          isUnique = true;
-        }
-      }
+      // Auto-generate a Teacher Attendance Passcode / PIN (alphanumeric, e.g. T7K9M2) via CSPRNG
+      generatedTeacherPin = generateTeacherPin();
 
       params.p_pin = generatedTeacherPin;
       params.p_class_ids = classIds.length > 0 ? classIds : null;
@@ -311,8 +284,7 @@ export async function addPersonAction(formData: FormData) {
         }
 
         if (generatedTeacherPin) {
-          const salt = bcrypt.genSaltSync(6);
-          const pinHash = bcrypt.hashSync(generatedTeacherPin, salt);
+          const pinHash = await bcrypt.hash(generatedTeacherPin, PIN_BCRYPT_ROUNDS);
           try {
             await adminClient
               .from('staff_users')
@@ -389,55 +361,20 @@ export async function resetTeacherPinAction(personId: string) {
       return { error: 'Teacher record not found or access denied.' };
     }
 
-    // 2. Auto-generate a unique 6-character PIN (e.g. T7K9M2)
-    const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+    // 2. Generate a new 6-character PIN (e.g. T7K9M2) with a CSPRNG
+    const newPin = generateTeacherPin();
 
-    const { data: existingStaff } = await adminClient
-      .from('staff_users')
-      .select('pin_hash')
-      .not('pin_hash', 'is', null);
-
-    let isUnique = false;
-    let attempts = 0;
-    let newPin = '';
-
-    while (!isUnique && attempts < 50) {
-      attempts++;
-      let candidate = 'T';
-      for (let i = 0; i < 5; i++) {
-        candidate += chars.charAt(Math.floor(Math.random() * chars.length));
-      }
-
-      let collision = false;
-      if (existingStaff && existingStaff.length > 0) {
-        for (const su of existingStaff) {
-          if (su.pin_hash && bcrypt.compareSync(candidate, su.pin_hash)) {
-            collision = true;
-            break;
-          }
-        }
-      }
-      if (!collision) {
-        newPin = candidate;
-        isUnique = true;
-      }
-    }
-
-    if (!newPin) {
-      return { error: 'Failed to generate a unique PIN. Please try again.' };
-    }
-
-    // 3. Hash the new PIN using bcrypt with salt rounds = 6
-    const salt = bcrypt.genSaltSync(6);
-    const pinHash = bcrypt.hashSync(newPin, salt);
+    // 3. Hash the new PIN (async bcrypt — never block the event loop)
+    const pinHash = await bcrypt.hash(newPin, PIN_BCRYPT_ROUNDS);
 
     // 4. Update staff_users table for this teacher
     const { error: updateErr } = await adminClient
       .from('staff_users')
       .update({
         pin_hash: pinHash,
-        pin_failed_attempts: 0,
-        pin_locked_until: null,
+        // Must match the columns read by verifyTeacherPin, otherwise a reset never clears a lockout.
+        failed_attempts: 0,
+        locked_until: null,
       })
       .eq('person_id', personId);
 
@@ -483,17 +420,21 @@ export async function searchPeopleAction(params: {
     query = query.eq('is_active', false);
   }
 
-  if (params.searchTerm && params.searchTerm.trim() !== '') {
-    const st = params.searchTerm.trim();
+  if (typeof params.searchTerm === 'string' && params.searchTerm.trim() !== '') {
+    // Strip PostgREST filter metacharacters so user input can't inject extra
+    // conditions into the .or() expression (e.g. "x,school_id.neq.null").
+    const st = params.searchTerm.trim().slice(0, 100).replace(/[,()*%\\:."'`]/g, ' ').trim();
     // ilike on full_name, phone, device_user_id
-    query = query.or(`full_name.ilike.%${st}%,phone.ilike.%${st}%,device_user_id.ilike.%${st}%`);
+    if (st) {
+      query = query.or(`full_name.ilike.%${st}%,phone.ilike.%${st}%,device_user_id.ilike.%${st}%`);
+    }
   }
 
   // order by full name
   query = query.order('full_name', { ascending: true });
 
-  const page = params.page || 1;
-  const limit = params.limit || 50;
+  const page = Number.isInteger(params.page) && (params.page as number) > 0 ? (params.page as number) : 1;
+  const limit = Number.isInteger(params.limit) && (params.limit as number) > 0 ? Math.min(params.limit as number, 200) : 50;
   const from = (page - 1) * limit;
   const to = from + limit - 1;
 

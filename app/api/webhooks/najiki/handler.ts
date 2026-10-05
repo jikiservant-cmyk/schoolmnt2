@@ -31,7 +31,10 @@ export async function handleNajikiWebhook(req: NextRequest) {
     // 1. Verify Authorization Bearer token
     if (authHeader) {
       const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-      if (token === expectedSecret) {
+      // Constant-time comparison (plain === leaks the secret via response timing).
+      const a = crypto.createHash('sha256').update(token).digest();
+      const b = crypto.createHash('sha256').update(expectedSecret).digest();
+      if (crypto.timingSafeEqual(a, b)) {
         isAuthorized = true;
       }
     }
@@ -41,7 +44,9 @@ export async function handleNajikiWebhook(req: NextRequest) {
       try {
         const hmac = crypto.createHmac('sha256', expectedSecret);
         const digest = hmac.update(rawBody).digest('hex');
-        if (crypto.timingSafeEqual(Buffer.from(signatureHeader), Buffer.from(digest))) {
+        const provided = Buffer.from(signatureHeader.replace(/^sha256=/i, '').trim().toLowerCase(), 'utf8');
+        const expected = Buffer.from(digest, 'utf8');
+        if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) {
           isAuthorized = true;
         }
       } catch (sigErr) {

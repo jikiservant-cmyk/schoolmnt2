@@ -36,20 +36,25 @@ async function resolveDevice(req: NextRequest, rawBody?: string) {
   }
 
   const cleanSn = sn.trim().toUpperCase();
+  // Serial numbers are alphanumeric; reject anything else (previously `.ilike()`
+  // let "%" / "_" act as wildcards to probe for registered devices).
+  if (!/^[A-Z0-9._-]{1,64}$/.test(cleanSn)) {
+    return { error: 'Invalid device serial number', status: 400 };
+  }
   const supabase = createAdminClient();
 
   const { data: rawDevice, error } = await supabase
     .from('devices')
     .select('*')
-    .ilike('serial_number', cleanSn)
+    .eq('serial_number', cleanSn)
     .maybeSingle();
 
   if (error || !rawDevice) {
-    return { error: `Device with serial number "${cleanSn}" is not registered in the system`, status: 404 };
+    return { error: 'Invalid device credentials', status: 401 };
   }
 
   if (!rawDevice.is_active) {
-    return { error: `Device "${cleanSn}" is currently marked inactive in the school portal`, status: 403 };
+    return { error: 'Invalid device credentials', status: 401 };
   }
 
   const device = parseDeviceMetadata(rawDevice);

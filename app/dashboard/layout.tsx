@@ -1,17 +1,18 @@
-import { createClient } from '@/utils/supabase/server';
+import { requireSchoolAdminPage } from '@/lib/auth-guard';
 import Sidebar from './Sidebar';
 import Topbar from './Topbar';
 
 export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
-  const supabase = await createClient();
-  
+  // SECURITY: middleware only proves a Supabase session exists. Enforce the
+  // school_admin role + tenant here so non-admin sessions never render the dashboard.
+  const { supabase, user } = await requireSchoolAdminPage();
+
   // Fetch current logged-in user and administrative session
   let adminName = 'Admin';
   let schoolName = '';
   let initials = 'AD';
 
   try {
-    const { data: { user } } = await supabase.auth.getUser();
     if (user) {
       const { data: staffData } = await supabase
         .from('staff_users')

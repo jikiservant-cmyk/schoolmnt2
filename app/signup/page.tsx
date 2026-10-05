@@ -10,22 +10,26 @@ export default function SignupPage() {
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError(null);
+    setInfo(null);
     const formData = new FormData(e.currentTarget);
     startTransition(async () => {
       try {
         const result = await signupAction(formData);
-        if (result && result.error) {
+        if (result && 'error' in result && result.error) {
           setError(result.error);
+        } else if (result && 'info' in result && result.info) {
+          setInfo(result.info);
         }
       } catch (err: any) {
         if (err?.message?.includes('NEXT_REDIRECT')) {
           throw err;
         }
-        setError(err?.message || 'An unexpected error occurred during registration. Please try again.');
+        setError('An unexpected error occurred during registration. Please try again.');
       }
     });
   };
@@ -48,6 +52,12 @@ export default function SignupPage() {
         {error && (
           <div className="p-3 mb-4 text-xs font-mono text-meridian-loss bg-meridian-loss/15 rounded-lg border border-meridian-loss/30 animate-fade-in">
             {error}
+          </div>
+        )}
+
+        {info && (
+          <div className="p-3 mb-4 text-xs font-mono text-meridian-text-1 bg-meridian-gold/15 rounded-lg border border-meridian-gold/30 animate-fade-in">
+            {info}
           </div>
         )}
 
@@ -89,7 +99,9 @@ export default function SignupPage() {
               name="password"
               type="password"
               required
-              minLength={6}
+              minLength={8}
+              maxLength={72}
+              autoComplete="new-password"
               disabled={isPending}
               className="w-full px-3 py-2.5 bg-meridian-panel-raised border border-meridian-border text-sm rounded-lg focus:outline-none focus:ring-1 focus:ring-meridian-gold focus:border-meridian-gold transition-colors disabled:opacity-50 text-meridian-text-1"
             />

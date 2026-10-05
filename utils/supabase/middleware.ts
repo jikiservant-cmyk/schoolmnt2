@@ -1,5 +1,6 @@
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
+import { hardenAuthCookieOptions } from './cookie-options'
 
 export async function updateSession(request: NextRequest) {
   let supabaseResponse = NextResponse.next({
@@ -35,12 +36,7 @@ export async function updateSession(request: NextRequest) {
             request,
           })
           cookiesToSet.forEach(({ name, value, options }) =>
-            supabaseResponse.cookies.set(name, value, {
-              ...options,
-              path: '/',
-              sameSite: 'none',
-              secure: true,
-            })
+            supabaseResponse.cookies.set(name, value, hardenAuthCookieOptions(options))
           )
         },
       },
