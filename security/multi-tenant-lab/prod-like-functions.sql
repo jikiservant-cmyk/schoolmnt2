@@ -13,3 +13,13 @@ BEGIN
   INSERT INTO public.transactions(wallet_id, amount, type, reference, status) VALUES (w, p_amount, 'credit', p_tx_ref, 'completed');
   RETURN nb;
 END $$;
+
+-- Signup provisioning (the app calls it with the service role after signUp).
+CREATE OR REPLACE FUNCTION public.rp_create_school_from_admin_profile(p_admin_profile_id uuid)
+RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, school AS $$
+DECLARE s uuid := gen_random_uuid();
+BEGIN
+  INSERT INTO school.schools(id, name, settings) VALUES (s, 'School of ' || p_admin_profile_id, '{}'::jsonb);
+  INSERT INTO public.tenants(id, code, name) VALUES (s, 'sch-' || left(s::text, 8), 'School of ' || p_admin_profile_id);
+  RETURN s;
+END $$;

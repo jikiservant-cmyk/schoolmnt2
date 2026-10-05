@@ -164,7 +164,7 @@ if (!lost) {
 }
 
 // P9: double-click on "Top up" for a school without a wallet -> duplicate wallets
-await q('DELETE FROM public.wallets WHERE tenant_id=$1 OR school_id=$1', [A.school]);
+await q('UPDATE public.wallets SET balance=0 WHERE tenant_id=$1 OR school_id=$1', [A.school]); await q('DELETE FROM public.wallets WHERE tenant_id=$1 OR school_id=$1', [A.school]);
 await Promise.all(Array.from({ length: 5 }, () => act('topUpBalance', [500, '0772123456'])));
 const nW = await wallets(A.school);
 rec('P9 concurrent top-up clicks create duplicate wallets', nW > 1, 'wallets=' + nW);

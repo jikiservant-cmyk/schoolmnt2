@@ -7,7 +7,7 @@ import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { getOwnedPerson } from '@/lib/tenant';
-import { loadSchoolWallet, isMissingTable } from '@/lib/payments/wallet';
+import { loadSchoolWallet, isMissingTable, legacyBalanceUsable } from '@/lib/payments/wallet';
 import { consumeRateLimit } from '@/lib/security/rate-limit';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
@@ -135,6 +135,10 @@ export async function getAttendanceData(dateFilterStr?: string) {
       if (wallet && wallet.balance !== null && wallet.balance !== undefined) {
         const curSettings = school.settings || {};
         school.settings = { ...curSettings, balance: Number(wallet.balance) };
+      } else if (!(await legacyBalanceUsable(createAdminClient(), school.id))) {
+        // No wallet row, but the school was credited before: the legacy
+        // settings.balance is a stale mirror, never show it as spendable.
+        school.settings = { ...(school.settings || {}), balance: 0 };
       }
     } catch (e) {
       console.warn('Notice loading balance from public.wallets:', e);
@@ -228,7 +232,9 @@ export async function getSchoolBalance() {
       .eq('id', schoolId)
       .maybeSingle();
 
-    const settingsBalance = schoolRecord?.settings?.balance !== undefined ? Number(schoolRecord.settings.balance) : null;
+    const settingsBalance = walletBalance === null && schoolRecord?.settings?.balance !== undefined
+      && (await legacyBalanceUsable(createAdminClient(), schoolId))
+      ? Number(schoolRecord.settings.balance) : null;
 
     const resolvedBalance = walletBalance !== null ? walletBalance : (settingsBalance !== null ? settingsBalance : 0);
 
@@ -428,7 +434,10 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   if (!intentErr) {
     intentRecorded = true;
   } else if (isMissingTable(intentErr)) {
-    console.warn('[NaJiki STK Push] school.payment_intents missing: run supabase_migrations/05_sms_payment_integrity.sql.');
+    // FAIL CLOSED: without migration 05 a paid top-up cannot be matched and
+    // credited safely, so don't take the parent's / school's money at all.
+    console.error('[NaJiki STK Push] school.payment_intents missing: top-ups refused. Run supabase_migrations/05_sms_payment_integrity.sql.');
+    return { error: 'Top-ups are temporarily unavailable. Please contact support.' };
   } else {
     console.error('[NaJiki STK Push] Could not record payment intent:', intentErr.message);
     return { error: 'Could not start the payment. Please try again.' };

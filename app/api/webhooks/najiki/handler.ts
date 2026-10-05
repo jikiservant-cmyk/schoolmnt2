@@ -282,8 +282,12 @@ async function handlePayment(eventData: Json, cls: ReturnType<typeof classifyPay
 
   if (error) {
     if (isMissingFunction(error)) {
-      console.warn('[NaJiki Webhook] Migration 05 (apply_payment) not installed: using the legacy credit path. Run supabase_migrations/05_sms_payment_integrity.sql.');
-      return legacyCredit({ refs, providerRef, amount, currency, claimedSchool });
+      // FAIL CLOSED. The old fallback credited without intent matching
+      // (pentest: never-initiated payments, overpay, double credit and
+      // wrong-school credit all succeeded). 503 makes NaJiki retry (up to
+      // ~2 days), so nothing is lost while migration 05 gets installed.
+      console.error('[NaJiki Webhook] Migration 05 (school.apply_payment) is NOT installed: payment NOT credited, NaJiki will retry. Run supabase_migrations/05_sms_payment_integrity.sql now.');
+      return NextResponse.json({ error: 'Payments temporarily unavailable, please retry' }, { status: 503 });
     }
     console.error('[NaJiki Webhook] apply_payment failed, asking NaJiki to retry:', error.message);
     return NextResponse.json({ error: 'Could not record payment, please retry' }, { status: 500 });
@@ -302,97 +306,6 @@ async function handlePayment(eventData: Json, cls: ReturnType<typeof classifyPay
   // recorded in school.payment_events for manual reconciliation, NOT credited.
   console.warn(`[NaJiki Webhook] Payment ${providerRef || refs[0]} NOT credited (${outcome}); held in school.payment_events for review.`);
   return NextResponse.json({ received: true, credited: false, outcome }, { status: 202 });
-}
-
-/**
- * Used only until migration 05 is installed. Weaker than apply_payment() (no
- * intent matching), but: never acknowledges a payment it failed to record,
- * only treats a unique-violation as "already processed", and updates the
- * balance with compare-and-swap so concurrent payments don't overwrite each other.
- */
-// Legacy path: process credits one at a time inside this server process, so
-// simultaneous duplicate webhooks can't both pass the "already processed?" check.
-// (Across several server instances only migration 05 makes this airtight.)
-let legacyQueue: Promise<unknown> = Promise.resolve();
-function legacyCredit(p: { refs: string[]; providerRef: string | null; amount: number; currency: string; claimedSchool: string | null }) {
-  const run = legacyQueue.then(() => legacyCreditNow(p));
-  legacyQueue = run.catch(() => undefined);
-  return run;
-}
-
-async function legacyCreditNow(p: { refs: string[]; providerRef: string | null; amount: number; currency: string; claimedSchool: string | null }) {
-  const { amount, currency, claimedSchool } = p;
-  const txRef = (p.providerRef || p.refs[0] || '').slice(0, 200);
-  if (currency !== 'UGX') {
-    console.warn(`[NaJiki Webhook] Non-UGX payment (${currency}) ${txRef} not credited.`);
-    return NextResponse.json({ received: true, credited: false, outcome: 'currency_mismatch' }, { status: 202 });
-  }
-  if (!claimedSchool) {
-    return NextResponse.json({ error: 'Missing school identifier' }, { status: 400 });
-  }
-  const publicAdmin = createPublicAdminClient();
-
-  const { data: existingTx, error: exErr } = await publicAdmin.from('transactions').select('id').eq('reference', txRef).limit(1);
-  if (exErr) throw new Error(`idempotency lookup failed: ${exErr.message}`);
-  if (existingTx && existingTx.length > 0) {
-    return NextResponse.json({ success: true, message: 'Transaction already processed' }, { status: 200 });
-  }
-
-  // Older deployments may have a public.credit_wallet RPC: keep using it if present.
-  const { error: rpcError } = await publicAdmin.rpc('credit_wallet', { p_school_id: claimedSchool, p_amount: amount, p_tx_ref: txRef });
-  if (!rpcError) {
-    return NextResponse.json({ success: true, credited: amount, reference: txRef }, { status: 200 });
-  }
-  if (!isMissingFunction(rpcError)) {
-    throw new Error(`credit_wallet failed: ${rpcError.message}`);
-  }
-
-  let wallet = await loadSchoolWallet(publicAdmin, claimedSchool);
-  if (!wallet) {
-    const { data: school } = await createAdminClient().from('schools').select('settings').eq('id', claimedSchool).maybeSingle();
-    const legacyBal = Number(school?.settings?.balance);
-    const { data: created, error: wErr } = await publicAdmin.from('wallets')
-      .insert({ id: crypto.randomUUID(), tenant_id: claimedSchool, school_id: claimedSchool, balance: Number.isFinite(legacyBal) && legacyBal > 0 ? legacyBal : 0, currency: 'UGX' })
-      .select('id, balance, tenant_id, school_id').single();
-    if (wErr) throw new Error(`wallet create failed: ${wErr.message}`);
-    wallet = created;
-  }
-  const walletId = wallet!.id;
-
-  // Record the payment first: the reference can only be used once.
-  const { error: tErr } = await publicAdmin.from('transactions').insert({
-    wallet_id: walletId, amount, type: 'credit', reference: txRef, status: 'completed',
-    description: `NaJiki Mobile Money Top-up (+${amount.toLocaleString()} UGX)`,
-  });
-  if (tErr) {
-    if (tErr.code === '23505') {
-      return NextResponse.json({ success: true, message: 'Transaction already processed' }, { status: 200 });
-    }
-    throw new Error(`transaction insert failed: ${tErr.message}`);
-  }
-
-  // Compare-and-swap balance update.
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const { data: cur, error: rErr } = await publicAdmin.from('wallets').select('balance').eq('id', walletId).single();
-    if (rErr) break;
-    const oldBal = cur.balance;
-    const newBal = Number(oldBal || 0) + amount;
-    let upd = publicAdmin.from('wallets').update({ balance: newBal }).eq('id', walletId);
-    upd = oldBal === null ? upd.is('balance', null) : upd.eq('balance', oldBal);
-    const { data: done, error: uErr } = await upd.select('id');
-    if (uErr) break;
-    if (done && done.length === 1) {
-      const { data: school } = await createAdminClient().from('schools').select('settings').eq('id', claimedSchool).maybeSingle();
-      if (school) {
-        await createAdminClient().from('schools').update({ settings: { ...(school.settings || {}), balance: newBal } }).eq('id', claimedSchool);
-      }
-      console.log(`[NaJiki Webhook] Credited ${amount} UGX to school ${claimedSchool} (legacy path), ref ${txRef}. New balance ${newBal}.`);
-      return NextResponse.json({ success: true, credited: amount, reference: txRef }, { status: 200 });
-    }
-  }
-  // Couldn't apply the balance: undo the ledger row so NaJiki's retry can credit it.
-  await publicAdmin.from('transactions').delete().eq('reference', txRef).eq('wallet_id', walletId);
-  throw new Error('balance update failed after retries');
 }
 
 /**

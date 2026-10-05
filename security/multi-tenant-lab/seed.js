@@ -55,6 +55,7 @@ if (require.main === module) (async () => {
     await c.query(fs.readFileSync(mig + '04_rls_tenant_isolation.sql', 'utf8'));
     if (process.env.MIG05 !== '0') await c.query(fs.readFileSync(mig + '05_sms_payment_integrity.sql', 'utf8'));
     if (process.env.MIG06 !== '0' && fs.existsSync(mig + '06_money_lockdown.sql')) await c.query(fs.readFileSync(mig + '06_money_lockdown.sql', 'utf8'));
+    if (process.env.MIG05 !== '0' && process.env.MIG07 !== '0' && fs.existsSync(mig + '07_payment_hardening.sql')) await c.query(fs.readFileSync(mig + '07_payment_hardening.sql', 'utf8'));
     console.log('RLS migrations applied');
   }
   console.log('seeded');

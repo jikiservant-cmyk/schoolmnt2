@@ -54,3 +54,21 @@ export function isMissingFunction(err: { code?: string } | null | undefined): bo
 export function isMissingTable(err: { code?: string } | null | undefined): boolean {
   return !!err && (err.code === 'PGRST205' || err.code === '42P01');
 }
+
+/**
+ * May the legacy school.schools.settings.balance still be shown / carried over?
+ * Only for a school that was never credited through apply_payment (same rule
+ * as migration 07): after the first credit settings.balance is a stale mirror
+ * that SMS spending never lowers. Errors / missing table (no migration 05):
+ * keep the old behaviour.
+ */
+export async function legacyBalanceUsable(schoolAdmin: any, schoolId: string): Promise<boolean> {
+  const { data, error } = await schoolAdmin
+    .from('payment_events')
+    .select('id')
+    .eq('school_id', schoolId)
+    .eq('outcome', 'credited')
+    .limit(1);
+  if (error) return true;
+  return !data || data.length === 0;
+}

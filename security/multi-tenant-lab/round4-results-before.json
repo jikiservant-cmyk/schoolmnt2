@@ -1,0 +1,34 @@
+{
+ "vulnerable": 4,
+ "total": 5,
+ "broken": [
+  "wallet still shows its money after the refused delete"
+ ],
+ "results": [
+  {
+   "name": "R1 anonymous visitor runs signup provisioning for any profile (creates schools + NaJiki tenants)",
+   "vulnerable": true,
+   "detail": "200 \"676a1181-a8fb-4efb-9d4d-dcbd6bf01146\""
+  },
+  {
+   "name": "R2 teacher runs signup provisioning",
+   "vulnerable": true,
+   "detail": "200 \"95ff4074-15da-4367-b5f8-622fe9c55a60\""
+  },
+  {
+   "name": "R3 stale legacy settings.balance re-minted after wallet row deleted",
+   "vulnerable": true,
+   "detail": "stale settings.balance=101000, wallet after 500 top-up=101500"
+  },
+  {
+   "name": "R5 wallet still holding money can be deleted",
+   "vulnerable": true,
+   "detail": "deleted; balance now 0"
+  },
+  {
+   "name": "R4 anonymous role executes school-schema functions",
+   "vulnerable": false,
+   "detail": "42501 permission denied for function auth_school_id"
+  }
+ ]
+}

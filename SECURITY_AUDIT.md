@@ -478,3 +478,60 @@ Regression after this round:
 **Known limits (not blockers):**
 - Without migration 05, the legacy `credit_wallet` path may not carry an old `settings.balance` into a newly created wallet. Running 05, which is already required, avoids that path.
 - A child can still get one check-in and one check-out SMS per day; that is intended.
+
+# Part 7: Money round 4: provisioning, stale balances, fail-closed
+
+## Findings (all fixed)
+
+| # | Attack / bug | Before | After |
+|---|---|---|---|
+| R1 | Anonymous visitor (public anon key) calls `rpc/rp_create_school_from_admin_profile` for **any profile id**, creating schools and NaJiki tenants at will. The signup code calls it with the service key, but Supabase lets PUBLIC execute every new function. | vulnerable | 42501 |
+| R2 | A teacher calls the same provisioning function | vulnerable | 42501 |
+| R3 | **Stale balance re-minted.** After the first credit, `settings.balance` is only a copy that SMS spending never lowers. If the wallet row is deleted (for example during duplicate cleanup), the next top-up re-created the wallet from that copy. Lab: the school spent 100,000, then **got 101,500 back for a 500 top-up**. | vulnerable | wallet = 500 |
+| R5 | A wallet still holding money could be deleted, and the school's credit vanished | vulnerable | refused |
+| F1 | **Without migration 05**, the webhook fell back to an old crediting path that still had P1, P2, P3b and P7 (credit for a payment never started, overpay, double credit, wrong school). Top-ups also kept taking money that couldn't be matched safely. | 4 / 20 | 0 credited |
+| R4 | Anon key executes school-schema functions (already blocked by 04; now guaranteed for every school function) | ok | ok |
+
+Also checked and found sound:
+
+- A "failed" payment notice never touches the intent, so it can't later enable a double credit.
+- A delivery report can only set `sent` or `failed`, never `pending`.
+- Under-payments are credited as paid; over-payments are capped at the top-up amount.
+
+## Fixes
+
+1. **`supabase_migrations/07_payment_hardening.sql`** (run after 06, idempotent):
+   - `apply_payment` seeds a new wallet from the old `settings.balance` **only for a school it has never credited**. A school's genuine old balance still carries over on its first top-up (tested).
+   - Provisioning functions (`rp_*`, `*create_school*`, `*provision*`, `*onboard*`) are **server-only**.
+   - Every `school` schema function loses EXECUTE for PUBLIC and anon. Logged-in users keep what they had (`auth_school_id`, `fn_add_person`).
+   - A trigger **refuses to delete a wallet that still holds money**. The error tells you to move the balance first.
+2. **Fail closed without migration 05.**
+   - The webhook answers **503** (NaJiki retries for about 2 days) instead of using the weak legacy path, which is deleted.
+   - `topUpBalance` refuses to start a top-up, so no money is ever taken that can't be matched.
+3. The dashboard (`getSchoolBalance`, `getAttendanceData`) follows the same rule. It never shows the stale `settings.balance` as spendable for a school that has been credited before (`legacyBalanceUsable` in `lib/payments/wallet.ts`).
+
+## Results
+
+`security/multi-tenant-lab/round4-attack.mjs`: **before 4/5 vulnerable, after 0/5, legit 4/4.**
+
+Full regression:
+
+- Round 3 rogue suite 0/23 (9 legit OK);
+- payments 0/20 (12 legit OK);
+- REST money attacks 0/8;
+- legit app flows 17/17;
+- app attacks 1/42 (known device transition item);
+- device 0/15;
+- RLS 0/32;
+- genuine NaJiki payment credited;
+- NaJiki's own signer: credited;
+- all 5 dashboard pages show own-school data only;
+- `tsc` and `eslint` are clean.
+
+Without 05, the payments suite shows no credit at all: P1, P2, P3b and P7 are now blocked. P4 and P9b report "not credited", which is the intended fail-closed result; nothing is lost because NaJiki retries.
+
+## Go-live (Part 7)
+
+1. Run migrations in order: **05 → 06 → 07** (back up first). Read the NOTICE lists.
+2. If you ever merge duplicate wallets: move the balance to the wallet you keep, set the other to 0, then delete it.
+3. Test one signup after the migration (it uses the service key, so it must still work).
