@@ -4,7 +4,7 @@ import { setupUsers, sessionCookie, actionIds, callAction, SHIM } from './lib.mj
 import seedMod from './seed.js';
 const { IDS: { A } } = seedMod;
 const [BASE, APPDIR] = process.argv.slice(2);
-execSync('node seed.js'); await fetch(SHIM + '/__reload', { method: 'POST' }); await setupUsers();
+if (!process.env.SKIP_SEED) execSync('node seed.js'); await fetch(SHIM + '/__reload', { method: 'POST' }); await setupUsers();
 const ck = await sessionCookie('adminA@lab.io'); const ids = actionIds(APPDIR);
 const act = (n, args) => { const a = ids[n][0]; return callAction(BASE, '/' + a.page.replace(/^app\//,'').replace(/\/page$/,'').replace('[classId]', A.cls), a.id, args, ck); };
 const fd = (o) => { const f = new FormData(); for (const [k, v] of Object.entries(o)) f.append(k, v); return f; };

@@ -57,3 +57,10 @@ claims) / `service_role`, so RLS is really enforced.
 - App under RLS: `regress.mjs` 17/17, `render-check.mjs`, `attack.mjs` 1/42,
   `RLS=1 node device-attack.mjs … rls` 0/15
 - `orphan-check.mjs`: a user with no school opening `/dashboard/people`
+- `null-inherit-check.js` (after `RLS=1 node seed.js`): NULL-school rows inherit
+  the referenced school, and RLS still blocks writes into another school
+- `legacy-devlogs.mjs`: older DB without `device_logs.school_id`. Run `prep`,
+  restart the shim with `SHIM_NO_AUTOCOL=1` (it then rejects unknown columns
+  like PostgREST does), then run `punch <base>` and `SKIP_SEED=1 node regress.mjs …`
+- `rls-active.js`: confirms the RLS policies are installed. `regress.mjs`,
+  `attack.mjs` and `device-attack.mjs` reseed, so keep `RLS=1` exported.

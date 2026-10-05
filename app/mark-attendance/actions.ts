@@ -2,6 +2,7 @@
 
 import { checkSchoolAdmin } from '@/lib/auth-guard';
 import { createAdminClient } from '@/utils/supabase/admin';
+import { isMissingColumnError } from '@/lib/tenant';
 import { isWithinAttendanceSmsWindow, getEatTodayRange, getAttendanceStatusForCheckIn } from '@/lib/attendance-window';
 
 async function getAuthenticatedSchoolId() {
@@ -72,9 +73,7 @@ export async function submitClockInAction(deviceUserId: string) {
     // -------------------------------------------------------------
     // Step A — Log raw device event (audit trail) scoped to school
     // -------------------------------------------------------------
-    const { data: rawLog, error: rawLogErr } = await adminClient
-      .from('device_logs')
-      .insert({
+    const rawLogRow: Record<string, unknown> = {
         school_id: schoolId,
         device_id: deviceId,
         raw_serial_number: serialNumber,
@@ -90,9 +89,21 @@ export async function submitClockInAction(deviceUserId: string) {
         processed: person ? true : false,
         processed_at: person ? new Date().toISOString() : null,
         processing_error: person ? null : 'Enrollment ID not registered in this school'
-      })
+      };
+    let { data: rawLog, error: rawLogErr } = await adminClient
+      .from('device_logs')
+      .insert(rawLogRow)
       .select('id')
       .single();
+    if (rawLogErr && isMissingColumnError(rawLogErr, 'school_id')) {
+      // Older databases without device_logs.school_id: write without it.
+      const { school_id: _omit, ...legacyRow } = rawLogRow;
+      ({ data: rawLog, error: rawLogErr } = await adminClient
+        .from('device_logs')
+        .insert(legacyRow)
+        .select('id')
+        .single());
+    }
 
     if (rawLogErr) {
       console.error('Failed to write raw device log audit trail:', rawLogErr);

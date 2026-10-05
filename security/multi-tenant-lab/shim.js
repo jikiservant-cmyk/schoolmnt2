@@ -57,6 +57,11 @@ async function ensureColumns(schema, table, obj) {
   let changed = false;
   for (const k of Object.keys(obj)) {
     if (t.cols[k]) continue;
+    if (process.env.SHIM_NO_AUTOCOL) {
+      // Behave like real PostgREST for unknown columns.
+      console.error('[shim] unknown column', schema + '.' + table + '.' + k);
+      throw Object.assign(new Error(`Could not find the '${k}' column of '${table}' in the schema cache`), { code: 'PGRST204' });
+    }
     const v = obj[k];
     const type = v !== null && typeof v === 'object' ? 'jsonb' : typeof v === 'boolean' ? 'boolean' : typeof v === 'number' ? 'numeric' : 'text';
     await pool.query('ALTER TABLE ' + qi(schema) + '.' + qi(table) + ' ADD COLUMN IF NOT EXISTS ' + qi(k) + ' ' + type);
@@ -176,6 +181,20 @@ function resolveEmbed(schema, table, item) {
   }
   throw new Error('cannot resolve embed ' + item.name + ' on ' + table);
 }
+// Column list to fetch, like PostgREST: only what was asked for (+ join keys).
+// Matters under column-level privileges (e.g. hidden pin_hash).
+function colList(schema, table, sel, extra = []) {
+  const t = CAT[schema][table];
+  if (sel.some((i) => i.name === '*' && !i.sub)) return '*';
+  const cols = new Set(extra);
+  for (const item of sel) {
+    if (!item.sub) { if (t.cols[item.name]) cols.add(item.name); continue; }
+    const e = resolveEmbed(schema, table, item);
+    cols.add(e.kind === 'one' ? e.col : 'id');
+  }
+  const list = [...cols].filter((c) => t.cols[c]);
+  return list.length ? list.map(qi).join(',') : (t.cols.id ? qi('id') : '*');
+}
 async function project(schema, table, rows, sel) {
   const out = rows.map(() => ({}));
   for (const item of sel) {
@@ -190,13 +209,13 @@ async function project(schema, table, rows, sel) {
     const e = resolveEmbed(schema, table, item);
     if (e.kind === 'one') {
       const ids = [...new Set(rows.map((r) => r[e.col]).filter((x) => x !== null && x !== undefined))];
-      const ref = ids.length ? (await dbq('SELECT * FROM ' + qi(e.rs) + '.' + qi(e.rt) + ' WHERE id = ANY($1)', [ids])).rows : [];
+      const ref = ids.length ? (await dbq('SELECT ' + colList(e.rs, e.rt, item.sub, ['id']) + ' FROM ' + qi(e.rs) + '.' + qi(e.rt) + ' WHERE id = ANY($1)', [ids])).rows : [];
       const projected = await project(e.rs, e.rt, ref, item.sub);
       const byId = new Map(ref.map((r, i) => [String(r.id), projected[i]]));
       rows.forEach((r, i) => { out[i][item.alias] = r[e.col] == null ? null : byId.get(String(r[e.col])) || null; });
     } else {
       const ids = rows.map((r) => r.id);
-      const ref = ids.length ? (await dbq('SELECT * FROM ' + qi(e.rs) + '.' + qi(e.rt) + ' WHERE ' + qi(e.col) + ' = ANY($1)', [ids])).rows : [];
+      const ref = ids.length ? (await dbq('SELECT ' + colList(e.rs, e.rt, item.sub, [e.col]) + ' FROM ' + qi(e.rs) + '.' + qi(e.rt) + ' WHERE ' + qi(e.col) + ' = ANY($1)', [ids])).rows : [];
       const projected = await project(e.rs, e.rt, ref, item.sub);
       rows.forEach((r, i) => {
         out[i][item.alias] = ref.map((x, j) => (String(x[e.col]) === String(r.id) ? projected[j] : null)).filter(Boolean);
@@ -241,9 +260,10 @@ async function handleRest(req, res, url, body) {
   const fq = qi(schema) + '.' + qi(table);
 
   let rows;
+  const returning = () => (prefer.includes('return=representation') ? ' RETURNING ' + colList(schema, table, sel) : '');
   if (req.method === 'GET' || req.method === 'HEAD') {
     const w = buildWhere(sp, t.cols);
-    let sql = 'SELECT * FROM ' + fq + w.sql + buildOrder(sp.get('order'), t.cols);
+    let sql = 'SELECT ' + colList(schema, table, sel) + ' FROM ' + fq + w.sql + buildOrder(sp.get('order'), t.cols);
     const total = prefer.includes('count=') ? Number((await dbq('SELECT count(*) FROM ' + fq + w.sql, w.params)).rows[0].count) : null;
     if (sp.get('limit')) sql += ' LIMIT ' + Number(sp.get('limit'));
     if (sp.get('offset')) sql += ' OFFSET ' + Number(sp.get('offset'));
@@ -280,7 +300,7 @@ async function handleRest(req, res, url, body) {
     } else if (prefer.includes('resolution=ignore-duplicates')) {
       sql += ' ON CONFLICT DO NOTHING';
     }
-    rows = (await dbq(sql + ' RETURNING *', params)).rows;
+    rows = (await dbq(sql + returning(), params)).rows;
   } else if (req.method === 'PATCH') {
     const payload = body ? JSON.parse(body) : {};
     await ensureColumns(schema, table, payload);
@@ -293,10 +313,10 @@ async function handleRest(req, res, url, body) {
       return qi(k) + ' = $' + params.length;
     });
     if (!sets.length) return send(res, 204);
-    rows = (await dbq('UPDATE ' + fq + ' SET ' + sets.join(',') + w.sql + ' RETURNING *', params)).rows;
+    rows = (await dbq('UPDATE ' + fq + ' SET ' + sets.join(',') + w.sql + returning(), params)).rows;
   } else if (req.method === 'DELETE') {
     const w = buildWhere(sp, t.cols);
-    rows = (await dbq('DELETE FROM ' + fq + w.sql + ' RETURNING *', w.params)).rows;
+    rows = (await dbq('DELETE FROM ' + fq + w.sql + returning(), w.params)).rows;
   } else {
     return send(res, 405, {});
   }

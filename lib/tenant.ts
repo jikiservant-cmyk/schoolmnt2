@@ -92,3 +92,14 @@ export async function getOwnedDeviceBySerial(admin: Admin, schoolId: string, ser
   if (error || !data) return null;
   return data;
 }
+
+/**
+ * True when PostgREST/Postgres says `column` does not exist on the table.
+ * Used for optional columns (e.g. device_logs.school_id) that older databases
+ * may not have yet: callers retry the write without that column.
+ */
+export function isMissingColumnError(err: { code?: string; message?: string } | null | undefined, column: string): boolean {
+  if (!err) return false;
+  const code = err.code || '';
+  return (code === 'PGRST204' || code === '42703') && (err.message || '').includes(column);
+}

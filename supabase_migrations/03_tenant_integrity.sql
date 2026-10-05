@@ -65,6 +65,13 @@ BEGIN
     RETURN NEW;
   END IF;
 
+  -- Row written without a school (older code paths): inherit the school of the
+  -- row it points at, instead of rejecting it or leaving an orphan. RLS
+  -- WITH CHECK runs after BEFORE triggers, so this cannot cross tenants.
+  IF own_tenant IS NULL AND ref_tenant IS NOT NULL THEN
+    RETURN jsonb_populate_record(NEW, jsonb_build_object(own_col, ref_tenant));
+  END IF;
+
   IF own_tenant IS DISTINCT FROM ref_tenant THEN
     RAISE EXCEPTION 'cross-tenant reference rejected: %.% -> % belongs to a different school',
       TG_TABLE_NAME, fk_col, ref_table

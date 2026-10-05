@@ -186,6 +186,10 @@ there are no RLS migrations in the repo. So this round tests the worst case.
 - `rls-attack.mjs` (32 checks) logs in as school A's admin, then attacks
   school B with A's own token straight against REST. Before running, the
   service role gives B rows in every table, so "0 rows" really means blocked.
+- The shim selects only the requested columns (like PostgREST). That matters
+  with column privileges: an early run where it used `SELECT *` showed false
+  permission errors. Each RLS run also checks that the policies are really
+  installed (`rls-active.js`), because some suites reseed the database.
 - The "after" run deliberately adds a legacy wide-open policy
   (`USING (true)` on `people`) before migration 04. This proves the
   restrictive guard still holds when someone has left an old policy behind.
@@ -202,6 +206,7 @@ there are no RLS migrations in the repo. So this round tests the worst case.
 | R6 | `/dashboard/people`: a logged-in user **without a school** got every school's class names in the response (the query ran unscoped when `schoolId` was null). Verified with `orphan-check.mjs`: old code leaked, new code does not. | The page now uses `requireSchoolAdminPage()` and always filters by `school_id`. |
 | R7 | Some inserts didn't set `school_id` (the `staff_users` fallback insert in people actions, and kiosk `device_logs`). Under RLS these would fail, or leave orphan rows. | Both inserts now set `school_id`. |
 | R8 | `processPendingNotificationsAction` updated notifications by id only. | Now also filters `.eq('school_id', schoolId)`. **Note:** this function only *simulates* sending (it marks items sent with fake provider data). Wire it to the real SMS gateway before relying on it. |
+| R9 | The device processor wrote `device_logs` **without** `school_id`. With `03` installed, the trigger rejected every device audit row (a NULL school pointing at a real device's school), so the hardware audit trail silently stopped. Punches were still saved. | The processor now sets `school_id: device.school_id`. Trigger `03`: a row written with a NULL school now **inherits** the school of the row it points at, instead of being rejected. RLS `WITH CHECK` runs afterwards, so admin A can't use this to write into B (tested). Both `device_logs` writers retry without `school_id` if an older DB lacks that column (tested with the column dropped). |
 
 ## Results
 
@@ -214,6 +219,9 @@ there are no RLS migrations in the repo. So this round tests the worst case.
 | Pages under RLS (`render-check.mjs`): dashboard, people, classes, devices, attendance | show A's data, none of B's |
 | App-layer attack (`attack.mjs`) under RLS | 1 / 42 (the intentional transition-mode check, same as before) |
 | Device pentest (`device-attack.mjs`) under RLS | 0 / 15 |
+| NULL-school inheritance (`null-inherit-check.js`) | 3 / 3: service row inherits; A→B device rejected by RLS; A→own device gets A |
+| Older DB without `device_logs.school_id` (`legacy-devlogs.mjs`, shim rejecting unknown columns like PostgREST) | device punch and kiosk clock-in still logged |
+| Regress **without** RLS (DB that hasn't run `04` yet) | 17 / 17 OK |
 | `tsc` / `eslint` | clean / 0 errors |
 
 ## Deployment steps (Part 4)
@@ -233,3 +241,10 @@ there are no RLS migrations in the repo. So this round tests the worst case.
    attendance), then deploy to production.
 6. Rotate the anon key that leaked in git history (commit `2fb2bd6`). It is
    less dangerous after `04`, but should still be replaced.
+7. If you re-run `03` (it is idempotent), it picks up the improved
+   NULL-school handling for `device_logs` and the other linked tables.
+
+**Limit to know:** the policies treat every logged-in member of a school
+alike. Today only admins log in, and teachers use kiosk PINs. If teachers or
+parents ever get their own logins, the policies need a role check, so that a
+teacher can't edit `staff_users` in their own school.

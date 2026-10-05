@@ -1,6 +1,7 @@
 import { AttendanceEvent, DeviceRecord } from './types';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { isWithinAttendanceSmsWindow } from '@/lib/attendance-window';
+import { isMissingColumnError } from '@/lib/tenant';
 
 export interface ProcessEventsResult {
   totalReceived: number;
@@ -211,6 +212,7 @@ export async function processAttendanceEvents(
     // Device Log (raw hardware audit trail)
     deviceLogsToInsert.push({
       id: deviceLogId,
+      school_id: device.school_id,
       device_id: device.id,
       raw_serial_number: device.serial_number,
       device_user_id: item.event.person_external_id,
@@ -273,7 +275,13 @@ export async function processAttendanceEvents(
 
   // 5. Batch Inserts
   if (deviceLogsToInsert.length > 0) {
-    const { error: dlErr } = await supabase.from('device_logs').insert(deviceLogsToInsert);
+    let { error: dlErr } = await supabase.from('device_logs').insert(deviceLogsToInsert);
+    if (dlErr && isMissingColumnError(dlErr, 'school_id')) {
+      // Older databases without device_logs.school_id: write without it.
+      ({ error: dlErr } = await supabase
+        .from('device_logs')
+        .insert(deviceLogsToInsert.map(({ school_id: _omit, ...row }) => row)));
+    }
     if (dlErr) {
       // Audit trail only: don't block the attendance record, but don't hide the failure either.
       console.error(`[Device Processor] device_logs insert failed for ${device.serial_number}:`, dlErr.message);
