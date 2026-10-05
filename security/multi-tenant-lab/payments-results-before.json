@@ -1,0 +1,77 @@
+{
+ "vulnerable": 13,
+ "total": 14,
+ "broken": [],
+ "results": [
+  {
+   "name": "P1 credit for a payment that was never initiated",
+   "vulnerable": true,
+   "detail": "200 B delta=5000000"
+  },
+  {
+   "name": "P2 webhook amount larger than the top-up requested",
+   "vulnerable": true,
+   "detail": "200 delta=900000"
+  },
+  {
+   "name": "P3 concurrent duplicate webhooks credit more than once",
+   "vulnerable": true,
+   "detail": "delta=9000 (expected 3000)"
+  },
+  {
+   "name": "P3b one top-up credited twice (two provider notifications)",
+   "vulnerable": true,
+   "detail": "delta=4400 (expected 2200)"
+  },
+  {
+   "name": "P4 concurrent different payments lose money (lost update)",
+   "vulnerable": true,
+   "detail": "delta=204 (expected 1045)"
+  },
+  {
+   "name": "P5 failed payment credited because event name says success",
+   "vulnerable": true,
+   "detail": "200 delta=1200"
+  },
+  {
+   "name": "P6 non-UGX payment credited as UGX",
+   "vulnerable": true,
+   "detail": "200 delta=1300"
+  },
+  {
+   "name": "P7 A's payment credited to another school",
+   "vulnerable": true,
+   "detail": "200 B delta=1400"
+  },
+  {
+   "name": "P8 DB error swallowed: provider told OK, payment never credited",
+   "vulnerable": true,
+   "detail": "200 {\"success\":true,\"message\":\"Transaction already processed or failed to insert\"}"
+  },
+  {
+   "name": "P9 concurrent top-up clicks create duplicate wallets",
+   "vulnerable": true,
+   "detail": "wallets=5"
+  },
+  {
+   "name": "P9b paid top-up not visible on dashboard (wallet confusion)",
+   "vulnerable": true,
+   "detail": "dashboard delta=0 wallets=7"
+  },
+  {
+   "name": "P10 admin can mark queued SMS as delivered without sending",
+   "vulnerable": false,
+   "detail": "action not exposed in this build"
+  },
+  {
+   "name": "P11 3MB unauthenticated webhook body accepted for processing",
+   "vulnerable": true,
+   "detail": "status=401"
+  },
+  {
+   "name": "P12 outbound API key accepted as webhook secret",
+   "vulnerable": true,
+   "detail": "200 (webhook secret configured: no)"
+  }
+ ]
+}

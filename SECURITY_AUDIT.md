@@ -248,3 +248,82 @@ there are no RLS migrations in the repo. So this round tests the worst case.
 alike. Today only admins log in, and teachers use kiosk PINs. If teachers or
 parents ever get their own logins, the policies need a role check, so that a
 teacher can't edit `staff_users` in their own school.
+
+
+---
+
+# Part 5: SMS credit and payment integrity pentest
+
+**Scope:** money going in (mobile-money top-ups: `topUpBalance` server action, then the NaJiki payment webhook crediting `public.wallets` and `public.transactions`), and money going out (SMS queue, delivery reports, balance display). The goal: nobody can get SMS credit they did not pay for, and nobody loses credit they did pay for.
+
+## How it was tested
+
+Same lab as Parts 2–4 (real Postgres with migrations 03 + 04 + RLS, the real Next.js app, a Supabase shim). The shim also plays NaJiki: it accepts top-up requests and lets the attack script send signed webhooks. Script: `security/multi-tenant-lab/payments-attack.mjs`. It contains 14 attacks plus 7 legit flows that must keep working, and it checks wallet balances in the database after every step.
+
+## Findings (all fixed)
+
+| ID | Severity | What an attacker / bad luck could do | Fix |
+|---|---|---|---|
+| P1 | Critical | Anyone holding the webhook secret (or a buggy provider retry) could credit any school with a payment that was **never started** in the app (5,000,000 UGX credited in the test). | Every top-up now creates a `school.payment_intents` row **before** NaJiki is called. Webhooks only credit a matching intent. |
+| P2 | Critical | Webhook claims more money than the top-up asked for: the larger amount was credited. | The credit is `least(paid, requested)`. Mismatches are logged. |
+| P3 | Critical | The same webhook sent 5× at the same instant was credited 5×. A read-then-insert duplicate check let them all through. | All crediting happens inside one DB function, `school.apply_payment()`, under a transaction lock, plus a UNIQUE index on `transactions.reference`. |
+| P3b | High | One top-up credited twice when the provider sends two notifications with different transaction ids. | Dedup by the **intent**: once credited, an intent can never be credited again. |
+| P4 | High | Two different payments landing at once: one overwrote the other's balance (lost update). | Balance is updated atomically (`balance = balance + x`) inside the locked function. |
+| P5 | High | A failed or cancelled payment was credited because the event name contained "success". | Only explicit success statuses credit. FAILED / CANCELLED / PENDING never do, whatever the event name says. |
+| P6 | High | A payment in USD (or another currency) was credited as the same number of UGX. | A non-UGX payment is held for review, not credited. |
+| P7 | High | School A's payment could be credited to school B by editing the school id or tenant code in the payload. | The school comes from the intent (created by the logged-in admin), not from the payload. A conflicting school is held for review. |
+| P8 | High | A DB error while crediting was swallowed and NaJiki was told "OK", so a paid top-up was lost forever. | DB error → HTTP 500, so NaJiki retries. The retry credits exactly once (tested with an injected DB failure). |
+| P9 / P9b | Medium | Duplicate wallet rows: the dashboard showed a wallet that was not being credited, so a paid top-up looked lost. | One wallet-picking helper (`lib/payments/wallet.ts`) used everywhere. Wallet pre-creation race removed. Migration 05 warns about existing duplicates. |
+| P10 | Medium | The "process pending notifications" action marked SMS as delivered **without sending them** (a simulation left in production). | Disabled unless `SMS_SIMULATION_MODE=true`. **Never set this in production.** |
+| P11 | Medium | The unauthenticated webhook read a 3 MB body before checking the signature (memory/CPU abuse). | 64 KB cap before anything else (HTTP 413). |
+| P12 | Medium | The webhook accepted the **outbound API key** as its signing secret, so one leaked key gives both "send SMS" and "mint credit". | New dedicated `NAJIKI_WEBHOOK_SECRET`. The old key still works (with a log warning) only until the new one is set. |
+
+Also fixed while testing:
+- **SMS delivery reports never updated anything.** The code wrote to `public.notifications`, but the queue lives in `school.notifications`.
+- **Top-up references were guessable** (timestamp-based). They are now random UUIDs.
+- **Top-up rate limit:** at most 6 top-up requests per school per 10 minutes (`TOPUP_MAX_PER_10_MIN`). This stops someone spamming parents' phones with mobile-money PIN prompts.
+- **`NAJIKI_API_KEY` is now required:** no silent fallback.
+
+Every webhook outcome (credited, duplicate, unmatched, amount mismatch, wrong currency, wrong school, error) is written to `school.payment_events`, so money questions can be answered from data.
+
+## Results
+
+| Run | Attacks that worked | Legit flows broken |
+|---|---|---|
+| Before (original code) | **13 / 14** | 0 / 5 |
+| After: code + migration 05, webhook still signed with API key | 1 / 14 (P12 only: config) | 0 / 7 |
+| **After: code + migration 05 + `NAJIKI_WEBHOOK_SECRET`** | **0 / 14** (run 3× with the same result) | **0 / 7** |
+| Code only, migration 05 **not** run | 4 / 14 (P1, P2, P3b, P7) | 0 / 7 |
+
+**Migration 05 is required. Do not deploy the code without it.** Without 05 the app still works (it falls back to a serialized legacy credit path and logs a warning), but four critical/high holes stay open.
+
+Legit flows checked:
+- normal top-up credited once;
+- provider retry after a DB hiccup credits once;
+- a paid-less-than-requested amount credits what was paid;
+- dashboard balance matches the ledger;
+- a wrong signature is rejected;
+- a delivery report marks the SMS as sent;
+- `payment.failed` is acknowledged with 0 credited.
+
+Direct-database attack with a school admin's own login token (`pay-rls-check.mjs`): **0 / 8**. Can't read other schools' top-ups, forge or inflate intents, read or erase the payment log, call `apply_payment`, edit the wallet, or insert fake transactions. All 8 are refused with "permission denied". The server (service role) still works.
+
+Default rate limit: 6 top-ups allowed, the 7th and 8th refused with "Too many top-up attempts".
+
+Regression (everything from Parts 1–4, re-run with 05 applied): legit flows 17/17, app attacks 1/42 (the known device shared-secret transition item), device attacks 0/15, direct REST attacks 0/32, dashboard render check OK.
+
+## Go-live steps (Part 5), in order
+
+1. **Back up the database**, then run `supabase_migrations/05_sms_payment_integrity.sql` (after 03 and 04). It is safe to re-run.
+2. Read the migration output. If it prints a `WARNING` about duplicate transaction references or duplicate wallets, fix those rows (queries are in the comments at the bottom of 05) and re-run 05 so the UNIQUE index gets created.
+3. Generate a long random secret, set it as `NAJIKI_WEBHOOK_SECRET` in the app, and configure the **same** value as the webhook signing secret in the NaJiki dashboard. It must be different from `NAJIKI_API_KEY`.
+4. Make sure `NAJIKI_API_KEY` is set (top-ups now refuse without it).
+5. Leave `NAJIKI_REQUIRE_PAYMENT_INTENT` unset (the default, `true`). Top-ups started before this release have no intent and will be **held**, not lost. Credit them by hand after checking.
+6. Do **not** set `SMS_SIMULATION_MODE`.
+7. Do one real small top-up (e.g. 500 UGX) on day one. Check the balance went up exactly once and that `school.payment_events` shows `credited`.
+8. Daily for the first weeks: check `school.payment_events` for anything that is not `credited` / `duplicate` (the reconciliation query is in 05). Each such row is real money that needs a human decision.
+
+**Known limits (not blockers):**
+- The top-up rate limit is in memory, per server instance. With several instances the real limit is 6 × instances.
+- The kiosk can queue the same SMS twice on a fast double-tap.
+- SMS are queued without checking the school still has enough balance; sending is charged by NaJiki.

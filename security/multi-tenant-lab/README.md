@@ -64,3 +64,15 @@ claims) / `service_role`, so RLS is really enforced.
   like PostgREST does), then run `punch <base>` and `SKIP_SEED=1 node regress.mjs …`
 - `rls-active.js`: confirms the RLS policies are installed. `regress.mjs`,
   `attack.mjs` and `device-attack.mjs` reseed, so keep `RLS=1` exported.
+
+## Payments / SMS credit (Part 5)
+
+```bash
+export RLS=1 NAJIKI_WEBHOOK_SECRET=lab-dedicated-webhook-secret-123
+# app must be started with the same NAJIKI_WEBHOOK_SECRET (env.sh raises TOPUP_MAX_PER_10_MIN for the suite)
+node payments-attack.mjs http://127.0.0.1:3201 /path/to/schoolmnt2 after   # 14 attacks + 7 legit flows
+MIG05=0 node payments-attack.mjs ... code-only                              # same, without migration 05
+node pay-rls-check.mjs                                                      # direct REST money attacks (8)
+node topup-limit-check.mjs http://127.0.0.1:3201 /path/to/schoolmnt2       # app started WITHOUT TOPUP_MAX_PER_10_MIN
+```
+The shim also impersonates NaJiki (`/__najiki/payments`) and runs real Postgres functions for `/rest/v1/rpc/*`.

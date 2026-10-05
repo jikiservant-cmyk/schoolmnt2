@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 const { AsyncLocalStorage } = require('async_hooks');
 const als = new AsyncLocalStorage();
+const NAJIKI = [];
 const dbq = (sql, p) => (als.getStore() || pool).query(sql, p);
 
 const pool = new Pool({ host: '127.0.0.1', port: 54329, user: 'postgres', password: 'pw', database: 'mtlab' });
@@ -231,12 +232,22 @@ function pgError(res, e) {
   return send(res, status, { code, message: e.message, details: e.detail || null, hint: null });
 }
 
-async function handleRpc(req, res, name, args, jwt) {
+async function handleRpc(req, res, name, args, jwt, schema = 'public') {
   if (name === 'auth_school_id') {
     if (!jwt || !jwt.sub) return send(res, 200, null);
     const hasFn = (await pool.query("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='school' AND p.proname='auth_school_id'")).rowCount;
     const r = hasFn ? await dbq('SELECT school.auth_school_id() AS school_id') : await dbq('SELECT school_id FROM school.staff_users WHERE auth_user_id = $1 LIMIT 1', [jwt.sub]);
     return send(res, 200, r.rows[0] ? r.rows[0].school_id : null);
+  }
+  // Real functions that exist in the DB are called like PostgREST does
+  // (named arguments, run as the request's role).
+  const fn = (await pool.query("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1 AND p.proname=$2", [schema, name])).rows;
+  if (fn.length) {
+    const keys = Object.keys(args);
+    const vals = keys.map((k) => { const v = args[k]; return v !== null && typeof v === 'object' && !Array.isArray(v) ? JSON.stringify(v) : v; });
+    const sql = 'SELECT ' + qi(schema) + '.' + qi(name) + '(' + keys.map((k, i) => qi(k) + ' => $' + (i + 1)).join(', ') + ') AS r';
+    const r = await dbq(sql, vals);
+    return send(res, 200, r.rows[0] ? r.rows[0].r : null);
   }
   // Every other RPC (fn_add_person, credit_wallet, ...) is "not deployed", which makes the
   // app use its own direct-table fallbacks: the path where app-level checks matter most.
@@ -249,7 +260,7 @@ async function handleRest(req, res, url, body) {
   const schema = req.headers['accept-profile'] || req.headers['content-profile'] || 'public';
   const rest = url.pathname.slice('/rest/v1/'.length);
   if (rest.startsWith('rpc/')) LOG.push('RPC ' + rest.slice(4) + ' ' + body);
-  if (rest.startsWith('rpc/')) return handleRpc(req, res, rest.slice(4), body ? JSON.parse(body) : {}, jwt);
+  if (rest.startsWith('rpc/')) return handleRpc(req, res, rest.slice(4), body ? JSON.parse(body) : {}, jwt, schema);
   const table = rest;
   const t = CAT[schema] && CAT[schema][table];
   if (!t) return send(res, 404, { code: '42P01', message: 'relation "' + schema + '.' + table + '" does not exist' });
@@ -361,6 +372,9 @@ http.createServer((req, res) => {
       if (url.pathname === '/__log') return send(res, 200, LOG.splice(0));
       if (url.pathname === '/__users') { Object.assign(USERS, JSON.parse(body)); return send(res, 200, Object.keys(USERS)); }
       if (url.pathname === '/__session') { const u = USERS[JSON.parse(body).email]; return send(res, 200, sessionFor(u)); }
+      // Fake NaJiki payments API: records STK push requests from the app.
+      if (url.pathname === '/__najiki/payments') { NAJIKI.push({ headers: { authorization: req.headers.authorization || '' }, body: JSON.parse(body || '{}') }); return send(res, 200, { transactionId: 'nj_' + crypto.randomUUID(), status: 'PENDING' }); }
+      if (url.pathname === '/__najiki/log') { if (req.method === 'DELETE') NAJIKI.length = 0; return send(res, 200, NAJIKI); }
       if (url.pathname === '/__reload') { await loadCatalog(); return send(res, 200, { ok: true }); }
       if (url.pathname.startsWith('/auth/v1/')) return handleAuth(req, res, url, body);
       if (url.pathname.startsWith('/rest/v1/')) {
@@ -373,8 +387,18 @@ http.createServer((req, res) => {
           await client.query('BEGIN');
           await client.query('SET LOCAL ROLE ' + role);
           await client.query("SELECT set_config('request.jwt.claims', $1, true)", [JSON.stringify(jwt || { role })]);
-          await als.run(client, () => handleRest(req, res, url, body));
-          await client.query('COMMIT');
+          // Like PostgREST: only answer after the transaction has committed.
+          const queued = [];
+          const realWH = res.writeHead.bind(res), realEnd = res.end.bind(res);
+          res.writeHead = (...x) => { queued.push(['wh', x]); return res; };
+          res.end = (...x) => { queued.push(['end', x]); return res; };
+          try {
+            await als.run(client, () => handleRest(req, res, url, body));
+            await client.query('COMMIT');
+          } finally {
+            res.writeHead = realWH; res.end = realEnd;
+          }
+          for (const [k, x] of queued) (k === 'wh' ? realWH : realEnd)(...x);
         } catch (e) {
           try { await client.query('ROLLBACK'); } catch {}
           throw e;

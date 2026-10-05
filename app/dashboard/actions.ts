@@ -4,7 +4,15 @@ import { createClient } from '@/utils/supabase/server';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 
+/**
+ * DEMO ONLY: marks queued SMS as "sent" with made-up provider data WITHOUT
+ * sending anything. With real parents and paid SMS this would hide messages
+ * that were never delivered, so it is disabled unless SMS_SIMULATION_MODE=true.
+ */
 export async function processPendingNotificationsAction() {
+  if (process.env.SMS_SIMULATION_MODE !== 'true') {
+    return { error: 'SMS simulation is disabled. Queued messages are delivered by the SMS gateway.' };
+  }
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
     // 1. Fetch pending notifications for this school only

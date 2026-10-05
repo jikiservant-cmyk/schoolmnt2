@@ -51,6 +51,7 @@ if (require.main === module) (async () => {
     await c.query(fs.readFileSync(mig + '03_tenant_integrity.sql', 'utf8'));
     await c.query("SET smartskoolz.harden_public = 'on'");
     await c.query(fs.readFileSync(mig + '04_rls_tenant_isolation.sql', 'utf8'));
+    if (process.env.MIG05 !== '0') await c.query(fs.readFileSync(mig + '05_sms_payment_integrity.sql', 'utf8'));
     console.log('RLS migrations applied');
   }
   console.log('seeded');

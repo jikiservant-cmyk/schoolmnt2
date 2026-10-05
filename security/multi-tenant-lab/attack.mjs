@@ -190,7 +190,7 @@ const ic = (path, qs, body) => fetch(BASE + path + '?' + new URLSearchParams(qs)
 import crypto from 'crypto';
 const hook = async (payload) => {
   const body = JSON.stringify(payload);
-  const sig = crypto.createHmac('sha256', 'lab-najiki-secret').update(body).digest('hex');
+  const sig = crypto.createHmac('sha256', process.env.NAJIKI_WEBHOOK_SECRET || 'lab-najiki-secret').update(body).digest('hex');
   const r = await fetch(BASE + '/api/webhooks/najiki', { method: 'POST', body, headers: { 'content-type': 'application/json', 'x-najiki-signature': sig } });
   return { status: r.status, body: await r.text() };
 };
@@ -200,7 +200,7 @@ const bal = async (s) => Number((await one("SELECT balance FROM public.wallets W
   // A pays, but payload carries B's tenant code first and A's uuid in metadata.
   const r = await hook({ status: 'SUCCESS', amount: 500, reference: 'ref-1', tenantCode: 'codeB', metadata: { schoolId: A.school } });
   const b1 = await bal(B.school), a1 = await bal(A.school);
-  rec('webhook: A\'s top-up credited to B (tenant code beats school uuid)', b1 > b0 || a1 === a0, `${r.status} A ${a0}->${a1} B ${b0}->${b1}`);
+  rec('webhook: A\'s top-up credited to B (tenant code beats school uuid)', b1 > b0 || (process.env.MIG05 === '0' && a1 === a0), `${r.status} A ${a0}->${a1} B ${b0}->${b1}`);
 }
 {
   const a0 = await bal(A.school);
