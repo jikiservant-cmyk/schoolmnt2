@@ -47,6 +47,9 @@ export function collectReferences(data: Json): { refs: string[]; providerRef: st
     data?.reference, data?.idempotencyKey, data?.idempotency_key, data?.tx_ref, data?.ext_ref, data?.externalReference, data?.external_reference,
     md.idempotencyKey, md.idempotency_key, md.reference, md.tx_ref,
     data?.transaction_ref, data?.transactionRef, data?.transaction_id, data?.transactionId, data?.paymentIntentId,
+    // The mobile money transaction id: lets apply_payment (migration 08)
+    // recognise a re-sent notification even when our reference is missing.
+    data?.providerPaymentId, data?.provider_payment_id,
   ].map(str).filter((v) => v.length > 0 && v.length <= 200);
   return { refs: Array.from(new Set(refs)), providerRef };
 }

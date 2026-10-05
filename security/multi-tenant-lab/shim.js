@@ -389,6 +389,10 @@ http.createServer((req, res) => {
         if (typeof b.idempotencyKey !== 'string' || b.idempotencyKey.length < 8) bad.push('idempotencyKey');
         if (b.metadata !== undefined && (typeof b.metadata !== 'object' || Array.isArray(b.metadata))) bad.push('metadata');
         if (bad.length) return send(res, 400, { error: 'Validation failed', details: bad });
+        // Lab switches: phone ending 500 -> NaJiki outage (502) AFTER the prompt
+        // may have gone out; ending 999 -> NaJiki hangs for 60 s.
+        if (String(b.phoneNumber).endsWith('500')) { NAJIKI.push({ headers: { authorization: auth }, body: b, response: null }); return send(res, 502, { error: 'Bad gateway' }); }
+        if (String(b.phoneNumber).endsWith('999')) { NAJIKI.push({ headers: { authorization: auth }, body: b, response: null }); await new Promise((r) => setTimeout(r, 60000)); return send(res, 504, { error: 'timeout' }); }
         const paymentId = crypto.randomUUID();
         const reference = String(b.applicationCode).slice(0, 6).toUpperCase() + '-PAY-' + Date.now().toString(16).slice(-8).toUpperCase() + '-' + crypto.randomBytes(5).toString('hex').toUpperCase();
         NAJIKI.push({ headers: { authorization: auth }, body: b, response: { paymentId, reference } });

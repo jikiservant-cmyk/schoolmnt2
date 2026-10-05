@@ -532,7 +532,7 @@ Without 05, the payments suite shows no credit at all: P1, P2, P3b and P7 are no
 
 ## Go-live (Part 7)
 
-1. Run migrations in order: **05 → 06 → 07** (back up first). Read the NOTICE lists.
+1. Run migrations in order: **05 → 06 → 07 → 08** (back up first; 08 added in Part 9). Read the NOTICE lists.
 2. If you ever merge duplicate wallets: move the balance to the wallet you keep, set the other to 0, then delete it.
 3. Test one signup after the migration (it uses the service key, so it must still work).
 
@@ -568,3 +568,55 @@ Goal: every link opens the exact page it should, nobody gets stuck, nothing misb
 
 - The repo's `start` script is `next start` while `next.config` sets `output: 'standalone'`. It works (Next prints a warning). If you deploy with Docker/standalone, run `node .next/standalone/server.js` and copy `.next/static` and `public` next to it.
 - No browser could be downloaded in the test sandbox, so the one client-side check (L3) was verified from the navigation payload the browser receives (the list is keyed `"student"` / `"teacher"`), not with a real click. Worth a 10-second manual click on launch day.
+
+# Part 9: Money round 5: reconciliation (do the books add up?)
+
+A new test, `security/multi-tenant-lab/money-reconcile.mjs`, runs 12 real-life payment scenarios through the real app (production build), then audits that every shilling in the wallet is explained by exactly one payment. The scenarios:
+
+- a normal top-up
+- the same notification delivered 25 times at once
+- a NaJiki retry 47 hours later with the original signature
+- "failed" then success
+- a late "failed" notice after a success
+- an over-reported amount
+- a partial payment
+- notifications that lost our reference, plus their retries
+- 10 payments arriving at once
+- another school's payment relabelled
+- NaJiki erroring while the parent pays anyway
+- NaJiki hanging
+
+## Findings (fixed)
+
+| # | What could happen | Fix |
+|---|---|---|
+| M17 | **Double credit.** A payment notification that lacked our top-up reference was matched to the school's oldest pending top-up of the same amount (correct). NaJiki's **retry** of it then matched the **next** pending top-up of that amount. With two 1,200 top-ups pending, one payment credited 2,400 | `supabase_migrations/08_payment_retry_dedupe.sql`: `apply_payment` stores every reference a credited payment arrived with (`payment_events.detail.refs`, backfilled for older payments) and treats any later notification carrying one of them as a duplicate, checked under the payment lock. The webhook now also passes NaJiki's `providerPaymentId` (the mobile money transaction id) |
+| M18 | **Top-up button hung** for as long as NaJiki did (60 s+ in the test; the platform kills the request with a generic error) | `topUpBalance`: 20 s limit on the NaJiki call. On a timeout or NaJiki 5xx the school is told "If you received a PIN prompt, complete it, your balance updates automatically", and the top-up stays pending so a payment that does arrive is credited. Only a 4xx (definite refusal) marks it failed |
+
+## Results
+
+- Before: 23/25 checks passed (M17 double credit; M18 60.1 s hang).
+- New code without 08: M17 still double credits, so **08 is required**.
+- After (code + 08): **25/25 checks pass; the books balance.**
+  - Wallet growth = sum of ledger credit rows = sum of "credited" payment events.
+  - No reference appears in the ledger twice.
+  - Every credited event has its ledger row with the same amount.
+  - No top-up was credited more than requested.
+  - The legacy mirror equals the wallet.
+  - The dashboard shows the wallet balance.
+  - School B is untouched.
+- Migration 08 on a database with 19 payments credited before it:
+  - It applies cleanly, twice in a row.
+  - All 19 payments are backfilled with their references.
+  - Re-sending a pre-08 payment is refused as a duplicate.
+  - Only `service_role` can run `apply_payment` (not anon, not logged-in users).
+- Full regression:
+  - payments 0/20 (legit OK); pay-rls 0/8; rogue 0/21 (K1/K2 only run 16:00–22:00 EAT); round 4 0/5.
+  - Genuine NaJiki payment and NaJiki's own signer: credited.
+  - regress 17/17; attack 1/42 (known device item); device 0/15; RLS 0/32.
+  - link-crawl clean; flows OK; 5/5 pages show own-school data only.
+  - `tsc`, `eslint` and `next build` are clean.
+
+## Go-live (Part 9)
+
+Run migrations **05 → 06 → 07 → 08** (back up first). 08 is safe to re-run.

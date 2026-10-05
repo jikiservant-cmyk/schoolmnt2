@@ -245,6 +245,10 @@ export async function getSchoolBalance() {
   }
 }
 
+const NAJIKI_TIMEOUT_MS = 20_000;
+const SLOW_GATEWAY_MESSAGE =
+  'Mobile Money is responding slowly. If you received a PIN prompt, complete it: your balance updates automatically. Otherwise try again in a few minutes.';
+
 export async function topUpBalance(amount: number, phoneNumber: string) {
   try {
     const { supabase, schoolId, user } = await requireSchoolAdmin();
@@ -463,7 +467,10 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
         'tenantCode': tenantCode,
         'code': tenantCode
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      // Without a limit a hung NaJiki left the "Top up" button spinning until
+      // the platform killed the request.
+      signal: AbortSignal.timeout(NAJIKI_TIMEOUT_MS),
     });
 
     let textData = '';
@@ -479,8 +486,12 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
 
     if (!response.ok) {
       console.error(`[NaJiki TopUp API] Failed with status ${response.status}:`, resData || textData);
-      // The provider refused the request: no PIN prompt was sent. (On network
-      // errors we keep the intent pending: the prompt may still have gone out.)
+      if (response.status >= 500) {
+        // NaJiki/gateway trouble: the PIN prompt may still have gone out, so
+        // keep the top-up pending (a payment that arrives is still credited).
+        return { error: SLOW_GATEWAY_MESSAGE };
+      }
+      // 4xx: the provider refused the request, no PIN prompt was sent.
       await markIntentFailed();
       
       // If payment provider returned a message or error
@@ -514,6 +525,10 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
       message: `Mobile Money PIN prompt sent to ${phoneLocal07}! Please enter your PIN on your phone to complete payment.`
     };
   } catch (err: any) {
+    if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+      console.error(`[NaJiki STK Push] No answer from NaJiki within ${NAJIKI_TIMEOUT_MS / 1000}s; top-up ${idempotencyKey} kept pending.`);
+      return { error: SLOW_GATEWAY_MESSAGE };
+    }
     console.error('NaJiki TopUp API connection error:', err);
     return { 
       error: 'Could not connect to payment gateway. Please check your network connection and try again.' 

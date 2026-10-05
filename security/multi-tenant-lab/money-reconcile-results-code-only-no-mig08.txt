@@ -1,0 +1,32 @@
+start: school A 1000 UGX, school B 1000 UGX
+
+OK     S1 normal 2,000 top-up credited exactly once  [200 balance 3000]
+OK     S2 same payment delivered 25x in parallel -> credited once  [statuses 200 balance 6000]
+OK     S3 retry 47h later (original signature) -> no second credit  [200 {"success":true,"message":"Transaction already processed"}]
+OK     S4 failed notice credits nothing, later success credits 1,500  [200/200]
+OK     S5 late "failed" after success -> balance unchanged  [200]
+OK     S6 report says 9,999 for a 2,500 top-up -> only 2,500 credited  [200 balance 10000]
+OK     S7 only 3,000 of 4,000 paid -> 3,000 credited; a 2nd notice for the same top-up adds nothing  [200/200 balance 13000]
+OK     S8 reference-less payment credited once  [200 {"success":true,"credited":1200,"reference":"sch_t]
+FAILED S8 RETRY of that same reference-less payment does not credit the other pending top-up  [200 {"success":true,"credited":1200,"reference":"sch_topup_b62d2 balance 14200 -> 15400]
+OK     S9 10 different 500 payments at once -> exactly +5,000  [balance 20400]
+OK     S10 school B's payment relabelled as school A -> nobody credited  [202 {"received":true,"credited":false,"outcome":"school_mismatch]
+OK     S11 NaJiki error on start: school told it failed  [{"error":"Mobile Money is responding slowly. If you received a PIN prompt, compl]
+OK     S11 ...parent paid anyway -> money still credited, not lost  [200 {"success":true,"credited":700,"reference":"sch_topup_eb349d]
+OK     S12 NaJiki hangs: school gets a clear answer within 25 s  [20.0 s, answer: {"error":"Mobile Money is responding slowly. If you received a PIN prompt, complete it: yo]
+OK     S12 ...parent paid during the hang -> money still credited  [200]
+OK     dashboard balance = wallet balance  [shown 21700, wallet 21700]
+
+--- audit ---
+OK     school A: wallet grew by exactly the expected amount  [grew 20700, expected 20700]
+OK     school B: wallet untouched  [1000]
+OK     ledger: sum of credit rows = wallet growth  [ledger 20700, growth 20700]
+OK     payment log: sum of "credited" events = wallet growth  [events 20700]
+OK     no payment reference in the ledger twice
+OK     every "credited" event has its matching ledger row (same amount)
+OK     no top-up credited more than requested
+OK     credited top-ups = credited events (one each)  [19 vs 19]
+OK     legacy settings.balance mirror = wallet  [21700.00 vs 21700]
+held for review (not credited, kept on record): school_mismatch=1, unmatched=1
+
+1 FAILED
