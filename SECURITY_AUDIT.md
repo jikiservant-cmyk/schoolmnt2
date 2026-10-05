@@ -535,3 +535,36 @@ Without 05, the payments suite shows no credit at all: P1, P2, P3b and P7 are no
 1. Run migrations in order: **05 → 06 → 07** (back up first). Read the NOTICE lists.
 2. If you ever merge duplicate wallets: move the balance to the wallet you keep, set the other to 0, then delete it.
 3. Test one signup after the migration (it uses the service key, so it must still work).
+
+# Part 8: Launch check (links, navigation, login flows)
+
+Goal: every link opens the exact page it should, nobody gets stuck, nothing misbehaves on day one. Tested on the **production build** (`next build` + `next start`), not only the dev server.
+
+## Bugs found and fixed
+
+| # | What users would have seen | Cause | Fix |
+|---|---|---|---|
+| L1 | Teacher logins, accounts with no school, or signups whose setup failed: browser stuck on **"too many redirects"**, login form unreachable | Dashboard sends non-admins to `/login?error=access_denied`; server components can't clear cookies, so the session survived and middleware sent them straight back to `/dashboard` | `utils/supabase/middleware.ts`: on that page, sign the session out and expire `sb-*` cookies, **only if** it fails the same admin test as the dashboard (`isWorkingSchoolAdmin`), so a shared link can't log a real admin out. Redirects also drop the old query string |
+| L2 | **Sign Out** sent people to `https://0.0.0.0:3000/login` (dead page) behind a real domain/proxy | Redirect URL built from `request.url` (the server's bind address) | `app/api/logout/route.ts`: relative `Location: /login` |
+| L3 | Clicking **Students** then **Teachers** in the sidebar kept showing students | People list keeps its filter in `useState`, which ignores new props on client-side navigation | `app/dashboard/people/page.tsx`: `key={initialRoleFilter}` remounts the list per role |
+| L4 | On any People page **both** Students and Teachers were highlighted | Sidebar ignored `?role=` | `Sidebar.tsx` compares the role too |
+| L5 | Wrong / other school's class-register link said "No active teachers found" | Server's "Class not found or access denied" was dropped | `manual-attendance/[classId]/page.tsx` shows it |
+| L6 | Build log: `[auth-guard] admin verification failed: Dynamic server usage` | The guard's `catch` swallowed Next.js's internal control-flow errors (risk: page wrongly treated as static) | `lib/auth-guard.ts`: `unstable_rethrow(err)` first; real errors still fail closed. Build is now warning-free |
+
+## How it was tested
+
+- `security/multi-tenant-lab/link-crawl.mjs <base>` crawls every link as 4 people (logged out, school admin, teacher, account with no school), follows redirects, checks assets, the 404 page, the access-denied flow, Sign Out, and that a real admin opening an access-denied link stays logged in.
+- `security/multi-tenant-lab/flows-check.mjs <base> <repo>` logs in through the real form (right password, wrong password, teacher refused), checks each sidebar page shows the right content for the right school, that a Students→Teachers click re-keys the list, the data each page loads in the browser (people lists, attendance, SMS balance, kiosk users, class register), and that another school's / garbage class links leak nothing and don't crash.
+- `lib.mjs` `actionIds` now also reads production-build manifests.
+
+## Results (production build)
+
+- link-crawl: **NO PROBLEMS FOUND**. Logged out: protected pages go to `/login`. Admin: all 12 pages land exactly. Teacher / no-school: access-denied page, session cleared, no loop. Unknown page: 404 with a link back.
+- flows-check: **ALL FLOWS OK**.
+- Re-run of every earlier suite: regress 17/17 OK; attack 1/42 (known device transition item); device 0/15; RLS 0/32; payments 0/20 (legit OK); pay-rls 0/8; rogue 0/23; round 4 0/5; genuine NaJiki payment credited; NaJiki's own signer credited; 5/5 dashboard pages show own-school data only.
+- `next build` clean (0 warnings), `tsc` and `eslint` clean.
+
+## Launch-day notes
+
+- The repo's `start` script is `next start` while `next.config` sets `output: 'standalone'`. It works (Next prints a warning). If you deploy with Docker/standalone, run `node .next/standalone/server.js` and copy `.next/static` and `public` next to it.
+- No browser could be downloaded in the test sandbox, so the one client-side check (L3) was verified from the navigation payload the browser receives (the list is keyed `"student"` / `"teacher"`), not with a real click. Worth a 10-second manual click on launch day.

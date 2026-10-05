@@ -19,6 +19,11 @@ export function actionIds(appDir) {
   const m = JSON.parse(fs.readFileSync(appDir + '/.next/server/server-reference-manifest.json', 'utf8'));
   const out = {};
   for (const [id, info] of Object.entries(m.node || {})) {
+    // Production builds: numeric moduleIds, but the name/file are listed directly.
+    if (info.exportedName) {
+      for (const worker of Object.keys(info.workers || {})) (out[info.exportedName] = out[info.exportedName] || []).push({ id, file: info.filename, page: worker });
+      continue;
+    }
     for (const [worker, w] of Object.entries(info.workers || {})) {
       const q = decodeURIComponent((w.moduleId.split('?actions=')[1] || '').split('&')[0].replace(/!$/, ''));
       let list = [];

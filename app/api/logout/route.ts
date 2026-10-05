@@ -29,10 +29,12 @@ export async function POST(request: NextRequest) {
   // Revoke the refresh token server-side, then the cookie store clears sb-* cookies.
   await supabase.auth.signOut();
 
-  const url = new URL('/login', request.url);
-  const response = NextResponse.redirect(url, { status: 303 });
-  response.headers.set('Cache-Control', 'no-store');
-  return response;
+  // Relative Location: request.url carries the server's bind address
+  // (e.g. http://0.0.0.0:3000) behind a proxy, which sent users to a dead page.
+  return new NextResponse(null, {
+    status: 303,
+    headers: { Location: '/login', 'Cache-Control': 'no-store' },
+  });
 }
 
 // Explicitly refuse GET so a logout can't be triggered by <img src="/api/logout">.

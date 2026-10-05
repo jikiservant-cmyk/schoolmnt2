@@ -46,6 +46,10 @@ export default async function PeoplePage({ searchParams }: SearchProps) {
 
   return (
     <PeopleDirectoryClient 
+      // Remount when the sidebar switches ?role= (Students <-> Teachers): the
+      // client keeps its filter in useState, which ignores new props, so the
+      // "Teachers" link kept showing students after "Students" was opened.
+      key={initialRoleFilter}
       classes={classes} 
       initialRoleFilter={initialRoleFilter} 
       initialCounts={aggregateCounts}

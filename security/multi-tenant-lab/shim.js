@@ -345,7 +345,8 @@ function handleAuth(req, res, url, body) {
   if (p === '/auth/v1/token') {
     const b = JSON.parse(body || '{}');
     if (url.searchParams.get('grant_type') === 'refresh_token') return send(res, 400, { code: 'refresh_token_not_found', msg: 'Invalid Refresh Token' });
-    const u = USERS[b.email];
+    // GoTrue matches emails case-insensitively (stored lower-case).
+    const u = USERS[b.email] || Object.values(USERS).find((x) => String(x.email).toLowerCase() === String(b.email || '').toLowerCase());
     if (!u || u.password !== b.password) return send(res, 400, { code: 'invalid_credentials', error_code: 'invalid_credentials', msg: 'Invalid login credentials' });
     return send(res, 200, sessionFor(u));
   }

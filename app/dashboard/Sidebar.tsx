@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useSearchParams } from 'next/navigation';
 import { 
   Menu, 
   X, 
@@ -21,6 +21,7 @@ interface SidebarProps {
 export default function Sidebar({ schoolName, adminName, initials }: SidebarProps) {
   const [isMobileOpen, setIsMobileOpen] = useState(false);
   const pathname = usePathname();
+  const searchParams = useSearchParams();
 
   const navItems = [
     { href: '/dashboard', label: 'Dashboard', symbol: '⌂', matchExact: true },
@@ -100,9 +101,13 @@ export default function Sidebar({ schoolName, adminName, initials }: SidebarProp
           
           <nav className="grid gap-[2px]">
             {navItems.map((item) => {
-              const isActive = item.matchExact 
-                ? pathname === item.href 
-                : pathname.startsWith(item.href.split('?')[0]);
+              // Links with ?role= (Students / Teachers) are only active for
+              // that role; before, both lit up on any People page.
+              const [itemPath, itemQuery] = item.href.split('?');
+              const itemRole = itemQuery ? new URLSearchParams(itemQuery).get('role') : null;
+              const isActive = item.matchExact
+                ? pathname === item.href
+                : pathname.startsWith(itemPath) && (!itemRole || searchParams.get('role') === itemRole);
 
               return (
                 <Link

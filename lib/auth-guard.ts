@@ -1,5 +1,5 @@
 import { cache } from 'react';
-import { redirect } from 'next/navigation';
+import { redirect, unstable_rethrow } from 'next/navigation';
 import { createClient } from '@/utils/supabase/server';
 import { createPublicAdminClient } from '@/utils/supabase/admin';
 import type { User } from '@supabase/supabase-js';
@@ -44,6 +44,10 @@ export const checkSchoolAdmin = cache(async function checkSchoolAdmin(): Promise
 
     return { ok: true, user, schoolId, supabase };
   } catch (err) {
+    // Let Next.js's own control-flow signals (dynamic-rendering bail-out,
+    // redirect, notFound) through; swallowing them could let Next cache a
+    // page statically. Real failures still fail closed below.
+    unstable_rethrow(err);
     console.error('[auth-guard] admin verification failed:', err instanceof Error ? err.message : err);
     return { ok: false, reason: 'error' };
   }
@@ -81,7 +85,8 @@ export async function requireSchoolAdminPage() {
       try {
         const supabase = await createClient();
         await supabase.auth.signOut();
-      } catch {
+      } catch (err) {
+        unstable_rethrow(err);
         /* cookies are read-only in server components; middleware will refresh */
       }
     }
