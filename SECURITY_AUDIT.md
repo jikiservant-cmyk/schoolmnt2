@@ -386,7 +386,7 @@ New legit flows, all passing:
 
 Regression after this pass: legit flows 17/17, app attacks 1/42 (known device transition item), direct REST money attacks 0/8, RLS policies active.
 
-### Not fixed here: needs a decision
+### Notes
 
-- **Nothing sends the queued SMS.** The school app writes SMS into `school.notifications`, but neither this repo nor najiki-finance2 has code that passes them to NaJiki `POST /api/messaging/send`. The only thing that touched them was the simulation action (now disabled), which just marked them "sent". Real SMS sending needs a dispatcher with a per-SMS price and a wallet debit. Building it needs the business rules: price per SMS/part, and what happens at zero balance.
+- **SMS sending happens in a Supabase Edge Function** (confirmed by the owner). It is not in this repo, so it was not reviewed. Things to check there: it should use the service-role key, because migration 04 RLS blocks anon access to `school.notifications`. It should charge the school's wallet atomically, once per SMS. It should mark a row as sent only after NaJiki accepts it. NaJiki delivery reports update `school.notifications.status` to `sent`/`failed`, matched by `provider_ref` (store NaJiki's `smsId` there) or the notification id.
 - **NaJiki side (other repo):** `POST /api/messaging/send` does not check or debit any wallet. Anyone holding the school app's `NAJIKI_API_KEY` can send unlimited SMS billed to NaJiki's SMS account. Keep that key server-side only (it is), and rotate it if it was ever exposed.
