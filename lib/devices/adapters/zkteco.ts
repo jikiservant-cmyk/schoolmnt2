@@ -1,5 +1,5 @@
 import { DeviceAdapter, DeviceRecord, AttendanceEvent, EnrollPersonInput, EnrollCommandResult, HandshakeResponse } from '../types';
-import { isAuthorizedToken } from '../metadata';
+import { isAuthorizedDevice } from '../metadata';
 import { formatZKTecoDisplayName } from '@/utils/zkteco/formatter';
 
 export class ZKTecoAdmsAdapter implements DeviceAdapter {
@@ -17,7 +17,7 @@ export class ZKTecoAdmsAdapter implements DeviceAdapter {
       url.searchParams.get('push_token') ||
       url.searchParams.get('PushToken');
 
-    return isAuthorizedToken(providedToken, device.device_secret, process.env.ZKTECO_DEVICE_SECRET);
+    return isAuthorizedDevice(providedToken, device, process.env.ZKTECO_DEVICE_SECRET);
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {

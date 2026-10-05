@@ -185,3 +185,67 @@ export function isAuthorizedToken(
     return cleanProvided === target;
   }
 }
+
+function matchesSecret(provided: string, stored: string): boolean {
+  const target = stored.trim();
+  if (!target) return false;
+  if (/^[0-9a-fA-F]{64}$/.test(target)) {
+    const computed = Buffer.from(hashDeviceSecret(provided), 'utf8');
+    const expected = Buffer.from(target.toLowerCase(), 'utf8');
+    return computed.length === expected.length && crypto.timingSafeEqual(computed, expected);
+  }
+  const a = crypto.createHash('sha256').update(provided).digest();
+  const b = crypto.createHash('sha256').update(target).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Multi-tenant safe device authentication.
+ *
+ * Previously adapters compared the token against `device.device_secret`
+ * (legacy plaintext column) only. Devices registered through the portal store
+ * `device_secret_hash`, so their per-device secret was NEVER checked and every
+ * ZKTeco device on the platform authenticated with the single shared
+ * ZKTECO_DEVICE_SECRET. Anyone holding that shared secret could impersonate
+ * ANY school's terminal just by knowing its serial number: inject attendance
+ * (and parent SMS) into another tenant, or pull its enrollment commands.
+ *
+ * Order of checks:
+ *   1. Per-device secret (hash, then legacy plaintext): the normal path.
+ *   2. Shared global secret:
+ *      - devices with NO per-device secret: allowed (legacy devices);
+ *      - devices WITH a per-device secret: allowed only while
+ *        ZKTECO_GLOBAL_SECRET_FALLBACK is not "false" (transition mode),
+ *        and every use is logged so operators can migrate devices.
+ */
+export function isAuthorizedDevice(
+  providedToken: string | null | undefined,
+  device: Pick<DeviceRecord, 'serial_number' | 'school_id'> & { device_secret?: string | null; device_secret_hash?: string | null },
+  globalSecret?: string
+): boolean {
+  if (!providedToken || !providedToken.trim()) return false;
+  const provided = providedToken.trim();
+
+  const perDevice = [device.device_secret_hash, device.device_secret].filter(
+    (v): v is string => typeof v === 'string' && v.trim().length > 0
+  );
+
+  for (const stored of perDevice) {
+    if (matchesSecret(provided, stored)) return true;
+  }
+
+  const global = globalSecret?.trim();
+  if (!global || !matchesSecret(provided, global)) return false;
+
+  if (perDevice.length === 0) return true;
+
+  const fallbackEnabled = (process.env.ZKTECO_GLOBAL_SECRET_FALLBACK || '').toLowerCase() !== 'false';
+  if (fallbackEnabled) {
+    console.warn(
+      `[Device Auth] Device ${device.serial_number} (school ${device.school_id}) authenticated with the SHARED global secret. ` +
+      'Reconfigure it with its per-device secret, then set ZKTECO_GLOBAL_SECRET_FALLBACK=false.'
+    );
+    return true;
+  }
+  return false;
+}

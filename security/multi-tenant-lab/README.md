@@ -1,0 +1,37 @@
+# Multi-tenant attack lab
+
+This lab runs the real app against **real Postgres with no RLS**, so only the
+application code keeps schools apart. That is a deliberately harsher setup than
+production, where RLS is a second layer.
+
+| File | Purpose |
+|---|---|
+| `schema.sql` / `seed.js` | Two schools: A (attacker) and B (victim). B's rows are tagged `B-SECRETNAME` / `B-SECRETCMD`. |
+| `shim.js` | Minimal PostgREST + GoTrue on port 54321, backed by Postgres on 54329. Unknown RPCs return 404, so the app takes its direct-table fallbacks. |
+| `attack.mjs` | 42 checks run as school A's admin against school B. |
+| `regress.mjs` | 17 legitimate same-school flows that must keep working. |
+| `test-triggers.js` | Tests `supabase_migrations/03_tenant_integrity.sql` (16 cases). |
+
+## Run
+
+The paths are written for the sandbox layout (`/home/user/...`). Adjust them if
+your layout differs.
+
+1. `npm install`, then start Postgres on port 54329. The embedded-postgres
+   binaries work: run `initdb`, then `pg_ctl -o "-p 54329"`.
+2. `node seed.js && node shim.js`
+3. `. ./env.sh && npx next dev -p 3201` (from the repo root)
+4. `node warm.mjs http://127.0.0.1:3201`
+5. `node attack.mjs http://127.0.0.1:3201 <repoDir> fixed`
+
+## Results (2026-10-05)
+
+| Build | Vulnerable checks |
+|---|---|
+| Before (commit 6e345fe) | **15 / 42** |
+| After, transition mode | 1 / 42 (the intentional shared-secret fallback) |
+| After, `ZKTECO_GLOBAL_SECRET_FALLBACK=false` | **0 / 42** |
+| Legitimate flows (`regress.mjs`) | 17 / 17 OK |
+| DB triggers (`test-triggers.js`) | 16 / 16 OK |
+
+The raw output is in `results-*.json`.

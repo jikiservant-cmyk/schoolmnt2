@@ -1,7 +1,10 @@
+import { cache } from 'react';
 import { redirect } from 'next/navigation';
 import { createClient } from '@/utils/supabase/server';
 import { createPublicAdminClient } from '@/utils/supabase/admin';
 import type { User } from '@supabase/supabase-js';
+
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type ServerSupabase = Awaited<ReturnType<typeof createClient>>;
 
@@ -19,7 +22,7 @@ type AdminCheck =
  *   `supabase.auth.updateUser({ data: { role: 'school_admin' } })`.
  * - Every failure path is fail-CLOSED.
  */
-export async function checkSchoolAdmin(): Promise<AdminCheck> {
+export const checkSchoolAdmin = cache(async function checkSchoolAdmin(): Promise<AdminCheck> {
   try {
     const supabase = await createClient();
     const { data: { user }, error } = await supabase.auth.getUser();
@@ -37,14 +40,14 @@ export async function checkSchoolAdmin(): Promise<AdminCheck> {
     if (profile.app_type && profile.app_type !== 'school') return { ok: false, reason: 'forbidden' };
 
     const { data: schoolId, error: rpcErr } = await supabase.rpc('auth_school_id');
-    if (rpcErr || !schoolId || typeof schoolId !== 'string') return { ok: false, reason: 'no_tenant' };
+    if (rpcErr || !schoolId || typeof schoolId !== 'string' || !UUID_RE.test(schoolId)) return { ok: false, reason: 'no_tenant' };
 
     return { ok: true, user, schoolId, supabase };
   } catch (err) {
     console.error('[auth-guard] admin verification failed:', err instanceof Error ? err.message : err);
     return { ok: false, reason: 'error' };
   }
-}
+});
 
 /** For server actions / route handlers: throws on failure. */
 export async function requireSchoolAdmin() {

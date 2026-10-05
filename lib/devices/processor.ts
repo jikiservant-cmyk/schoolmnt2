@@ -65,15 +65,21 @@ export async function processAttendanceEvents(
   try {
     const { data: credsData } = await supabase
       .from('person_credentials')
-      .select('identifier_value, person:person_id(id, full_name, role, class_id, is_active, device_user_id, classes:class_id(id, name))')
+      .select('identifier_value, person:person_id(id, school_id, full_name, role, class_id, is_active, device_user_id, classes:class_id(id, name))')
       .eq('school_id', device.school_id)
       .eq('is_active', true);
 
     if (credsData) {
       for (const c of credsData) {
         if (!c.identifier_value || !c.person) continue;
-        const pObj = Array.isArray(c.person) ? c.person[0] : c.person;
+        const pObj: any = Array.isArray(c.person) ? c.person[0] : c.person;
         if (!pObj) continue;
+        // MULTI-TENANT: a credential row tagged with this school must never
+        // resolve to a person who belongs to another school.
+        if (pObj.school_id !== device.school_id) {
+          console.warn(`[Device Processor] Ignoring cross-tenant credential "${c.identifier_value}" on device ${device.serial_number}`);
+          continue;
+        }
 
         const cVal = c.identifier_value.trim().toLowerCase();
         const cNum = cVal.replace(/^0+/, '');
@@ -252,13 +258,16 @@ export async function processAttendanceEvents(
     const sIds = Array.from(new Set(validStudentRecords.map(r => r.person.id)));
     const { data: parentsData } = await supabase
       .from('student_parents')
-      .select('student_id, parent_id, parents(phone)')
+      .select('student_id, parent_id, parents(phone, school_id)')
       .in('student_id', sIds)
       .eq('is_primary_contact', true);
 
     const parentMap = new Map();
     if (parentsData) {
       for (const row of parentsData) {
+        const parentRow: any = Array.isArray(row.parents) ? row.parents[0] : row.parents;
+        // MULTI-TENANT: only notify guardians registered in the same school.
+        if (!parentRow || parentRow.school_id !== device.school_id) continue;
         parentMap.set(row.student_id, {
           parent_id: row.parent_id,
           phone: Array.isArray(row.parents) ? (row.parents[0] as any)?.phone : (row.parents as any)?.phone

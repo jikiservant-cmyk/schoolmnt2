@@ -235,6 +235,7 @@ export async function getStudentsForClass(classId: string) {
   const { data: logs } = await supabase
     .from('attendance_logs')
     .select('person_id, attendance_type, status, occurred_at')
+    .eq('school_id', schoolId)
     .in('person_id', studentIds)
     .gte('occurred_at', startIso)
     .lte('occurred_at', endIso)
@@ -364,6 +365,7 @@ export async function submitClassAttendance(
     const { data: existingLogs } = await adminClient
       .from('attendance_logs')
       .select('person_id, attendance_type')
+      .eq('school_id', schoolId)
       .in('person_id', presentStudentIds)
       .gte('occurred_at', startIso)
       .lte('occurred_at', endIso);
@@ -438,12 +440,13 @@ export async function submitClassAttendance(
       const { data: studentsData } = await adminClient
         .from('people')
         .select('id, full_name')
+        .eq('school_id', schoolId)
         .in('id', eligibleStudentIds);
         
       // 2. Fetch Parents (prefer primary contact, fallback to any linked parent with phone)
       const { data: parentsData } = await adminClient
         .from('student_parents')
-        .select('student_id, parent_id, is_primary_contact, parents(phone, full_name)')
+        .select('student_id, parent_id, is_primary_contact, parents(phone, full_name, school_id)')
         .in('student_id', eligibleStudentIds);
 
       if (studentsData && parentsData && parentsData.length > 0) {
@@ -455,6 +458,8 @@ export async function submitClassAttendance(
         for (const sp of parentsData) {
           const phone = (sp.parents as any)?.phone;
           if (!phone) continue;
+          // MULTI-TENANT: never message a guardian registered under another school.
+          if ((sp.parents as any)?.school_id !== schoolId) continue;
           
           const existing = parentByStudent.get(sp.student_id);
           if (!existing || (!existing.is_primary_contact && sp.is_primary_contact)) {

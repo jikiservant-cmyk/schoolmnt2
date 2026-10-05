@@ -1,0 +1,212 @@
+[
+  {
+    "name": "addPerson: A enrols a student into B's class",
+    "vulnerable": true,
+    "detail": "{\"success\":true,\"data\":{\"id\":\"793ccbb6-de50-4ec9-841e-314af9970ca1\",\"school_id\":\"aaaaaaaa-0000-4000-8000-000000000001\",\"full_name\":\"Mole Student\",\"role\":\"student\",\"class_id\":\"bbbbbbbb-0000-4000-8000-0000000000c1\",\"device_user_id\":null,\"phone\":null,\"email\":null,\"is_active\":true,\"pin_hash\":null,\"failed_attempts\":0,\"locked_until\":null,\"created_at\":\"2026-10-05T13:02:31.285Z\",\"updated_at\":null,\"guardian_linked\":false},\"teacherPin\":null}"
+  },
+  {
+    "name": "addPerson: A assigns a new teacher to B's class (sent to fn_add_person)",
+    "vulnerable": true,
+    "detail": "{\"success\":true,\"data\":{\"id\":\"714661a0-d9bb-4c76-98e0-ea504b0814e4\",\"school_id\":\"aaaaaaaa-0000-4000-8000-000000000001\",\"full_name\":\"Mole Teacher\",\"role\":\"teacher\",\"class_id\":null,\"device_user_id\":null,\"phone\":\"+256700000009\",\"email\":null,\"is_active\":true,\"pin_hash\":null,\"failed_attempts\":0,\"locked_until\":null,\"created_at\":\"2026-10-05T13:02:31.660Z\",\"updated_at\":null},\"teacherPin\":\"TKHXFF\"}"
+  },
+  {
+    "name": "addClass: A creates a class taught by B's teacher",
+    "vulnerable": true,
+    "detail": "{\"success\":true}"
+  },
+  {
+    "name": "recordTeacherAttendance: A marks B's teacher present",
+    "vulnerable": true,
+    "detail": "{\"success\":true,\"data\":{\"id\":\"eb2c990a-edf4-4e11-87da-fb6d9579ba78\",\"school_id\":\"aaaaaaaa-0000-4000-8000-000000000001\",\"person_id\":\"bbbbbbbb-0000-4000-8000-0000000000e1\",\"device_id\":null,\"class_id\":null,\"status\":\"present\",\"attendance_type\":\"check_in\",\"occurred_at\":\"2026-10-05T13:02:32.181Z\",\"source\":\"manual\",\"created_at\":\"2026-10-05T13:02:32.183Z\",\"recorded_by\":null,\"notes\":null,\"verify_mode\":null,\"raw_payload\":null}}"
+  },
+  {
+    "name": "recordTeacherAttendance: arbitrary status value stored",
+    "vulnerable": true,
+    "detail": "{\"success\":true,\"data\":{\"id\":\"006f8db4-8de6-497b-8635-e9b783f59deb\",\"school_id\":\"aaaaaaaa-0000-4000-8000-000000000001\",\"person_id\":\"aaaaaaaa-0000-4000-8000-0000000000e1\",\"device_id\":null,\"class_id\":null,\"status\":\"absent_hacked\",\"attendance_type\":\"check_in\",\"occurred_at\":\"2026-10-05T13:02:32.299Z\",\"source\":\"manual\",\"created_at\":\"2026-10-05T13:02:32.301Z\",\"recorded_by\":null,\"notes\":null,\"verify_mode\":null,\"raw_payload\":null}}"
+  },
+  {
+    "name": "updatePersonDeviceUserId: A rewrites B student's biometric ID",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Person record not found or access denied.\"}"
+  },
+  {
+    "name": "resetTeacherPin: A resets (and learns) B teacher's PIN",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Teacher record not found or access denied.\"}"
+  },
+  {
+    "name": "getDevicePushCandidates: B class name / students leak to A",
+    "vulnerable": true,
+    "detail": "{\"success\":true,\"schoolId\":\"aaaaaaaa-0000-4000-8000-000000000001\",\"schoolName\":\"Connected School\",\"totalCount\":1,\"withPinCount\":0,\"withoutPinCount\":1,\"candidates\":[{\"id\":\"793ccbb6-de50-4ec9-841e-314af9970ca1\",\"full_name\":\"Mole Student\",\"role\":\"student\",\"device_user_id\":null,\"className\":\"Class B-SECRETNAME\",\"formattedName\":\"Mole Stu (Class B-SECRETNAME)\"}]}"
+  },
+  {
+    "name": "pushUsersToDevice serial=\"SNB0001\": A queues commands onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "pushUsersToDevice serial=\"snb0001\": A queues commands onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "pushUsersToDevice serial=\"%\": A queues commands onto B's device",
+    "vulnerable": false,
+    "detail": "{\"success\":true,\"count\":2,\"schoolName\":\"Alpha Academy\",\"categoryLabel\":\"All School Members\",\"previewList\":[\"102: Student A-SECRETNAME (ZKTeco ADMS (Push SDK / iClock))\",\"101: Teacher A-SECRETNAME (ZKTeco ADMS (Push SDK / iClock))\"],\"message\":\"Enqueued 2 enrollment payload(s) (All School Members) for Alpha Academy.\"}"
+  },
+  {
+    "name": "pushUsersToDevice serial=\"SN_0001\": A queues commands onto B's device",
+    "vulnerable": false,
+    "detail": "{\"success\":true,\"count\":2,\"schoolName\":\"Alpha Academy\",\"categoryLabel\":\"All School Members\",\"previewList\":[\"102: Student A-SECRETNAME (ZKTeco ADMS (Push SDK / iClock))\",\"101: Teacher A-SECRETNAME (ZKTeco ADMS (Push SDK / iClock))\"],\"message\":\"Enqueued 2 enrollment payload(s) (All School Members) for Alpha Academy.\"}"
+  },
+  {
+    "name": "pushUsersToDevice serial=\"SNB%\": A queues commands onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "pushUsersToDevice class=B: B class accepted / named in reply",
+    "vulnerable": true,
+    "detail": "{\"success\":true,\"count\":0,\"schoolName\":\"Alpha Academy\",\"categoryLabel\":\"Class \\\"Class B-SECRETNAME\\\" Students\",\"message\":\"No class \\\"class b-secretname\\\" students with a Device User ID (PIN) found in Alpha Academy.\"}"
+  },
+  {
+    "name": "autoAssignDevicePins: A pushes PINs onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "pushAllUsersToDevice: A pushes everyone onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "regenerateDeviceSecret: A rotates B device secret (takeover / DoS)",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found.\"}"
+  },
+  {
+    "name": "addDevice: error reveals serial belongs to another school",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device with Serial Number \\\"SNB0001\\\" is already registered.\"}"
+  },
+  {
+    "name": "getStudentsForClass: A reads B class roster",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Class not found or access denied.\"}"
+  },
+  {
+    "name": "submitClassAttendance: A logs attendance for B student",
+    "vulnerable": false,
+    "detail": "{\"success\":false,\"error\":\"Invalid student reference provided.\"}"
+  },
+  {
+    "name": "submitClockIn: A kiosk clocks in B student (device id 202)",
+    "vulnerable": false,
+    "detail": "{\"error\":\"ID not registered for this school. Check enrollment.\"}"
+  },
+  {
+    "name": "searchPeople term=\"x,school_id.neq.null\": B rows returned",
+    "vulnerable": false,
+    "detail": "{\"success\":true,\"data\":[],\"count\":0}"
+  },
+  {
+    "name": "searchPeople term=\"B-SECRETNAME\": B rows returned",
+    "vulnerable": false,
+    "detail": "{\"success\":true,\"data\":[],\"count\":0}"
+  },
+  {
+    "name": "searchPeople term=\"*)\": B rows returned",
+    "vulnerable": false,
+    "detail": "{\"success\":true,\"data\":[{\"id\":\"793ccbb6-de50-4ec9-841e-314af9970ca1\",\"full_name\":\"Mole Student\",\"role\":\"student\",\"class_"
+  },
+  {
+    "name": "searchPeople term=\"a%\": B rows returned",
+    "vulnerable": false,
+    "detail": "{\"success\":true,\"data\":[{\"id\":\"714661a0-d9bb-4c76-98e0-ea504b0814e4\",\"full_name\":\"Mole Teacher\",\"role\":\"teacher\",\"class_"
+  },
+  {
+    "name": "getAttendanceData: B rows visible to A",
+    "vulnerable": true,
+    "detail": ""
+  },
+  {
+    "name": "page /dashboard: contains B data",
+    "vulnerable": true,
+    "detail": ""
+  },
+  {
+    "name": "page /dashboard/people: contains B data",
+    "vulnerable": false,
+    "detail": ""
+  },
+  {
+    "name": "page /dashboard/classes: contains B data",
+    "vulnerable": false,
+    "detail": ""
+  },
+  {
+    "name": "page /dashboard/devices: contains B data",
+    "vulnerable": false,
+    "detail": ""
+  },
+  {
+    "name": "page /dashboard/attendance: contains B data",
+    "vulnerable": false,
+    "detail": ""
+  },
+  {
+    "name": "iclock: B serial accepted with A's per-device secret",
+    "vulnerable": false,
+    "detail": 401
+  },
+  {
+    "name": "iclock (baseline): A serial + A secret is accepted",
+    "vulnerable": true,
+    "detail": 401
+  },
+  {
+    "name": "iclock: B device accepted with GLOBAL shared secret (transition mode allows; strict mode must not)",
+    "vulnerable": true,
+    "detail": "200 (expected 200 while ZKTECO_GLOBAL_SECRET_FALLBACK unset)"
+  },
+  {
+    "name": "iclock ATTLOG: A forges attendance for B student on B device",
+    "vulnerable": false,
+    "detail": 401
+  },
+  {
+    "name": "iclock ATTLOG: A device punch resolves to B student",
+    "vulnerable": false,
+    "detail": 401
+  },
+  {
+    "name": "iclock getrequest (A): leaks B commands",
+    "vulnerable": false,
+    "detail": "ERROR: INVALID_CREDENTIALS"
+  },
+  {
+    "name": "iclock getrequest: A pulls B queue with own secret",
+    "vulnerable": false,
+    "detail": 401
+  },
+  {
+    "name": "webhook: A's top-up credited to B (tenant code beats school uuid)",
+    "vulnerable": true,
+    "detail": "200 A 1000->1000 B 1000->1000"
+  },
+  {
+    "name": "webhook: missing reference -> replay double-credits",
+    "vulnerable": true,
+    "detail": "200/200 A 1000->2400"
+  },
+  {
+    "name": "webhook: filter injection via schoolId accepted",
+    "vulnerable": true,
+    "detail": "200 {\"success\":true,\"message\":\"Successfully credited 500 UGX to school x),school_id.neq.null\",\"reference"
+  },
+  {
+    "name": "webhook: conflicting school ids accepted",
+    "vulnerable": true,
+    "detail": "200 {\"success\":true,\"message\":\"Successfully credited 500 UGX to school bbbbbbbb-0000-4000-8000-000000000"
+  }
+]

@@ -1,0 +1,6 @@
+{
+  "name": "multi-tenant-lab",
+  "private": true,
+  "description": "Cross-tenant attack harness: tenant A's admin attacks tenant B. See README.md.",
+  "dependencies": { "embedded-postgres": "^17.5.0-beta.15", "pg": "^8.23.1" }
+}

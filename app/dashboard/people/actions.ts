@@ -6,6 +6,7 @@ import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 import bcrypt from 'bcryptjs';
 import { generateTeacherPin, PIN_BCRYPT_ROUNDS } from '@/lib/security/pin';
+import { allClassesOwned, getOwnedClass, isUuid } from '@/lib/tenant';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
   // 1. Try auth_school_id RPC
@@ -58,6 +59,9 @@ export async function addPersonAction(formData: FormData) {
     const adminClient = createAdminClient();
     const rawDeviceId = formData.get('deviceUserId') as string;
     const cleanDeviceId = rawDeviceId && rawDeviceId.trim() ? rawDeviceId.trim() : null;
+    if (cleanDeviceId && (cleanDeviceId.length > 32 || !/^[A-Za-z0-9_-]+$/.test(cleanDeviceId))) {
+      return { error: 'Biometric Enrollment ID may only contain letters, digits, "_" or "-" (max 32).' };
+    }
 
     // Check for duplicate biometric device user ID in this school
     if (cleanDeviceId) {
@@ -149,7 +153,14 @@ export async function addPersonAction(formData: FormData) {
       if (!classId) {
         return { error: 'Please select a class for the student.' };
       }
-      studentClassId = classId;
+      // MULTI-TENANT: the class must belong to the caller's school. Otherwise a
+      // student could be attached to another school's class (cross-tenant FK)
+      // and that school's class name would leak back through joins.
+      const ownedClass = await getOwnedClass(adminClient, schoolId, classId);
+      if (!ownedClass) {
+        return { error: 'Selected class was not found in your school.' };
+      }
+      studentClassId = ownedClass.id;
       params.p_class_id = classId;
 
       const guardianName = formData.get('guardianName') as string;
@@ -170,10 +181,16 @@ export async function addPersonAction(formData: FormData) {
       let classIds: string[] = [];
       if (classIdsJson) {
         try {
-          classIds = JSON.parse(classIdsJson);
+          const parsed = JSON.parse(classIdsJson);
+          classIds = Array.isArray(parsed) ? parsed : [];
         } catch (e) {
           console.error('Failed to parse classIds:', e);
+          return { error: 'Invalid class selection.' };
         }
+      }
+      // MULTI-TENANT: every assigned class must belong to the caller's school.
+      if (!(await allClassesOwned(adminClient, schoolId, classIds))) {
+        return { error: 'One or more selected classes were not found in your school.' };
       }
 
       if (phone && phone.trim()) {
@@ -461,6 +478,10 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
     const cleanUid = deviceUserId && deviceUserId.trim() ? deviceUserId.trim() : null;
 
     // 1. Fetch person details to verify and get info for device command
+    if (!isUuid(personId)) return { error: 'Person record not found or access denied.' };
+    if (cleanUid && (cleanUid.length > 32 || !/^[A-Za-z0-9_-]+$/.test(cleanUid))) {
+      return { error: 'Biometric UID may only contain letters, digits, "_" or "-" (max 32).' };
+    }
     const { data: person, error: pErr } = await adminClient
       .from('people')
       .select('id, full_name, role, school_id, class_id, classes:class_id(name)')
@@ -493,7 +514,8 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
     const { error: updateErr } = await adminClient
       .from('people')
       .update({ device_user_id: cleanUid })
-      .eq('id', personId);
+      .eq('id', personId)
+      .eq('school_id', schoolId);
 
     if (updateErr) {
       console.error('Error updating device_user_id:', updateErr);

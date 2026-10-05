@@ -5,6 +5,8 @@ import { createClient } from '@/utils/supabase/server';
 import { createPublicAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
+import { createAdminClient } from '@/utils/supabase/admin';
+import { getOwnedPerson } from '@/lib/tenant';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
   // 1. Try auth_school_id RPC
@@ -163,7 +165,17 @@ export async function getAttendanceData(dateFilterStr?: string) {
 export async function recordTeacherAttendance(personId: string, status?: 'present' | 'late' | 'excused') {
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
-    
+
+    // MULTI-TENANT: the person must belong to this school (previously any
+    // person UUID was accepted and logged under the caller's school_id).
+    const person = await getOwnedPerson(createAdminClient(), schoolId, personId, ['teacher', 'support_staff', 'admin']);
+    if (!person) {
+      return { error: 'Staff member not found in your school.' };
+    }
+    if (status !== undefined && status !== 'present' && status !== 'late' && status !== 'excused') {
+      return { error: 'Invalid attendance status.' };
+    }
+
     const now = new Date();
     // Default rule: if checking in after 08:30 AM East Africa Time, mark as late unless specified
     const eatHours = (now.getUTCHours() + 3) % 24;
@@ -252,6 +264,13 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   try {
     const { supabase, schoolId, user } = await requireSchoolAdmin();
     const publicAdmin = createPublicAdminClient();
+
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || !Number.isInteger(amount) || amount < 1 || amount > 10_000_000) {
+      return { error: 'Top-up amount must be a whole number between 1 and 10,000,000 UGX.' };
+    }
+    if (typeof phoneNumber !== 'string' || !/^\+?[0-9\s\-().]{9,20}$/.test(phoneNumber)) {
+      return { error: 'Please enter a valid mobile money phone number.' };
+    }
     const userData = { user };
 
   const { data: school } = await supabase

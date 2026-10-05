@@ -4,6 +4,19 @@ import { createClient } from '@/utils/supabase/server';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
+import { getOwnedClass, getOwnedDeviceBySerial, isUuid, normalizeSerial } from '@/lib/tenant';
+
+const DEVICE_TYPES = ['zkteco_adms', 'hikvision_isapi', 'suprema_biostar', 'dahua_isapi', 'generic_webhook'];
+const PUSH_CATEGORIES = ['all', 'teachers', 'support_staff', 'all_students', 'class'];
+
+function isValidTimeZone(tz: string) {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function resolveSchoolId(supabase: any, userId: string): Promise<string | null> {
   // 1. Try auth_school_id RPC
@@ -46,13 +59,25 @@ export async function addDeviceAction(formData: FormData) {
   if (!serialNumber || !serialNumber.trim()) {
     return { error: 'Device Serial Number is required.' };
   }
+  if (!normalizeSerial(serialNumber)) {
+    return { error: 'Serial Number may only contain letters, digits, ".", "_" or "-" (max 64).' };
+  }
+  if (!DEVICE_TYPES.includes(deviceType)) {
+    return { error: 'Unsupported device type.' };
+  }
+  if (rawSecret && rawSecret.length < 16) {
+    return { error: 'Custom device secrets must be at least 16 characters (leave blank to auto-generate).' };
+  }
+  if (!isValidTimeZone(timeZone)) {
+    return { error: 'Invalid time zone.' };
+  }
 
   try {
     const { schoolId } = await requireSchoolAdmin();
     const adminClient = createAdminClient();
 
     // Check if device serial already exists
-    const cleanSerial = serialNumber.trim().toUpperCase();
+    const cleanSerial = normalizeSerial(serialNumber) as string;
     const { data: existingDevice } = await adminClient
       .from('devices')
       .select('id, serial_number')
@@ -60,7 +85,8 @@ export async function addDeviceAction(formData: FormData) {
       .maybeSingle();
 
     if (existingDevice) {
-      return { error: `Device with Serial Number "${cleanSerial}" is already registered.` };
+      // Serials are globally unique (devices authenticate by serial). Don't reveal which school owns it.
+      return { error: `Serial Number "${cleanSerial}" cannot be registered. If this is your device, contact support to transfer it.` };
     }
 
     const { generateDeviceSecret, hashDeviceSecret, packDeviceMetadata } = await import('@/lib/devices/metadata');
@@ -69,8 +95,8 @@ export async function addDeviceAction(formData: FormData) {
 
     const [lateH, lateM] = lateCutoff.split(':').map(n => parseInt(n, 10));
     const config = {
-      lateCutoffHour: isNaN(lateH) ? 8 : lateH,
-      lateCutoffMinute: isNaN(lateM) ? 0 : lateM,
+      lateCutoffHour: isNaN(lateH) || lateH < 0 || lateH > 23 ? 8 : lateH,
+      lateCutoffMinute: isNaN(lateM) || lateM < 0 || lateM > 59 ? 0 : lateM,
       timeZone: timeZone || 'Africa/Kampala',
     };
 
@@ -131,6 +157,7 @@ export async function addDeviceAction(formData: FormData) {
 export async function regenerateDeviceSecretAction(deviceId: string) {
   try {
     const { schoolId } = await requireSchoolAdmin();
+    if (!isUuid(deviceId)) return { error: 'Device not found.' };
     const adminClient = createAdminClient();
     const { data: dev, error: fetchErr } = await adminClient
       .from('devices')
@@ -152,7 +179,8 @@ export async function regenerateDeviceSecretAction(deviceId: string) {
       .update({ 
         device_secret_hash: newSecretHash
       })
-      .eq('id', deviceId);
+      .eq('id', deviceId)
+      .eq('school_id', schoolId);
 
     if (updateErr && (updateErr.code === 'PGRST204' || updateErr.message?.includes('column'))) {
       const packedFw = packDeviceMetadata(dev.firmware_version, {
@@ -162,7 +190,8 @@ export async function regenerateDeviceSecretAction(deviceId: string) {
       const retryPacked = await adminClient
         .from('devices')
         .update({ firmware_version: packedFw, device_secret_hash: newSecretHash })
-        .eq('id', deviceId);
+        .eq('id', deviceId)
+        .eq('school_id', schoolId);
       updateErr = retryPacked.error;
     }
 
@@ -175,6 +204,38 @@ export async function regenerateDeviceSecretAction(deviceId: string) {
   } catch (err: any) {
     return { error: err?.message || 'Failed to update token.' };
   }
+}
+
+/**
+ * Validates every tenant-scoped identifier in a push request:
+ *  - device serial must be an exact, well-formed serial owned by the school;
+ *  - category must be a known value;
+ *  - classId (if supplied) must be a class owned by the school.
+ */
+async function validatePushTarget(
+  adminClient: ReturnType<typeof createAdminClient>,
+  schoolId: string,
+  options: PushDeviceTargetOptions
+): Promise<{ error: string } | { device: any | null; cls: { id: string; name: string } | null; schoolName: string | null }> {
+  if (!options || typeof options !== 'object') return { error: 'Invalid request.' };
+  const category = options.category ?? 'all';
+  if (!PUSH_CATEGORIES.includes(category)) return { error: 'Invalid category.' };
+
+  let device: any | null = null;
+  let schoolName: string | null = null;
+  if (options.deviceSerialNumber !== undefined && options.deviceSerialNumber !== null && String(options.deviceSerialNumber).trim() !== '') {
+    device = await getOwnedDeviceBySerial(adminClient, schoolId, options.deviceSerialNumber);
+    if (!device) return { error: 'Device not found or access denied.' };
+    const { data: school } = await adminClient.from('schools').select('name').eq('id', schoolId).maybeSingle();
+    schoolName = school?.name || null;
+  }
+
+  let cls: { id: string; name: string } | null = null;
+  if (options.classId !== undefined && options.classId !== null && options.classId !== '') {
+    cls = await getOwnedClass(adminClient, schoolId, options.classId);
+    if (!cls) return { error: 'Class not found or access denied.' };
+  }
+  return { device, cls, schoolName };
 }
 
 export interface PushDeviceTargetOptions {
@@ -191,21 +252,9 @@ export async function getDevicePushCandidatesAction(options: PushDeviceTargetOpt
 
     let schoolName = 'Connected School';
 
-    if (deviceSerialNumber && deviceSerialNumber.trim()) {
-      const cleanSerial = deviceSerialNumber.trim();
-      const { data: deviceRecord } = await adminClient
-        .from('devices')
-        .select('id, serial_number, school_id, schools:school_id(name)')
-        .eq('school_id', schoolId)
-        .ilike('serial_number', cleanSerial)
-        .maybeSingle();
-
-      if (!deviceRecord) {
-        return { error: 'Device not found or access denied.' };
-      }
-      
-      schoolName = (deviceRecord.schools as any)?.name || schoolName;
-    }
+    const validation = await validatePushTarget(adminClient, schoolId, options);
+    if ('error' in validation) return { error: validation.error };
+    if (validation.schoolName) schoolName = validation.schoolName;
 
     let query = adminClient
       .from('people')
@@ -282,21 +331,9 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
     let schoolName = 'Connected School';
 
     // 1. Resolve school from the target device to guarantee multi-tenant scoping
-    if (deviceSerialNumber && deviceSerialNumber.trim()) {
-      const cleanSerial = deviceSerialNumber.trim();
-      const { data: deviceRecord } = await adminClient
-        .from('devices')
-        .select('id, serial_number, school_id, schools:school_id(name)')
-        .eq('school_id', schoolId)
-        .ilike('serial_number', cleanSerial)
-        .maybeSingle();
-
-      if (!deviceRecord) {
-        return { error: 'Device not found or access denied.' };
-      }
-      
-      schoolName = (deviceRecord.schools as any)?.name || schoolName;
-    }
+    const validation = await validatePushTarget(adminClient, schoolId, options);
+    if ('error' in validation) return { error: validation.error };
+    if (validation.schoolName) schoolName = validation.schoolName;
 
     // 3. Query people strictly scoped to this school_id
     let query = adminClient
@@ -330,13 +367,8 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       query = query.eq('role', 'student');
       if (classId) {
         query = query.eq('class_id', classId);
-        // Find class name for nice label
-        const { data: cls } = await adminClient
-          .from('classes')
-          .select('name')
-          .eq('id', classId)
-          .maybeSingle();
-        targetClassName = cls?.name || 'Selected Class';
+        // Class ownership was verified in validatePushTarget
+        targetClassName = validation.cls?.name || 'Selected Class';
         categoryLabel = `Class "${targetClassName}" Students`;
       } else {
         categoryLabel = 'Class Students';
@@ -367,19 +399,9 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
     let targetAdapter: any = null;
     let targetDevice: any = null;
 
-    if (deviceSerialNumber && deviceSerialNumber.trim()) {
-      const cleanSerial = deviceSerialNumber.trim().toUpperCase();
-      const { data: devRow } = await adminClient
-        .from('devices')
-        .select('*')
-        .eq('school_id', schoolId)
-        .ilike('serial_number', cleanSerial)
-        .maybeSingle();
-
-      if (devRow) {
-        targetDevice = parseDeviceMetadata(devRow);
-        targetAdapter = getDeviceAdapter(targetDevice.device_type);
-      }
+    if (validation.device) {
+      targetDevice = parseDeviceMetadata(validation.device);
+      targetAdapter = getDeviceAdapter(targetDevice.device_type);
     }
 
     let queuedCount = 0;
@@ -398,8 +420,8 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       if (targetDevice && targetAdapter) {
         const enrollCmd = targetAdapter.buildEnrollCommand(enrollInput, targetDevice);
         if (enrollCmd.transportType === 'adms_command' || enrollCmd.transportType === 'rest_api') {
-          await enqueueDeviceCommand(enrollCmd.command, targetDevice.serial_number);
-          queuedCount++;
+          const res = await enqueueDeviceCommand(enrollCmd.command, targetDevice.serial_number, { schoolId });
+          if (res.success) queuedCount++;
         }
       } else {
         // Broadcast to all devices owned by school with dynamic per-vendor translation
@@ -442,21 +464,9 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
 
     let schoolName = 'Connected School';
 
-    if (deviceSerialNumber && deviceSerialNumber.trim()) {
-      const cleanSerial = deviceSerialNumber.trim();
-      const { data: deviceRecord } = await adminClient
-        .from('devices')
-        .select('id, serial_number, school_id, schools:school_id(name)')
-        .eq('school_id', schoolId)
-        .ilike('serial_number', cleanSerial)
-        .maybeSingle();
-
-      if (!deviceRecord) {
-        return { error: 'Device not found or access denied.' };
-      }
-      
-      schoolName = (deviceRecord.schools as any)?.name || schoolName;
-    }
+    const validation = await validatePushTarget(adminClient, schoolId, options);
+    if ('error' in validation) return { error: validation.error };
+    if (validation.schoolName) schoolName = validation.schoolName;
 
     // 1. Fetch all people in school to find highest existing numeric PIN
     const { data: allSchoolPeople } = await adminClient
@@ -531,7 +541,8 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
       await adminClient
         .from('people')
         .update({ device_user_id: assignedPin })
-        .eq('id', p.id);
+        .eq('id', p.id)
+        .eq('school_id', schoolId);
 
       // Enqueue sync command to terminal
       const displayName = formatZKTecoDisplayName({
@@ -542,8 +553,8 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
 
       const pri = p.role === 'admin' ? 14 : 0;
       const cmd = `DATA UPDATE userinfo PIN=${assignedPin}\tName=${displayName}\tPri=${pri}`;
-      if (deviceSerialNumber) {
-        await enqueueDeviceCommand(cmd, deviceSerialNumber);
+      if (validation.device) {
+        await enqueueDeviceCommand(cmd, validation.device.serial_number, { schoolId });
       } else {
         await enqueueDeviceCommandForSchool(cmd, schoolId);
       }

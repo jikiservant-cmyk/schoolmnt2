@@ -81,3 +81,52 @@ denies access, and the admin client no longer falls back to the anon key.
    `2fb2bd6`). Rotate the key.
 5. The rate limiter is per instance. If you scale out, back it with
    Redis/Upstash.
+
+---
+
+# Part 2: Multi-tenant isolation audit
+
+Every school shares one database. Here the attacker is a legitimate admin of
+school A who tries to read or change school B's data. All tests ran with
+**RLS switched off**, so the application code had to stop every attack by
+itself. Lab and raw results: `security/multi-tenant-lab/`.
+
+## Findings (all fixed)
+
+| # | Severity | Issue | Fix |
+|---|---|---|---|
+| T1 | Critical | Device secrets weren't checked per device. Adapters compared against the plaintext `device_secret`, but new devices store only the hash. So the single global `ZKTECO_DEVICE_SECRET` authenticated every school's devices. Anyone holding it could inject attendance (and paid SMS) into any school and pull its enrol commands. Hashed non-ZKTeco devices couldn't log in at all. | `isAuthorizedDevice()` checks the per-device hash first, with a timing-safe compare. The global secret is a transition fallback that you can turn off. |
+| T2 | High | `enqueueDeviceCommand` found devices with a global, case-insensitive pattern match, and `schoolId` was optional. Commands could land in another school's device queue. | `schoolId` is required. Lookup is exact match + `school_id`. The command is refused if the device isn't yours. |
+| T3 | High | Push / auto-assign: `classId` wasn't validated, and the class-name lookup wasn't scoped to the school (it leaked B's class names). Auto-assign used the raw serial. | `validatePushTarget()` checks device, category and class ownership. |
+| T4 | High | `regenerateDeviceSecret` updated the device without a `school_id` filter. | Scoped, plus a UUID check. |
+| T5 | High | `addPerson` accepted another school's class for students, and for teachers (`classIdsJson`). | `getOwnedClass` / `allClassesOwned`. |
+| T6 | High | `addClass` accepted another school's teacher. | Teacher must belong to your school. |
+| T7 | High | `recordTeacherAttendance` accepted any person ID and any status string. | Ownership + role check. Status is limited to an allowed list. |
+| T8 | High | Payment webhook: the tenant **code** took priority over the school UUID we send ourselves, so a top-up could be credited to the wrong school. Non-UUID values went straight into a PostgREST `.or()` filter. Conflicting IDs were accepted. A missing reference became `tx_<now>`, so every replay credited again. | `resolveWebhookSchool()`: UUID first, conflicting IDs rejected, the code must map to exactly one school, and the school must exist. A reference is now required and the amount is bounds-checked. |
+| T9 | Medium | Guardian SMS lookups (device processor, kiosk, manual attendance) didn't check the guardian's school. Credential→person joins weren't checked either. | Guardian and person must have the same `school_id`. |
+| T10 | Low | `addDevice` said a serial was "already registered", which lets anyone enumerate serials. | Generic message. |
+| T11 | Low | `topUpBalance` accepted any amount and phone number. | Validated. |
+
+Defence in depth: `supabase_migrations/03_tenant_integrity.sql` adds triggers
+that reject any cross-school link at the database level. It covers class,
+teacher, attendance person/device, device commands, credentials, notifications
+and guardians. It also makes `school_id` immutable and adds a case-insensitive
+unique index on serials. Tested on Postgres 17 (16/16 cases).
+
+## Results
+
+Before: **15/42** attacks succeeded. After: **0/42** in strict mode (1/42 in
+transition mode, which is intentional). All 17 legitimate same-school flows
+still work.
+
+## Deployment steps (Part 2)
+
+1. Run the audit query at the bottom of `03_tenant_integrity.sql`. Then run the
+   migration. It's safe to re-run, and it skips tables that don't exist.
+2. Give every device its own secret: Dashboard → Devices → *Regenerate secret*,
+   then enter it on the terminal.
+3. Once every device uses its own secret, set
+   `ZKTECO_GLOBAL_SECRET_FALLBACK=false`. Until then, any device using the
+   shared secret logs a `[Device Auth] ... SHARED global secret` warning.
+4. Make sure the payment provider sends back a `reference`/`transactionId` and
+   `externalEntityId`/`metadata.schoolId`. Webhooks without them now get `400`.

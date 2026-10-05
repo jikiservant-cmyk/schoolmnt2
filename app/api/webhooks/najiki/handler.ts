@@ -1,6 +1,65 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createPublicAdminClient } from '@/utils/supabase/admin';
 import crypto from 'crypto';
+import { createAdminClient } from '@/utils/supabase/admin';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * MULTI-TENANT: decide which school a payment belongs to.
+ *
+ * Previously the first truthy field won, and tenant CODES were checked before
+ * the explicit school UUID that we send ourselves (externalEntityId /
+ * metadata.schoolId). If the payment provider echoed back a shared or
+ * ambiguous tenant code, the top-up could be credited to another school's
+ * wallet. Any non-UUID string was also interpolated into a PostgREST `.or()`
+ * filter.
+ *
+ * Now:
+ *  1. Explicit school UUIDs win. If they disagree, the payment is rejected.
+ *  2. Only when no UUID is present is a tenant code resolved, and it must map
+ *     to exactly one school.
+ *  3. The resolved school must exist.
+ */
+async function resolveWebhookSchool(publicAdmin: any, eventData: any): Promise<{ schoolId: string; via: string } | { error: string }> {
+  const md = (eventData && typeof eventData.metadata === 'object' && eventData.metadata) || {};
+  const uuidCandidates = [
+    eventData?.school_id, eventData?.schoolId, md.schoolId, md.school_id,
+    eventData?.externalEntityId, eventData?.external_entity_id,
+    eventData?.tenant_id, eventData?.tenantId, md.tenantId, md.tenant_id,
+  ].filter((v) => typeof v === 'string' && UUID_RE.test(v)).map((v: string) => v.toLowerCase());
+
+  const distinct = Array.from(new Set(uuidCandidates));
+  let schoolId: string | null = null;
+  let via = 'school_uuid';
+
+  if (distinct.length > 1) {
+    return { error: 'Conflicting school identifiers in payment payload' };
+  }
+  if (distinct.length === 1) {
+    schoolId = distinct[0];
+  } else {
+    const code = [eventData?.tenantCode, eventData?.tenant_code, md.tenantCode, md.tenant_code, eventData?.code]
+      .find((v) => typeof v === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(v));
+    if (!code) return { error: 'Missing school identifier' };
+    via = 'tenant_code';
+
+    const { data: tenants } = await publicAdmin.from('tenants').select('id').eq('code', code).limit(2);
+    if (Array.isArray(tenants) && tenants.length === 1 && UUID_RE.test(String(tenants[0].id))) {
+      schoolId = String(tenants[0].id).toLowerCase();
+    } else if (!tenants || tenants.length === 0) {
+      const { data: profiles } = await publicAdmin.from('profiles').select('school_id').eq('code', code).limit(2);
+      if (Array.isArray(profiles) && profiles.length === 1 && UUID_RE.test(String(profiles[0].school_id))) {
+        schoolId = String(profiles[0].school_id).toLowerCase();
+      }
+    }
+    if (!schoolId) return { error: 'Tenant code does not map to exactly one school' };
+  }
+
+  const { data: school, error } = await createAdminClient().from('schools').select('id').eq('id', schoolId).maybeSingle();
+  if (error || !school) return { error: 'Unknown school' };
+  return { schoolId, via };
+}
 
 export async function handleNajikiWebhook(req: NextRequest) {
   try {
@@ -93,20 +152,6 @@ export async function handleNajikiWebhook(req: NextRequest) {
       rawStatus === 'PAID';
 
     if (isPaymentSuccess) {
-      const schoolId = 
-        eventData.school_id || 
-        eventData.schoolId || 
-        eventData.tenant_id ||
-        eventData.tenantId ||
-        eventData.tenantCode || 
-        eventData.tenant_code ||
-        eventData.externalEntityId ||
-        eventData.external_entity_id ||
-        eventData.metadata?.schoolId || 
-        eventData.metadata?.school_id ||
-        eventData.metadata?.tenantId ||
-        eventData.metadata?.tenant_id;
-
       const amount = Number(
         eventData.amount || 
         eventData.value || 
@@ -115,38 +160,35 @@ export async function handleNajikiWebhook(req: NextRequest) {
         0
       );
 
-      const txRef = 
-        eventData.transaction_ref || 
+      const txRefRaw =
+        eventData.transaction_ref ||
         eventData.transactionRef ||
         eventData.transaction_id ||
         eventData.transactionId ||
-        eventData.reference || 
-        eventData.paymentIntentId || 
+        eventData.reference ||
+        eventData.paymentIntentId ||
         eventData.idempotencyKey ||
         eventData.idempotency_key ||
-        eventData.ext_ref ||
-        `tx_${Date.now()}`;
-      
-      if (schoolId && amount > 0) {
-        let targetSchoolId = schoolId;
-        // If schoolId was passed as a tenant code, resolve to school_id or user id from public.profiles
-        try {
-          const { data: prof } = await publicAdmin
-            .from('profiles')
-            .select('id, user_id, school_id, code')
-            .eq('code', schoolId)
-            .maybeSingle();
+        eventData.ext_ref;
+      const txRef = typeof txRefRaw === 'string' || typeof txRefRaw === 'number' ? String(txRefRaw).slice(0, 200) : '';
 
-          if (prof?.school_id) {
-            targetSchoolId = prof.school_id;
-          } else if (prof?.id) {
-            targetSchoolId = prof.id;
-          }
-        } catch {
-          // ignore
-        }
+      if (!txRef) {
+        return NextResponse.json({ error: 'Missing transaction reference' }, { status: 400 });
+      }
+      if (!Number.isFinite(amount) || amount <= 0 || amount > 50_000_000) {
+        return NextResponse.json({ error: 'Invalid amount' }, { status: 400 });
+      }
 
-        console.log(`[NaJiki Webhook] Processing wallet credit for school ${targetSchoolId} (raw identifier: ${schoolId}) with amount ${amount} UGX, ref: ${txRef}`);
+      const resolved = await resolveWebhookSchool(publicAdmin, eventData);
+      if ('error' in resolved) {
+        console.warn('[NaJiki Webhook] Could not resolve tenant for payment:', resolved.error);
+        return NextResponse.json({ error: resolved.error }, { status: 400 });
+      }
+      const targetSchoolId = resolved.schoolId;
+      const schoolId = targetSchoolId;
+
+      {
+        console.log(`[NaJiki Webhook] Processing wallet credit for school ${targetSchoolId} (resolved via ${resolved.via}) with amount ${amount} UGX, ref: ${txRef}`);
         
         // Strict Idempotency Check: Verify if txRef already exists
         const { data: existingTx } = await publicAdmin
@@ -276,9 +318,6 @@ export async function handleNajikiWebhook(req: NextRequest) {
           reference: txRef 
         }, { status: 200 });
 
-      } else {
-        console.warn('[NaJiki Webhook] Missing required fields for payment.success', { schoolId, amount, txRef, eventData });
-        return NextResponse.json({ error: 'Missing required payment fields (schoolId, amount)' }, { status: 400 });
       }
     } 
     

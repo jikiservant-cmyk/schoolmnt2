@@ -191,7 +191,7 @@ export async function submitClockInAction(deviceUserId: string) {
         let studentParent: any = null;
         const { data: primaryParent } = await adminClient
           .from('student_parents')
-          .select('parent_id, parents(phone, full_name)')
+          .select('parent_id, parents(phone, full_name, school_id)')
           .eq('student_id', person.id)
           .eq('is_primary_contact', true)
           .maybeSingle();
@@ -201,10 +201,15 @@ export async function submitClockInAction(deviceUserId: string) {
         } else {
           const { data: fallbackParent } = await adminClient
             .from('student_parents')
-            .select('parent_id, parents(phone, full_name)')
+            .select('parent_id, parents(phone, full_name, school_id)')
             .eq('student_id', person.id)
             .maybeSingle();
           studentParent = fallbackParent;
+        }
+
+        // MULTI-TENANT: never message a guardian registered under another school.
+        if (studentParent && (studentParent.parents as any)?.school_id !== schoolId) {
+          studentParent = null;
         }
 
         if (studentParent && studentParent.parents) {

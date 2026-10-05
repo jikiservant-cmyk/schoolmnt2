@@ -1,0 +1,212 @@
+[
+  {
+    "name": "addPerson: A enrols a student into B's class",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Selected class was not found in your school.\"}"
+  },
+  {
+    "name": "addPerson: A assigns a new teacher to B's class (sent to fn_add_person)",
+    "vulnerable": false,
+    "detail": "{\"error\":\"One or more selected classes were not found in your school.\"}"
+  },
+  {
+    "name": "addClass: A creates a class taught by B's teacher",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Selected teacher was not found in your school.\"}"
+  },
+  {
+    "name": "recordTeacherAttendance: A marks B's teacher present",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Staff member not found in your school.\"}"
+  },
+  {
+    "name": "recordTeacherAttendance: arbitrary status value stored",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Invalid attendance status.\"}"
+  },
+  {
+    "name": "updatePersonDeviceUserId: A rewrites B student's biometric ID",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Person record not found or access denied.\"}"
+  },
+  {
+    "name": "resetTeacherPin: A resets (and learns) B teacher's PIN",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Teacher record not found or access denied.\"}"
+  },
+  {
+    "name": "getDevicePushCandidates: B class name / students leak to A",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Class not found or access denied.\"}"
+  },
+  {
+    "name": "pushUsersToDevice serial=\"SNB0001\": A queues commands onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "pushUsersToDevice serial=\"snb0001\": A queues commands onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "pushUsersToDevice serial=\"%\": A queues commands onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "pushUsersToDevice serial=\"SN_0001\": A queues commands onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "pushUsersToDevice serial=\"SNB%\": A queues commands onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "pushUsersToDevice class=B: B class accepted / named in reply",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Class not found or access denied.\"}"
+  },
+  {
+    "name": "autoAssignDevicePins: A pushes PINs onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "pushAllUsersToDevice: A pushes everyone onto B's device",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found or access denied.\"}"
+  },
+  {
+    "name": "regenerateDeviceSecret: A rotates B device secret (takeover / DoS)",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Device not found.\"}"
+  },
+  {
+    "name": "addDevice: error reveals serial belongs to another school",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Serial Number \\\"SNB0001\\\" cannot be registered. If this is your device, contact support to transfer it.\"}"
+  },
+  {
+    "name": "getStudentsForClass: A reads B class roster",
+    "vulnerable": false,
+    "detail": "{\"error\":\"Class not found or access denied.\"}"
+  },
+  {
+    "name": "submitClassAttendance: A logs attendance for B student",
+    "vulnerable": false,
+    "detail": "{\"success\":false,\"error\":\"Invalid student reference provided.\"}"
+  },
+  {
+    "name": "submitClockIn: A kiosk clocks in B student (device id 202)",
+    "vulnerable": false,
+    "detail": "{\"error\":\"ID not registered for this school. Check enrollment.\"}"
+  },
+  {
+    "name": "searchPeople term=\"x,school_id.neq.null\": B rows returned",
+    "vulnerable": false,
+    "detail": "{\"success\":true,\"data\":[],\"count\":0}"
+  },
+  {
+    "name": "searchPeople term=\"B-SECRETNAME\": B rows returned",
+    "vulnerable": false,
+    "detail": "{\"success\":true,\"data\":[],\"count\":0}"
+  },
+  {
+    "name": "searchPeople term=\"*)\": B rows returned",
+    "vulnerable": false,
+    "detail": "{\"success\":true,\"data\":[{\"id\":\"aaaaaaaa-0000-4000-8000-0000000000f1\",\"full_name\":\"Student A-SECRETNAME\",\"role\":\"student\""
+  },
+  {
+    "name": "searchPeople term=\"a%\": B rows returned",
+    "vulnerable": false,
+    "detail": "{\"success\":true,\"data\":[{\"id\":\"aaaaaaaa-0000-4000-8000-0000000000f1\",\"full_name\":\"Student A-SECRETNAME\",\"role\":\"student\""
+  },
+  {
+    "name": "getAttendanceData: B rows visible to A",
+    "vulnerable": false,
+    "detail": ""
+  },
+  {
+    "name": "page /dashboard: contains B data",
+    "vulnerable": false,
+    "detail": ""
+  },
+  {
+    "name": "page /dashboard/people: contains B data",
+    "vulnerable": false,
+    "detail": ""
+  },
+  {
+    "name": "page /dashboard/classes: contains B data",
+    "vulnerable": false,
+    "detail": ""
+  },
+  {
+    "name": "page /dashboard/devices: contains B data",
+    "vulnerable": false,
+    "detail": ""
+  },
+  {
+    "name": "page /dashboard/attendance: contains B data",
+    "vulnerable": false,
+    "detail": ""
+  },
+  {
+    "name": "iclock: B serial accepted with A's per-device secret",
+    "vulnerable": false,
+    "detail": 401
+  },
+  {
+    "name": "iclock (baseline): A serial + A secret is accepted",
+    "vulnerable": false,
+    "detail": 200
+  },
+  {
+    "name": "iclock: B device accepted with GLOBAL shared secret (transition mode allows; strict mode must not)",
+    "vulnerable": false,
+    "detail": "401 (expected 200 while ZKTECO_GLOBAL_SECRET_FALLBACK unset)"
+  },
+  {
+    "name": "iclock ATTLOG: A forges attendance for B student on B device",
+    "vulnerable": false,
+    "detail": 401
+  },
+  {
+    "name": "iclock ATTLOG: A device punch resolves to B student",
+    "vulnerable": false,
+    "detail": 200
+  },
+  {
+    "name": "iclock getrequest (A): leaks B commands",
+    "vulnerable": false,
+    "detail": "C:3bc96898-ed42-47ff-aebf-44fc96ceee28:DATA UPDATE USERINFO PIN=999 Name=A-SECRETCMD"
+  },
+  {
+    "name": "iclock getrequest: A pulls B queue with own secret",
+    "vulnerable": false,
+    "detail": 401
+  },
+  {
+    "name": "webhook: A's top-up credited to B (tenant code beats school uuid)",
+    "vulnerable": false,
+    "detail": "200 A 1000->1500 B 1000->1000"
+  },
+  {
+    "name": "webhook: missing reference -> replay double-credits",
+    "vulnerable": false,
+    "detail": "400/400 A 1500->1500"
+  },
+  {
+    "name": "webhook: filter injection via schoolId accepted",
+    "vulnerable": false,
+    "detail": "400 {\"error\":\"Missing school identifier\"}"
+  },
+  {
+    "name": "webhook: conflicting school ids accepted",
+    "vulnerable": false,
+    "detail": "400 {\"error\":\"Conflicting school identifiers in payment payload\"}"
+  }
+]
