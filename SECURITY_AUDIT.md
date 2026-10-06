@@ -532,7 +532,7 @@ Without 05, the payments suite shows no credit at all: P1, P2, P3b and P7 are no
 
 ## Go-live (Part 7)
 
-1. Run migrations in order: **05 → 06 → 07 → 08** (back up first; 08 added in Part 9). Read the NOTICE lists.
+1. Run migrations in order: **05 → 06 → 07 → 08 → 09** (back up first; run 09 outside gate hours). Read the NOTICE lists.
 2. If you ever merge duplicate wallets: move the balance to the wallet you keep, set the other to 0, then delete it.
 3. Test one signup after the migration (it uses the service key, so it must still work).
 
@@ -619,7 +619,7 @@ A new test, `security/multi-tenant-lab/money-reconcile.mjs`, runs 12 real-life p
 
 ## Go-live (Part 9)
 
-Run migrations **05 → 06 → 07 → 08** (back up first). 08 is safe to re-run.
+Run migrations **05 → 06 → 07 → 08 → 09** (back up first; run 09 outside gate hours). Migration 09 is safe to re-run.
 
 ---
 
@@ -702,3 +702,64 @@ Streams are class entries ("S.2 East", "S.2 West"), so "push by stream" means ch
 **One old bug fixed (N5):** "One class" with no class picked made **Auto-assign** apply no filter, so it gave device IDs to teachers and staff too. This was already the case before Part 10. The preview and Push already treat this case as "students only", and Auto-assign now uses the same rule.
 
 Battery after the fix: device 0/15, attack 1/42 (known), regress, rls 0/32, flows, links, render, round4, rogue, reconcile, payments 0/20, pay-rls 0/8, and genuine NaJiki are all OK. tsc, eslint and build are clean.
+
+# Part 11: ZKTeco double-thumb attendance deduplication
+
+## Finding and fix
+
+The old processor compared `person_id` + `occurred_at` as strings. PostgREST returned UTC timestamps such as `2026-10-06T04:45:00+00:00`, while the app compared against `2026-10-06T04:45:00.000Z`; the same saved punch therefore looked new on a later upload. The old two-second query window also did not deduplicate a child who thumbed again seconds later, and concurrent requests could all pass the read-before-write check.
+
+`lib/devices/processor.ts` now compares parsed instants, defaults `ATTENDANCE_DUPLICATE_WINDOW_SECONDS` to **120** (clamped to 0–3600; 0 means exact duplicates only), sorts each upload oldest-first and remembers each kept punch. Same-direction punches within the window are deduplicated; check-in and check-out remain separate. A failed lookup logs a warning and continues, while non-unique insert errors still throw for the device's 503 retry. `23505` conflicts still use the row-by-row skip fallback, and duplicate uploads still receive `OK`. Parent SMS dedupe remains one message per child, direction and local day.
+
+Migration `09_attendance_duplicate_guard.sql` archives only exact duplicate `source='device'` rows (same person and instant), retaining the lowest `id`; it leaves seconds-apart history and manual rows unchanged. The private archive has RLS enabled and no policies, app-role grants are revoked only on that table, and a partial unique index prevents a concurrent exact device punch from being stored twice.
+
+## Double-thumb test (real Postgres + app + PostgREST-format timestamps)
+
+`security/multi-tenant-lab/double-thumb-check.mjs` runs the real `/iclock/cdata` endpoint and counts database rows. The shim was run with `PGRST_TS=1`; its type-1184 parser returns `YYYY-MM-DDTHH:MM:SS+00:00` and sets UTC on each connection. Results are saved as `double-thumb-results-*.json`.
+
+| Scenario | Expected | Before (old code) | After (window 120 + migration 09) |
+|---|---:|---:|---:|
+| Same second twice in one upload | 1 | 1 | 1 |
+| Same punch re-sent in a later upload | 1 | 2 | 1 |
+| Same punch sent 5× in parallel | 1 | 5 | 1 |
+| Two thumbs 2 seconds apart, one upload | 1 | 2 | 1 |
+| Two thumbs 2 seconds apart, separate uploads | 1 | 2 | 1 |
+| Two thumbs 40 seconds apart | 1 | 2 | 1 |
+| Check-in, then check-out 1 minute later | 2 | 2 | 2 |
+| Same child again 3 minutes later | 2 | 2 | 2 |
+| Two different students at the same second | 2 | 2 | 2 |
+| Morning check-in, afternoon check-out | 2 | 2 | 2 |
+| **Scenarios passing** | **10** | **5/10** | **10/10** |
+
+The exact duplicate in one upload already passed before the fix because the old in-memory check caught byte-identical incoming timestamps. The later-upload resend and the seconds-apart cases exposed the timestamp-format/window bugs; the parallel case exposed the missing database guard.
+
+- With `MIG09=0`, **9/10** scenarios passed; only the parallel case failed (2 rows in this run), confirming the database index is required for the race.
+- With `ATTENDANCE_DUPLICATE_WINDOW_SECONDS=0`, exact repeats still passed; the 2-second and 40-second pairs correctly remained separate (7/10 against the default-window expectations).
+- Migration 09 was tested independently: **9/9** checks passed—exact duplicates archived, seconds-apart and manual rows preserved, second run safe, repeated device punch rejected, manual inserts unrestricted, backup RLS on with no policies and no grants to `anon`/`authenticated`.
+
+## Regression battery
+
+All requested existing suites were rerun with migration 09 enabled. Payments, SMS, device-name push, category/class/stream push and links behaved as before.
+
+| Suite | Result |
+|---|---|
+| `device-attack.mjs` | 0/15 vulnerable |
+| `device-names-check.mjs` | 17/17 OK |
+| `device-push-categories-check.mjs` | 44/44 OK |
+| `attack.mjs` | 1/42; the known `ZKTECO_GLOBAL_SECRET_FALLBACK` transition item remains |
+| `regress.mjs` | 17/17 OK |
+| `rls-attack.mjs` | 0/32 vulnerable |
+| `flows-check.mjs` | All flows OK |
+| `link-crawl.mjs` | No problems; all checked links/assets resolved |
+| `render-check.mjs` | 5/5 pages show school A only |
+| `round4-attack.mjs` | 0/5 vulnerable; no legitimate failures |
+| `rogue-attack.mjs` | 0/21 vulnerable; no legitimate failures |
+| `money-reconcile.mjs` | All money/reconciliation checks OK |
+| `payments-attack.mjs` | 0/20 vulnerable; no legitimate failures |
+| `pay-rls-check.mjs` | 0/8 vulnerable |
+| `genuine-najiki-check.mjs` | HTTP 200; 2,000 UGX credited |
+| `tsc` | Passed |
+| `eslint` | Passed with 0 errors (one existing `loadData` hook-dependency warning in `app/dashboard/attendance/page.tsx`) |
+| `next build` | Passed |
+
+**Go-live:** run migrations **05 → 06 → 07 → 08 → 09** (back up first; run 09 outside gate hours).
