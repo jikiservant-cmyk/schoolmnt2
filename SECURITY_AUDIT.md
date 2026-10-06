@@ -683,3 +683,22 @@ The terminal polls the real app, applies the commands to its own user list, and 
 | tsc / eslint / build | clean |
 
 **Go-live:** no migration is needed for Part 10. After deploying, press **Devices → Push users to device** once per terminal, so every name is re-sent in the correct format.
+
+## Part 10b: Push by category, class and stream (nothing changed for users)
+
+Streams are class entries ("S.2 East", "S.2 West"), so "push by stream" means choosing that class.
+
+**Test:** `device-push-categories-check.mjs`. The lab school has two streams, a P.5 class, teachers, an admin, support staff, a student who left, people with no device ID, and another school with a stream of the **same name**. Every option is pressed: Teachers (including admins), Support staff, All students, each stream and class, and Everyone. Each is checked through three paths: the preview, "Push names", and "Auto-assign IDs + push".
+
+**Result after the fix: 44/44 OK.** For every option:
+
+- The strict simulated terminal shows **exactly** the expected people.
+- The preview equals what was pushed, and the names on the device equal the names in the preview.
+- Device rights are unchanged (admin 14, everyone else 0).
+- The other school's stream and device are refused, and their terminal receives nothing.
+
+**Old code vs new code:** the same test was run on `77bd32e`, the code before Part 10, with a terminal that tolerates the old long IDs. The selection (who is queued, preview counts, push counts, auto-assign) is **identical** for every option. Compare `device-push-selection-old-code.json` with `device-push-selection-after.json`. Part 10 changed how names travel to the device, not who gets sent.
+
+**One old bug fixed (N5):** "One class" with no class picked made **Auto-assign** apply no filter, so it gave device IDs to teachers and staff too. This was already the case before Part 10. The preview and Push already treat this case as "students only", and Auto-assign now uses the same rule.
+
+Battery after the fix: device 0/15, attack 1/42 (known), regress, rls 0/32, flows, links, render, round4, rogue, reconcile, payments 0/20, pay-rls 0/8, and genuine NaJiki are all OK. tsc, eslint and build are clean.

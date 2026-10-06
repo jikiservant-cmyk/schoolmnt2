@@ -509,8 +509,11 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
       query = query.eq('role', 'support_staff');
     } else if (category === 'all_students') {
       query = query.eq('role', 'student');
-    } else if (category === 'class' && classId) {
-      query = query.eq('role', 'student').eq('class_id', classId);
+    } else if (category === 'class') {
+      // Same rule as the preview and "push": "class" only ever means students.
+      // (Without a classId this used to apply no filter and give IDs to staff too.)
+      query = query.eq('role', 'student');
+      if (classId) query = query.eq('class_id', classId);
     }
 
     const { data: unassignedPeople, error: fetchErr } = await query;
