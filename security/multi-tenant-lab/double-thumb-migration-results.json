@@ -1,0 +1,51 @@
+{
+  "passed": 9,
+  "total": 9,
+  "checks": [
+    {
+      "name": "archives exact device duplicates and keeps the lowest id",
+      "passed": true,
+      "detail": "active=1, backup=2"
+    },
+    {
+      "name": "leaves device punches seconds apart untouched",
+      "passed": true,
+      "detail": "remaining=2"
+    },
+    {
+      "name": "leaves manual duplicate rows untouched",
+      "passed": true,
+      "detail": "remaining=2"
+    },
+    {
+      "name": "migration reports the number archived",
+      "passed": true,
+      "detail": "Moved 2 exact duplicate device attendance row(s) to school.attendance_logs_duplicates_backup"
+    },
+    {
+      "name": "migration is safe to run twice",
+      "passed": true,
+      "detail": "backup=2->2"
+    },
+    {
+      "name": "unique index refuses a repeated device punch",
+      "passed": true,
+      "detail": "error=23505"
+    },
+    {
+      "name": "unique index does not restrict manual attendance",
+      "passed": true,
+      "detail": "inserted=2"
+    },
+    {
+      "name": "backup is protected by RLS with no policies",
+      "passed": true,
+      "detail": "rls=true, policies=0"
+    },
+    {
+      "name": "backup has no app-role grants",
+      "passed": true,
+      "detail": "anon/authenticated have no table privileges"
+    }
+  ]
+}

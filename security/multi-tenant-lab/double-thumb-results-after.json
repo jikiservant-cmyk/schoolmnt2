@@ -1,0 +1,115 @@
+{
+  "label": "after",
+  "duplicateWindowSeconds": "default (120)",
+  "migration09Enabled": true,
+  "passed": 10,
+  "total": 10,
+  "results": [
+    {
+      "scenario": "Same second twice in one upload",
+      "expectedRows": 1,
+      "actualRows": 1,
+      "httpStatuses": [
+        200
+      ],
+      "keptOldestPunch": null,
+      "passed": true
+    },
+    {
+      "scenario": "Same punch re-sent in a later upload",
+      "expectedRows": 1,
+      "actualRows": 1,
+      "httpStatuses": [
+        200,
+        200
+      ],
+      "keptOldestPunch": null,
+      "passed": true
+    },
+    {
+      "scenario": "Same punch sent 5x in parallel",
+      "expectedRows": 1,
+      "actualRows": 1,
+      "httpStatuses": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "keptOldestPunch": null,
+      "passed": true
+    },
+    {
+      "scenario": "Two thumbs 2 seconds apart in one upload (newer arrives first)",
+      "expectedRows": 1,
+      "actualRows": 1,
+      "httpStatuses": [
+        200
+      ],
+      "keptOldestPunch": true,
+      "passed": true
+    },
+    {
+      "scenario": "Two thumbs 2 seconds apart in separate uploads",
+      "expectedRows": 1,
+      "actualRows": 1,
+      "httpStatuses": [
+        200,
+        200
+      ],
+      "keptOldestPunch": true,
+      "passed": true
+    },
+    {
+      "scenario": "Two thumbs 40 seconds apart",
+      "expectedRows": 1,
+      "actualRows": 1,
+      "httpStatuses": [
+        200
+      ],
+      "keptOldestPunch": true,
+      "passed": true
+    },
+    {
+      "scenario": "Check-in then check-out 1 minute later",
+      "expectedRows": 2,
+      "actualRows": 2,
+      "httpStatuses": [
+        200
+      ],
+      "keptOldestPunch": null,
+      "passed": true
+    },
+    {
+      "scenario": "Same child 3 minutes later in the same direction",
+      "expectedRows": 2,
+      "actualRows": 2,
+      "httpStatuses": [
+        200
+      ],
+      "keptOldestPunch": null,
+      "passed": true
+    },
+    {
+      "scenario": "Two different students at the same second",
+      "expectedRows": 2,
+      "actualRows": 2,
+      "httpStatuses": [
+        200
+      ],
+      "keptOldestPunch": null,
+      "passed": true
+    },
+    {
+      "scenario": "Morning check-in and afternoon check-out",
+      "expectedRows": 2,
+      "actualRows": 2,
+      "httpStatuses": [
+        200
+      ],
+      "keptOldestPunch": null,
+      "passed": true
+    }
+  ]
+}

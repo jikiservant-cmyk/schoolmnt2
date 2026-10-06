@@ -3,13 +3,35 @@
 // every tenant's rows, so only the application's own checks keep tenants apart.
 const http = require('http');
 const crypto = require('crypto');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
 const { AsyncLocalStorage } = require('async_hooks');
 const als = new AsyncLocalStorage();
 const NAJIKI = [];
 const dbq = (sql, p) => (als.getStore() || pool).query(sql, p);
 
-const pool = new Pool({ host: '127.0.0.1', port: 54329, user: 'postgres', password: 'pw', database: 'mtlab' });
+// Match PostgREST's timestamptz JSON representation when requested by tests.
+// Supabase emits UTC instants like 2026-10-06T04:45:00+00:00 (not JS's
+// 2026-10-06T04:45:00.000Z); keeping this format exposed the old string-compare bug.
+if (process.env.PGRST_TS === '1') {
+  types.setTypeParser(1184, (value) => {
+    const parsed = new Date(value);
+    if (!Number.isFinite(parsed.getTime())) return value;
+    return parsed.toISOString().slice(0, 19) + '+00:00';
+  });
+}
+
+const pool = new Pool({
+  host: '127.0.0.1',
+  port: 54329,
+  user: 'postgres',
+  password: 'pw',
+  database: 'mtlab',
+  ...(process.env.PGRST_TS === '1' ? {
+    // pg-pool awaits onConnect before handing a client to a request, so the
+    // session timezone is set before any PostgREST query runs.
+    onConnect: (client) => client.query("SET TIME ZONE 'UTC'"),
+  } : {}),
+});
 const SECRET = 'lab-secret';
 const USERS = {}; // email -> {id,password,email}
 const LOG = [];

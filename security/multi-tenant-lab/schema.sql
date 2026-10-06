@@ -17,7 +17,8 @@ CREATE TABLE school.device_commands(id uuid primary key default gen_random_uuid(
   status text default 'pending', created_at timestamptz default now(), sent_at timestamptz, completed_at timestamptz, result text, attempts int default 0);
 CREATE TABLE school.device_logs(id uuid primary key default gen_random_uuid(), school_id uuid, device_id uuid references school.devices, serial_number text, payload jsonb, log_type text, raw_data text, created_at timestamptz default now());
 CREATE TABLE school.attendance_logs(id uuid primary key default gen_random_uuid(), school_id uuid references school.schools, person_id uuid references school.people, device_id uuid references school.devices, class_id uuid references school.classes,
-  status text, attendance_type text, occurred_at timestamptz default now(), source text, created_at timestamptz default now(), recorded_by uuid, notes text, verify_mode text, raw_payload jsonb);
+  status text, attendance_type text, occurred_at timestamptz default now(), source text, created_at timestamptz default now(), recorded_by uuid, notes text, verify_mode text, raw_payload jsonb,
+  device_log_id uuid, marked_by uuid, class_id_at_time uuid, class_name_at_time text);
 CREATE TABLE school.parents(id uuid primary key default gen_random_uuid(), school_id uuid references school.schools, full_name text, phone text);
 CREATE TABLE school.student_parents(id uuid primary key default gen_random_uuid(), student_id uuid references school.people, parent_id uuid references school.parents, is_primary_contact boolean default true, relationship text);
 CREATE TABLE school.person_credentials(id uuid primary key default gen_random_uuid(), school_id uuid, person_id uuid references school.people, identifier_value text, identifier_type text, device_id uuid);

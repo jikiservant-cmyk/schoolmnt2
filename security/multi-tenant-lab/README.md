@@ -94,3 +94,15 @@ RLS=1 HARDEN=0         node rogue-attack.mjs ... after                          
 - K1/K2 (kiosk / register races) only run between 16:00 and 22:00 EAT (check-out SMS window).
 - `prod-like-functions.sql` creates a production-style `public.credit_wallet` (SECURITY DEFINER, executable by PUBLIC). `PRODFN=0` skips it.
 - seed.js env: `HARDEN=0` (skip 04's optional public step), `MIG05=0`, `MIG06=0`. It also creates a teacher login (`teacherA@lab.io`).
+
+## Attendance duplicate-punch guard (Part 11)
+
+Start the shim with `PGRST_TS=1` so `timestamptz` responses use Supabase's UTC format. Start the app with the desired `ATTENDANCE_DUPLICATE_WINDOW_SECONDS` (default 120), then run:
+
+```bash
+RLS=1 node double-thumb-check.mjs http://127.0.0.1:3201 after
+RLS=1 MIG09=0 node double-thumb-check.mjs http://127.0.0.1:3201 without-mig09
+RLS=1 node double-thumb-migration-check.mjs
+```
+
+For exact-only behavior, start the app with `ATTENDANCE_DUPLICATE_WINDOW_SECONDS=0` and run the first command with label `window-zero`. Each endpoint test reseeds the lab; JSON results are written as `double-thumb-results-*.json`.

@@ -19,6 +19,16 @@ export interface ProcessEventsResult {
  * Handles person lookup, deduplication, late-cutoff calculation, batch inserts, and SMS queues.
  */
 const MAX_EVENTS_PER_BATCH = 2000;
+const DEFAULT_ATTENDANCE_DUPLICATE_WINDOW_SECONDS = 120;
+
+function attendanceDuplicateWindowMs(): number {
+  const configured = process.env.ATTENDANCE_DUPLICATE_WINDOW_SECONDS;
+  const parsed = configured == null || configured.trim() === ''
+    ? DEFAULT_ATTENDANCE_DUPLICATE_WINDOW_SECONDS
+    : Number(configured);
+  if (!Number.isFinite(parsed)) return DEFAULT_ATTENDANCE_DUPLICATE_WINDOW_SECONDS * 1000;
+  return Math.trunc(Math.max(0, Math.min(3600, parsed))) * 1000;
+}
 
 export async function processAttendanceEvents(
   events: AttendanceEvent[],
@@ -128,9 +138,6 @@ export async function processAttendanceEvents(
     logDate: Date;
   }[] = [];
 
-  let earliestDate = new Date();
-  let latestDate = new Date('2000-01-01');
-
   for (const ev of events) {
     const cleanPin = ev.person_external_id.trim().toLowerCase();
     const person = personMap.get(cleanPin) || 
@@ -153,9 +160,6 @@ export async function processAttendanceEvents(
     const logDate = ev.timestamp instanceof Date && !isNaN(ev.timestamp.getTime()) ? ev.timestamp : new Date();
     const isoString = logDate.toISOString();
 
-    if (logDate < earliestDate) earliestDate = logDate;
-    if (logDate > latestDate) latestDate = logDate;
-
     matchedList.push({
       event: ev,
       person,
@@ -168,20 +172,48 @@ export async function processAttendanceEvents(
     return result;
   }
 
-  // 3. Query existing attendance logs within time range to prevent duplicate punch recordings
-  const earliestIso = new Date(earliestDate.getTime() - 2000).toISOString();
-  const latestIso = new Date(latestDate.getTime() + 2000).toISOString();
+  // 3. Deduplicate real instants in a configurable window. Processing oldest
+  // first preserves the first thumb in a batch, and adding every kept punch to
+  // knownPunches also catches repeats inside that same upload.
+  matchedList.sort((a, b) => a.logDate.getTime() - b.logDate.getTime());
+  const duplicateWindowMs = attendanceDuplicateWindowMs();
+  const earliestMs = matchedList[0].logDate.getTime();
+  const latestMs = matchedList[matchedList.length - 1].logDate.getTime();
+  const earliestIso = new Date(earliestMs - duplicateWindowMs).toISOString();
+  const latestIso = new Date(latestMs + duplicateWindowMs).toISOString();
   const personIds = Array.from(new Set(matchedList.map(m => m.person.id)));
 
-  const { data: existingLogs } = await supabase
-    .from('attendance_logs')
-    .select('person_id, occurred_at')
-    .eq('school_id', device.school_id)
-    .in('person_id', personIds)
-    .gte('occurred_at', earliestIso)
-    .lte('occurred_at', latestIso);
+  let existingLogs: any[] = [];
+  let existingLogsError: unknown = null;
+  try {
+    const { data, error } = await supabase
+      .from('attendance_logs')
+      .select('person_id, attendance_type, occurred_at')
+      .eq('school_id', device.school_id)
+      .in('person_id', personIds)
+      .gte('occurred_at', earliestIso)
+      .lte('occurred_at', latestIso);
 
-  const existingSet = new Set((existingLogs || []).map(l => `${l.person_id}-${l.occurred_at}`));
+    if (error) existingLogsError = error;
+    else existingLogs = data || [];
+  } catch (error) {
+    existingLogsError = error;
+  }
+
+  if (existingLogsError) {
+    // This is a best-effort optimization. The unique database index still
+    // rejects exact duplicate device punches if the lookup is unavailable.
+    const message = existingLogsError instanceof Error
+      ? existingLogsError.message
+      : (existingLogsError as { message?: string } | null)?.message || String(existingLogsError);
+    console.warn(`[Device Processor] Duplicate attendance lookup failed for ${device.serial_number}; continuing: ${message}`);
+  }
+  const knownPunches: { person_id: string; attendance_type: string; occurred_at: string }[] =
+    existingLogsError ? [] : existingLogs.map((log: any) => ({
+      person_id: log.person_id,
+      attendance_type: log.attendance_type,
+      occurred_at: log.occurred_at
+    }));
 
   // 4. Resolve School/Device Late Cutoff and TimeZone configuration
   const timeZone = device.config?.timeZone || 'Africa/Kampala';
@@ -201,12 +233,29 @@ export async function processAttendanceEvents(
   const nowIso = new Date().toISOString();
 
   for (const item of matchedList) {
-    const dedupKey = `${item.person.id}-${item.isoString}`;
-    if (existingSet.has(dedupKey)) {
+    const incomingMs = new Date(item.isoString).getTime();
+    const duplicate = knownPunches.some((known) => {
+      if (known.person_id !== item.person.id) return false;
+      // Check-in and check-out are separate attendance actions and must never
+      // be collapsed into one another.
+      if (known.attendance_type !== item.event.event_type) return false;
+
+      const knownMs = new Date(known.occurred_at).getTime();
+      if (!Number.isFinite(knownMs) || !Number.isFinite(incomingMs)) return false;
+      const distanceMs = Math.abs(knownMs - incomingMs);
+      if (distanceMs === 0) return true;
+      if (duplicateWindowMs === 0) return false;
+      return distanceMs < 1000 || distanceMs <= duplicateWindowMs;
+    });
+    if (duplicate) {
       result.skippedDuplicates++;
       continue;
     }
-    existingSet.add(dedupKey);
+    knownPunches.push({
+      person_id: item.person.id,
+      attendance_type: item.event.event_type,
+      occurred_at: item.isoString
+    });
 
     const deviceLogId = crypto.randomUUID();
 
@@ -313,8 +362,11 @@ export async function processAttendanceEvents(
     } else {
       result.insertedAttendanceLogs = attendanceLogsToInsert.length;
     }
-    console.log(`[Device Processor] Saved ${attendanceLogsToInsert.length} attendance records from device ${device.serial_number} (${device.device_type})`);
   }
+  const skippedDuplicatesNote = result.skippedDuplicates
+    ? `; skipped ${result.skippedDuplicates} duplicate(s)`
+    : '';
+  console.log(`[Device Processor] Saved ${result.insertedAttendanceLogs} attendance records from device ${device.serial_number} (${device.device_type})${skippedDuplicatesNote}`);
 
   // 6. Queue SMS Notifications for Parents
   // COST / ABUSE: one SMS per child per direction per local day. A child

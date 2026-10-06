@@ -46,10 +46,10 @@ if (require.main === module) (async () => {
   }
   await c.query(fs.readFileSync(__dirname + '/supabase-base.sql', 'utf8'));
   if (process.env.PRODFN !== '0') await c.query(fs.readFileSync(__dirname + '/prod-like-functions.sql', 'utf8'));
+  const mig = '/home/user/schoolmnt2/supabase_migrations/';
   if (process.env.RLS === '1') {
     // Emulate a sloppy pre-existing setup: RLS on, plus a wide-open policy.
     await c.query("ALTER TABLE school.people ENABLE ROW LEVEL SECURITY; CREATE POLICY legacy_open ON school.people FOR SELECT TO authenticated USING (true)");
-    const mig = '/home/user/schoolmnt2/supabase_migrations/';
     await c.query(fs.readFileSync(mig + '03_tenant_integrity.sql', 'utf8'));
     if (process.env.HARDEN !== '0') await c.query("SET smartskoolz.harden_public = 'on'");
     await c.query(fs.readFileSync(mig + '04_rls_tenant_isolation.sql', 'utf8'));
@@ -58,6 +58,9 @@ if (require.main === module) (async () => {
     if (process.env.MIG05 !== '0' && process.env.MIG07 !== '0' && fs.existsSync(mig + '07_payment_hardening.sql')) await c.query(fs.readFileSync(mig + '07_payment_hardening.sql', 'utf8'));
     if (process.env.MIG05 !== '0' && process.env.MIG07 !== '0' && process.env.MIG08 !== '0' && fs.existsSync(mig + '08_payment_retry_dedupe.sql')) await c.query(fs.readFileSync(mig + '08_payment_retry_dedupe.sql', 'utf8'));
     console.log('RLS migrations applied');
+  }
+  if (process.env.MIG09 !== '0' && fs.existsSync(mig + '09_attendance_duplicate_guard.sql')) {
+    await c.query(fs.readFileSync(mig + '09_attendance_duplicate_guard.sql', 'utf8'));
   }
   console.log('seeded');
   await c.end();
