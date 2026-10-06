@@ -1,0 +1,32 @@
+{
+ "vulnerable": 0,
+ "total": 5,
+ "broken": [],
+ "results": [
+  {
+   "name": "R1 anonymous visitor runs signup provisioning for any profile (creates schools + NaJiki tenants)",
+   "vulnerable": false,
+   "detail": "400 {\"code\":\"42501\",\"message\":\"permission denied for function rp_create_school_from_"
+  },
+  {
+   "name": "R2 teacher runs signup provisioning",
+   "vulnerable": false,
+   "detail": "400 {\"code\":\"42501\",\"message\":\"permission denied for function rp_create_school_from_"
+  },
+  {
+   "name": "R3 stale legacy settings.balance re-minted after wallet row deleted",
+   "vulnerable": false,
+   "detail": "stale settings.balance=101000, wallet after 500 top-up=500"
+  },
+  {
+   "name": "R5 wallet still holding money can be deleted",
+   "vulnerable": false,
+   "detail": "wallet 4360638f-1cf2-434a-bb33-02e3136577c9 still holds 4500 UGX: move the balance to anot"
+  },
+  {
+   "name": "R4 anonymous role executes school-schema functions",
+   "vulnerable": false,
+   "detail": "42501 permission denied for function auth_school_id"
+  }
+ ]
+}

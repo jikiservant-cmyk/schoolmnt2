@@ -1,5 +1,5 @@
 import { DeviceAdapter, DeviceRecord, AttendanceEvent, EnrollPersonInput, EnrollCommandResult, HandshakeResponse } from '../types';
-import { isAuthorizedToken } from '../metadata';
+import { isAuthorizedDevice } from '../metadata';
 
 export class DahuaIsapiAdapter implements DeviceAdapter {
   readonly deviceType = 'dahua_isapi';
@@ -14,7 +14,7 @@ export class DahuaIsapiAdapter implements DeviceAdapter {
       req.headers.get('authorization')?.replace(/^Bearer\s+/i, '') ||
       url.searchParams.get('token');
 
-    return isAuthorizedToken(providedToken, device.device_secret);
+    return isAuthorizedDevice(providedToken, device);
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {

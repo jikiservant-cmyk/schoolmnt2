@@ -1,5 +1,5 @@
 import { DeviceAdapter, DeviceRecord, AttendanceEvent, EnrollPersonInput, EnrollCommandResult, HandshakeResponse } from '../types';
-import { isAuthorizedToken } from '../metadata';
+import { isAuthorizedDevice } from '../metadata';
 import { formatZKTecoDisplayName } from '@/utils/zkteco/formatter';
 
 export class ZKTecoAdmsAdapter implements DeviceAdapter {
@@ -17,7 +17,7 @@ export class ZKTecoAdmsAdapter implements DeviceAdapter {
       url.searchParams.get('push_token') ||
       url.searchParams.get('PushToken');
 
-    return isAuthorizedToken(providedToken, device.device_secret, process.env.ZKTECO_DEVICE_SECRET);
+    return isAuthorizedDevice(providedToken, device, process.env.ZKTECO_DEVICE_SECRET);
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {
@@ -153,7 +153,8 @@ export class ZKTecoAdmsAdapter implements DeviceAdapter {
 
     const pri = person.role === 'admin' ? 14 : 0;
     const cleanPin = person.pin.trim().replace(/[\t\r\n=]/g, '');
-    const command = `DATA UPDATE userinfo PIN=${cleanPin}\tName=${displayName}\tPri=${pri}`;
+    // Exact upper-case form from the PUSH spec; real firmware rejects other spellings.
+    const command = `DATA UPDATE USERINFO PIN=${cleanPin}\tName=${displayName}\tPri=${pri}`;
 
     return {
       command,
@@ -165,4 +166,10 @@ export class ZKTecoAdmsAdapter implements DeviceAdapter {
       }
     };
   }
+}
+
+/** Remove a user (by device PIN) from a ZKTeco terminal. */
+export function zktecoDeleteUserCommand(pin: string): string | null {
+  const cleanPin = String(pin ?? '').trim().replace(/[\t\r\n=\0]/g, '');
+  return cleanPin ? `DATA DELETE USERINFO PIN=${cleanPin}` : null;
 }

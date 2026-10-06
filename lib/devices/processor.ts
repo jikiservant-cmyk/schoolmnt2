@@ -1,6 +1,8 @@
 import { AttendanceEvent, DeviceRecord } from './types';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { isWithinAttendanceSmsWindow } from '@/lib/attendance-window';
+import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
+import { isMissingColumnError } from '@/lib/tenant';
 
 export interface ProcessEventsResult {
   totalReceived: number;
@@ -16,6 +18,8 @@ export interface ProcessEventsResult {
  * High-performance normalized attendance event processor for all device vendors.
  * Handles person lookup, deduplication, late-cutoff calculation, batch inserts, and SMS queues.
  */
+const MAX_EVENTS_PER_BATCH = 2000;
+
 export async function processAttendanceEvents(
   events: AttendanceEvent[],
   device: DeviceRecord
@@ -33,6 +37,28 @@ export async function processAttendanceEvents(
   if (!events || events.length === 0) {
     return result;
   }
+
+  // SECURITY: never trust device-supplied values blindly.
+  //  - cap batch size (memory / DB load)
+  //  - bound the external id length
+  //  - drop timestamps from the future (> 10 min clock skew) or older than
+  //    60 days. Previously only the ZKTeco parser checked this, so webhook
+  //    devices could write attendance dated 2099 or 1999.
+  const nowMs = Date.now();
+  const MAX_FUTURE_MS = 10 * 60 * 1000;
+  const MAX_PAST_MS = 60 * 24 * 60 * 60 * 1000;
+  const sane = events.slice(0, MAX_EVENTS_PER_BATCH).filter((ev) => {
+    const id = typeof ev.person_external_id === 'string' ? ev.person_external_id.trim() : '';
+    if (!id || id.length > 64) return false;
+    const t = ev.timestamp instanceof Date ? ev.timestamp.getTime() : NaN;
+    if (!Number.isFinite(t)) return false;
+    return t <= nowMs + MAX_FUTURE_MS && t >= nowMs - MAX_PAST_MS;
+  });
+  if (sane.length !== events.length) {
+    console.warn(`[Device Processor] Dropped ${events.length - sane.length} invalid/out-of-range event(s) from ${device.serial_number}`);
+  }
+  events = sane;
+  if (events.length === 0) return result;
 
   const supabase = createAdminClient();
 
@@ -65,15 +91,21 @@ export async function processAttendanceEvents(
   try {
     const { data: credsData } = await supabase
       .from('person_credentials')
-      .select('identifier_value, person:person_id(id, full_name, role, class_id, is_active, device_user_id, classes:class_id(id, name))')
+      .select('identifier_value, person:person_id(id, school_id, full_name, role, class_id, is_active, device_user_id, classes:class_id(id, name))')
       .eq('school_id', device.school_id)
       .eq('is_active', true);
 
     if (credsData) {
       for (const c of credsData) {
         if (!c.identifier_value || !c.person) continue;
-        const pObj = Array.isArray(c.person) ? c.person[0] : c.person;
+        const pObj: any = Array.isArray(c.person) ? c.person[0] : c.person;
         if (!pObj) continue;
+        // MULTI-TENANT: a credential row tagged with this school must never
+        // resolve to a person who belongs to another school.
+        if (pObj.school_id !== device.school_id) {
+          console.warn(`[Device Processor] Ignoring cross-tenant credential "${c.identifier_value}" on device ${device.serial_number}`);
+          continue;
+        }
 
         const cVal = c.identifier_value.trim().toLowerCase();
         const cNum = cVal.replace(/^0+/, '');
@@ -104,6 +136,12 @@ export async function processAttendanceEvents(
     const person = personMap.get(cleanPin) || 
                    personMap.get(cleanPin.replace(/^0+/, '')) || 
                    personMap.get(cleanPin.padStart(4, '0'));
+
+    if (person && person.is_active === false) {
+      // Deactivated (left / expelled / suspended) people must not be recorded or trigger SMS.
+      result.unrecognizedCount++;
+      continue;
+    }
 
     if (!person) {
       console.warn(`[Device Processor] Unrecognized external ID "${cleanPin}" on device ${device.serial_number}`);
@@ -175,6 +213,7 @@ export async function processAttendanceEvents(
     // Device Log (raw hardware audit trail)
     deviceLogsToInsert.push({
       id: deviceLogId,
+      school_id: device.school_id,
       device_id: device.id,
       raw_serial_number: device.serial_number,
       device_user_id: item.event.person_external_id,
@@ -237,28 +276,96 @@ export async function processAttendanceEvents(
 
   // 5. Batch Inserts
   if (deviceLogsToInsert.length > 0) {
-    await supabase.from('device_logs').insert(deviceLogsToInsert);
-    result.insertedDeviceLogs = deviceLogsToInsert.length;
+    let { error: dlErr } = await supabase.from('device_logs').insert(deviceLogsToInsert);
+    if (dlErr && isMissingColumnError(dlErr, 'school_id')) {
+      // Older databases without device_logs.school_id: write without it.
+      ({ error: dlErr } = await supabase
+        .from('device_logs')
+        .insert(deviceLogsToInsert.map(({ school_id: _omit, ...row }) => row)));
+    }
+    if (dlErr) {
+      // Audit trail only: don't block the attendance record, but don't hide the failure either.
+      console.error(`[Device Processor] device_logs insert failed for ${device.serial_number}:`, dlErr.message);
+      for (const a of attendanceLogsToInsert) a.device_log_id = null;
+    } else {
+      result.insertedDeviceLogs = deviceLogsToInsert.length;
+    }
   }
 
   if (attendanceLogsToInsert.length > 0) {
-    await supabase.from('attendance_logs').insert(attendanceLogsToInsert);
-    result.insertedAttendanceLogs = attendanceLogsToInsert.length;
+    // RELIABILITY: these errors used to be ignored and the device was told
+    // "OK", so it deleted punches that were never saved. Now a failure throws
+    // and the route answers 503, so the terminal keeps the punches and retries.
+    // Unique-constraint conflicts (an already-stored punch) are skipped row by row.
+    const { error: attErr } = await supabase.from('attendance_logs').insert(attendanceLogsToInsert);
+    if (attErr) {
+      if (attErr.code !== '23505') {
+        throw new Error(`attendance_logs insert failed: ${attErr.message}`);
+      }
+      let stored = 0;
+      for (const row of attendanceLogsToInsert) {
+        const { error: rowErr } = await supabase.from('attendance_logs').insert(row);
+        if (!rowErr) stored++;
+        else if (rowErr.code === '23505') result.skippedDuplicates++;
+        else throw new Error(`attendance_logs insert failed: ${rowErr.message}`);
+      }
+      result.insertedAttendanceLogs = stored;
+    } else {
+      result.insertedAttendanceLogs = attendanceLogsToInsert.length;
+    }
     console.log(`[Device Processor] Saved ${attendanceLogsToInsert.length} attendance records from device ${device.serial_number} (${device.device_type})`);
   }
 
   // 6. Queue SMS Notifications for Parents
+  // COST / ABUSE: one SMS per child per direction per local day. A child
+  // who taps the reader 5 times (or a replayed upload) used to trigger 5
+  // paid SMS. Attendance rows are still stored for every punch.
+  if (validStudentRecords.length > 0) {
+    const dayKey = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' });
+    const ids = Array.from(new Set(validStudentRecords.map(r => r.person.id)));
+    const minMs = Math.min(...validStudentRecords.map(r => r.logDate.getTime()));
+    const { data: sameDayLogs, error: sdErr } = await supabase
+      .from('attendance_logs')
+      .select('person_id, attendance_type, occurred_at')
+      .eq('school_id', device.school_id)
+      .in('person_id', ids)
+      .gte('occurred_at', new Date(minMs - 36 * 3600 * 1000).toISOString());
+    if (sdErr) {
+      console.warn('[Device Processor] SMS de-duplication lookup failed; skipping SMS for safety:', sdErr.message);
+      validStudentRecords.length = 0;
+    } else {
+      const kept: any[] = [];
+      const seen = new Set<string>();
+      for (const r of validStudentRecords.sort((a, b) => a.logDate.getTime() - b.logDate.getTime())) {
+        const k = `${r.person.id}|${r.attendanceType}|${dayKey.format(r.logDate)}`;
+        if (seen.has(k)) continue;
+        const earlier = (sameDayLogs || []).some((l: any) =>
+          l.person_id === r.person.id &&
+          l.attendance_type === r.attendanceType &&
+          new Date(l.occurred_at).getTime() < r.logDate.getTime() &&
+          dayKey.format(new Date(l.occurred_at)) === dayKey.format(r.logDate));
+        seen.add(k);
+        if (!earlier) kept.push(r);
+      }
+      validStudentRecords.length = 0;
+      validStudentRecords.push(...kept);
+    }
+  }
+
   if (validStudentRecords.length > 0) {
     const sIds = Array.from(new Set(validStudentRecords.map(r => r.person.id)));
     const { data: parentsData } = await supabase
       .from('student_parents')
-      .select('student_id, parent_id, parents(phone)')
+      .select('student_id, parent_id, parents(phone, school_id)')
       .in('student_id', sIds)
       .eq('is_primary_contact', true);
 
     const parentMap = new Map();
     if (parentsData) {
       for (const row of parentsData) {
+        const parentRow: any = Array.isArray(row.parents) ? row.parents[0] : row.parents;
+        // MULTI-TENANT: only notify guardians registered in the same school.
+        if (!parentRow || parentRow.school_id !== device.school_id) continue;
         parentMap.set(row.student_id, {
           parent_id: row.parent_id,
           phone: Array.isArray(row.parents) ? (row.parents[0] as any)?.phone : (row.parents as any)?.phone
@@ -274,6 +381,7 @@ export async function processAttendanceEvents(
         const timeFormatted = record.timeFormatted || record.logDate.toLocaleTimeString([], { timeZone, hour: '2-digit', minute: '2-digit' });
 
         notificationsToInsert.push({
+          dedupe_key: attendanceSmsKey(record.person.id, record.attendanceType, record.logDate, timeZone),
           school_id: device.school_id,
           recipient_type: 'parent',
           recipient_id: pInfo.parent_id,
@@ -287,9 +395,14 @@ export async function processAttendanceEvents(
     }
 
     if (notificationsToInsert.length > 0) {
-      await supabase.from('notifications').insert(notificationsToInsert);
-      result.queuedSmsCount = notificationsToInsert.length;
-      console.log(`[Device Processor] Queued ${notificationsToInsert.length} parent SMS notifications from device ${device.serial_number}`);
+      // Never fail the upload over SMS (the punches are already saved).
+      try {
+        const { queued, duplicates } = await queueNotifications(supabase, notificationsToInsert);
+        result.queuedSmsCount = queued;
+        console.log(`[Device Processor] Queued ${queued} parent SMS notifications from device ${device.serial_number}${duplicates ? ` (${duplicates} already queued today)` : ''}`);
+      } catch (e) {
+        console.error(`[Device Processor] SMS queue failed for ${device.serial_number}:`, e);
+      }
     }
   }
 

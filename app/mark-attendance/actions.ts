@@ -1,49 +1,34 @@
 'use server';
 
-import { createClient } from '@/utils/supabase/server';
+import { checkSchoolAdmin } from '@/lib/auth-guard';
 import { createAdminClient } from '@/utils/supabase/admin';
+import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
+import { isMissingColumnError } from '@/lib/tenant';
 import { isWithinAttendanceSmsWindow, getEatTodayRange, getAttendanceStatusForCheckIn } from '@/lib/attendance-window';
 
 async function getAuthenticatedSchoolId() {
-  const supabase = await createClient();
-  const { data: { user }, error: authErr } = await supabase.auth.getUser();
-  if (authErr || !user) {
-    return { user: null, schoolId: null, error: 'Unauthorized. Please sign in to your school account.' };
+  // SECURITY: previously any authenticated Supabase user (including accounts
+  // created directly against GoTrue with the public anon key, without an
+  // admin profile) could drive the kiosk. Require a verified school admin.
+  const result = await checkSchoolAdmin();
+  if (!result.ok) {
+    return {
+      user: null,
+      schoolId: null,
+      error: result.reason === 'unauthenticated'
+        ? 'Unauthorized. Please sign in to your school account.'
+        : 'Access denied. School admin session required.',
+    };
   }
-
-  // Try auth_school_id RPC
-  try {
-    const { data: rpcSchoolId } = await supabase.rpc('auth_school_id');
-    if (rpcSchoolId) {
-      return { user, schoolId: rpcSchoolId, error: null };
-    }
-  } catch (err) {
-    console.warn('auth_school_id check failed in kiosk action:', err);
-  }
-
-  // Try staff_users linked via person_id -> people -> school_id
-  try {
-    const { data: staffData } = await supabase
-      .from('staff_users')
-      .select('person_id, people(school_id)')
-      .eq('auth_user_id', user.id)
-      .maybeSingle();
-
-    const peopleObj = Array.isArray(staffData?.people) ? staffData.people[0] : staffData?.people;
-    const resolvedSchoolId = (peopleObj as any)?.school_id;
-    if (resolvedSchoolId) {
-      return { user, schoolId: resolvedSchoolId, error: null };
-    }
-  } catch (err) {
-    console.warn('Error resolving staff_users school context:', err);
-  }
-
-  return { user, schoolId: null, error: 'No school tenant context found for this account.' };
+  return { user: result.user, schoolId: result.schoolId, error: null };
 }
 
 export async function submitClockInAction(deviceUserId: string) {
-  if (!deviceUserId) {
+  if (typeof deviceUserId !== 'string' || !deviceUserId.trim()) {
     return { error: 'Please enter your Enrollment ID.' };
+  }
+  if (deviceUserId.length > 32 || !/^[A-Za-z0-9_-]+$/.test(deviceUserId.trim())) {
+    return { error: 'Invalid Enrollment ID format.' };
   }
 
   const { user, schoolId, error: authError } = await getAuthenticatedSchoolId();
@@ -89,9 +74,8 @@ export async function submitClockInAction(deviceUserId: string) {
     // -------------------------------------------------------------
     // Step A — Log raw device event (audit trail) scoped to school
     // -------------------------------------------------------------
-    const { data: rawLog, error: rawLogErr } = await adminClient
-      .from('device_logs')
-      .insert({
+    const rawLogRow: Record<string, unknown> = {
+        school_id: schoolId,
         device_id: deviceId,
         raw_serial_number: serialNumber,
         device_user_id: cleanUserId,
@@ -106,9 +90,21 @@ export async function submitClockInAction(deviceUserId: string) {
         processed: person ? true : false,
         processed_at: person ? new Date().toISOString() : null,
         processing_error: person ? null : 'Enrollment ID not registered in this school'
-      })
+      };
+    let { data: rawLog, error: rawLogErr } = await adminClient
+      .from('device_logs')
+      .insert(rawLogRow)
       .select('id')
       .single();
+    if (rawLogErr && isMissingColumnError(rawLogErr, 'school_id')) {
+      // Older databases without device_logs.school_id: write without it.
+      const { school_id: _omit, ...legacyRow } = rawLogRow;
+      ({ data: rawLog, error: rawLogErr } = await adminClient
+        .from('device_logs')
+        .insert(legacyRow)
+        .select('id')
+        .single());
+    }
 
     if (rawLogErr) {
       console.error('Failed to write raw device log audit trail:', rawLogErr);
@@ -183,7 +179,7 @@ export async function submitClockInAction(deviceUserId: string) {
 
     if (logErr) {
       console.error('Failed to commit attendance fact:', logErr);
-      return { error: `Transmission failed: ${logErr.message}` };
+      return { error: 'Transmission failed. Please try again.' };
     }
 
     // -------------------------------------------------------------
@@ -208,7 +204,7 @@ export async function submitClockInAction(deviceUserId: string) {
         let studentParent: any = null;
         const { data: primaryParent } = await adminClient
           .from('student_parents')
-          .select('parent_id, parents(phone, full_name)')
+          .select('parent_id, parents(phone, full_name, school_id)')
           .eq('student_id', person.id)
           .eq('is_primary_contact', true)
           .maybeSingle();
@@ -218,10 +214,15 @@ export async function submitClockInAction(deviceUserId: string) {
         } else {
           const { data: fallbackParent } = await adminClient
             .from('student_parents')
-            .select('parent_id, parents(phone, full_name)')
+            .select('parent_id, parents(phone, full_name, school_id)')
             .eq('student_id', person.id)
             .maybeSingle();
           studentParent = fallbackParent;
+        }
+
+        // MULTI-TENANT: never message a guardian registered under another school.
+        if (studentParent && (studentParent.parents as any)?.school_id !== schoolId) {
+          studentParent = null;
         }
 
         if (studentParent && studentParent.parents) {
@@ -238,10 +239,12 @@ export async function submitClockInAction(deviceUserId: string) {
             ? `Dear Parent, your child ${person.full_name} checked in successfully at ${timestampStr}.`
             : `Dear Parent, your child ${person.full_name} checked OUT of school successfully at ${timestampStr}.`;
 
-          // Queue the notification in school.notifications
-          const { error: queueErr } = await adminClient
-            .from('notifications')
-            .insert({
+          // Queue the notification in school.notifications (one per child,
+          // direction and day: simultaneous taps cannot queue a second paid SMS)
+          let queueErr: unknown = null;
+          try {
+            await queueNotifications(adminClient, [{
+              dedupe_key: attendanceSmsKey(person.id, attendanceType, now),
               school_id: schoolId,
               recipient_type: 'parent',
               recipient_id: parentId,
@@ -252,7 +255,10 @@ export async function submitClockInAction(deviceUserId: string) {
               related_id: attendanceLog.id,
               message: smsMessageText,
               status: 'pending'
-            });
+            }]);
+          } catch (e) {
+            queueErr = e;
+          }
 
           if (queueErr) {
             console.error('Error writing outbound notification queue row:', queueErr);

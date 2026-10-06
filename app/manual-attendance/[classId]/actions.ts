@@ -1,7 +1,9 @@
 'use server';
 
-import { createClient } from '@/utils/supabase/server';
+import { checkSchoolAdmin } from '@/lib/auth-guard';
+import { consumeRateLimit, resetRateLimit } from '@/lib/security/rate-limit';
 import { createAdminClient } from '@/utils/supabase/admin';
+import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
 import { 
   isWithinAttendanceSmsWindow, 
   getAttendanceStatusForCheckIn,
@@ -21,66 +23,160 @@ export interface StudentAttendanceStatus {
   check_out_time: string | null;
 }
 
-// Durable rate limiting via staff_users table
-// Requires migration: ALTER TABLE staff_users ADD COLUMN failed_attempts INT DEFAULT 0, ADD COLUMN locked_until TIMESTAMPTZ;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const PIN_RE = /^[A-Za-z0-9]{4,12}$/;
 
-export async function verifyTeacherPin(classId: string, teacherId: string, pin: string) {
-  await new Promise(resolve => setTimeout(resolve, 300));
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return { success: false, error: 'Unauthorized.' };
+const MAX_PIN_FAILURES = 5;
+const PIN_LOCK_MS = 10 * 60 * 1000;
+const GENERIC_PIN_ERROR = 'Invalid teacher or PIN.';
 
-  const { data: schoolId } = await supabase.rpc('auth_school_id');
-  if (!schoolId) return { success: false, error: 'School context not found.' };
+async function requireAdminContext() {
+  const result = await checkSchoolAdmin();
+  if (!result.ok) {
+    return { ok: false as const, error: result.reason === 'unauthenticated' ? 'Unauthorized.' : 'Access denied.' };
+  }
+  return { ok: true as const, supabase: result.supabase, schoolId: result.schoolId, user: result.user };
+}
+
+type VerifiedTeacher = {
+  teacher: { id: string; full_name: string; role: string; school_id: string; device_user_id: string | null };
+  staffUserId: string;
+};
+
+/**
+ * Core PIN verification, always scoped to the caller's school.
+ *
+ * Fixes vs. previous implementation:
+ *  - staff_users was looked up by person_id WITHOUT a school filter before the
+ *    tenant check, so an admin of School A could burn PIN attempts and lock out
+ *    teachers of School B (cross-tenant DoS) given their person UUID.
+ *  - DB-backed failure counter was read-modify-write → N parallel requests all
+ *    saw the same count and bypassed the 5-attempt lockout. An in-process
+ *    limiter is now consumed *before* bcrypt runs.
+ *  - "Teacher not found" vs "Invalid PIN" allowed enumeration → single message.
+ *  - Lockout columns are standardised on failed_attempts / locked_until (the
+ *    reset action previously wrote pin_failed_attempts / pin_locked_until, so a
+ *    PIN reset never actually cleared a lockout).
+ */
+async function verifyTeacherPinScoped(
+  schoolId: string,
+  classId: string,
+  teacherId: string,
+  pin: string,
+  callerId: string
+): Promise<{ success: true; data: VerifiedTeacher } | { success: false; error: string }> {
+  if (typeof classId !== 'string' || !UUID_RE.test(classId)) return { success: false, error: 'Invalid class.' };
+  if (typeof teacherId !== 'string' || !UUID_RE.test(teacherId)) return { success: false, error: GENERIC_PIN_ERROR };
+  if (typeof pin !== 'string' || !PIN_RE.test(pin.trim())) return { success: false, error: GENERIC_PIN_ERROR };
+
+  // Throttle before doing any expensive work (bcrypt) — per teacher and per operator session.
+  const perTeacher = consumeRateLimit(`pin:teacher:${teacherId}`, MAX_PIN_FAILURES * 2, PIN_LOCK_MS);
+  const perCaller = consumeRateLimit(`pin:caller:${callerId}`, 30, PIN_LOCK_MS);
+  if (!perTeacher.allowed || !perCaller.allowed) {
+    const secs = Math.max(perTeacher.retryAfterSeconds, perCaller.retryAfterSeconds);
+    return { success: false, error: `Too many attempts. Locked for ${Math.max(1, Math.ceil(secs / 60))} minute(s).` };
+  }
 
   const adminClient = createAdminClient();
 
-  const { data: staffUser } = await adminClient
-    .from('staff_users')
-    .select('id, person_id, pin_hash, failed_attempts, locked_until')
-    .eq('person_id', teacherId)
-    .maybeSingle();
-
-  if (!staffUser) return { success: false, error: 'Teacher not found.' };
-
-  if (staffUser.locked_until && new Date(staffUser.locked_until).getTime() > Date.now()) {
-    const mins = Math.ceil((new Date(staffUser.locked_until).getTime() - Date.now()) / 60000);
-    return { success: false, error: `Locked for ${mins} minute(s).` };
-  }
-
-  const cleanPin = pin.trim().toUpperCase();
-  const isMatch = staffUser.pin_hash && ((await bcrypt.compare(cleanPin, staffUser.pin_hash)) || (await bcrypt.compare(pin.trim(), staffUser.pin_hash)));
-  
-  if (!isMatch) {
-    const newFailures = (staffUser.failed_attempts || 0) + 1;
-    const update: any = { failed_attempts: newFailures };
-    if (newFailures >= 5) update.locked_until = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-    await adminClient.from('staff_users').update(update).eq('id', staffUser.id);
-    return { success: false, error: 'Invalid PIN.' };
-  }
-
-  await adminClient.from('staff_users').update({ failed_attempts: 0, locked_until: null }).eq('id', staffUser.id);
-  
-  const { data: teacher } = await supabase
+  // 1. Tenant check FIRST: the teacher must be an active teacher in the caller's school.
+  const { data: teacher } = await adminClient
     .from('people')
     .select('id, full_name, role, school_id, device_user_id')
-    .eq('id', staffUser.person_id)
+    .eq('id', teacherId)
+    .eq('school_id', schoolId)
+    .eq('role', 'teacher')
+    .eq('is_active', true)
+    .maybeSingle();
+
+  // 2. The class must belong to the same school.
+  const { data: cls } = await adminClient
+    .from('classes')
+    .select('id')
+    .eq('id', classId)
     .eq('school_id', schoolId)
     .maybeSingle();
 
-  if (!teacher) return { success: false, error: 'Teacher access denied.' };
-    
-  return { success: true, teacher: teacher };
+  if (!teacher || !cls) {
+    await bcrypt.compare(pin, getDummyHash()); // equalise timing with the real path
+    return { success: false, error: GENERIC_PIN_ERROR };
+  }
+
+  // 3. Load credentials (tolerate deployments that haven't added lockout columns yet).
+  let staffUser: { id: string; pin_hash: string | null; failed_attempts?: number | null; locked_until?: string | null } | null = null;
+  let hasLockoutColumns = true;
+  {
+    const { data, error } = await adminClient
+      .from('staff_users')
+      .select('id, pin_hash, failed_attempts, locked_until')
+      .eq('person_id', teacher.id)
+      .maybeSingle();
+    if (error) {
+      hasLockoutColumns = false;
+      const fallback = await adminClient
+        .from('staff_users')
+        .select('id, pin_hash')
+        .eq('person_id', teacher.id)
+        .maybeSingle();
+      staffUser = fallback.data;
+    } else {
+      staffUser = data;
+    }
+  }
+
+  if (!staffUser || !staffUser.pin_hash) {
+    await bcrypt.compare(pin, getDummyHash());
+    return { success: false, error: GENERIC_PIN_ERROR };
+  }
+
+  if (staffUser.locked_until && new Date(staffUser.locked_until).getTime() > Date.now()) {
+    const mins = Math.ceil((new Date(staffUser.locked_until).getTime() - Date.now()) / 60000);
+    return { success: false, error: `Too many attempts. Locked for ${mins} minute(s).` };
+  }
+
+  // PINs are generated upper-case; accept case-insensitive input.
+  const isMatch = await bcrypt.compare(pin.trim().toUpperCase(), staffUser.pin_hash);
+
+  if (!isMatch) {
+    if (hasLockoutColumns) {
+      const newFailures = (staffUser.failed_attempts || 0) + 1;
+      const update: Record<string, unknown> = { failed_attempts: newFailures };
+      if (newFailures >= MAX_PIN_FAILURES) update.locked_until = new Date(Date.now() + PIN_LOCK_MS).toISOString();
+      await adminClient.from('staff_users').update(update).eq('id', staffUser.id);
+    }
+    return { success: false, error: GENERIC_PIN_ERROR };
+  }
+
+  if (hasLockoutColumns && (staffUser.failed_attempts || staffUser.locked_until)) {
+    await adminClient.from('staff_users').update({ failed_attempts: 0, locked_until: null }).eq('id', staffUser.id);
+  }
+  resetRateLimit(`pin:teacher:${teacherId}`);
+
+  return { success: true, data: { teacher, staffUserId: staffUser.id } };
+}
+
+// bcrypt hash of a random value, used only to equalise response timing.
+let dummyHash: string | null = null;
+function getDummyHash() {
+  if (!dummyHash) dummyHash = bcrypt.hashSync(crypto.randomUUID(), 10);
+  return dummyHash;
+}
+
+export async function verifyTeacherPin(classId: string, teacherId: string, pin: string) {
+  const ctx = await requireAdminContext();
+  if (!ctx.ok) return { success: false, error: ctx.error };
+
+  const result = await verifyTeacherPinScoped(ctx.schoolId, classId, teacherId, pin, ctx.user.id);
+  if (!result.success) return { success: false, error: result.error };
+  return { success: true, teacher: result.data.teacher };
 }
 
 export async function getTeachersForClass(classId: string) {
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return { success: false, error: 'Unauthorized.' };
+  const ctx = await requireAdminContext();
+  if (!ctx.ok) return { success: false, error: ctx.error };
+  const { supabase, schoolId } = ctx;
+  if (typeof classId !== 'string' || !UUID_RE.test(classId)) return { success: false, error: 'Invalid class.' };
 
-  const { data: schoolId } = await supabase.rpc('auth_school_id');
-  if (!schoolId) return { success: false, error: 'School context not found.' };
-  
   const { data: cls } = await supabase
     .from('classes')
     .select('id')
@@ -102,12 +198,10 @@ export async function getTeachersForClass(classId: string) {
 }
 
 export async function getStudentsForClass(classId: string) {
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return { error: 'Unauthorized.' };
-
-  const { data: schoolId } = await supabase.rpc('auth_school_id');
-  if (!schoolId) return { error: 'School context not found.' };
+  const ctx = await requireAdminContext();
+  if (!ctx.ok) return { error: ctx.error };
+  const { supabase, schoolId } = ctx;
+  if (typeof classId !== 'string' || !UUID_RE.test(classId)) return { error: 'Invalid class.' };
 
   const { data: cls } = await supabase
     .from('classes')
@@ -142,6 +236,7 @@ export async function getStudentsForClass(classId: string) {
   const { data: logs } = await supabase
     .from('attendance_logs')
     .select('person_id, attendance_type, status, occurred_at')
+    .eq('school_id', schoolId)
     .in('person_id', studentIds)
     .gte('occurred_at', startIso)
     .lte('occurred_at', endIso)
@@ -208,17 +303,28 @@ export async function submitClassAttendance(
   attendanceType: 'check_in' | 'check_out' = 'check_in',
   pin: string = ''
 ) {
-  const supabase = await createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return { success: false, error: 'Unauthorized.' };
+  const ctx = await requireAdminContext();
+  if (!ctx.ok) return { success: false, error: ctx.error };
+  const { supabase, schoolId } = ctx;
 
-  const { data: schoolId } = await supabase.rpc('auth_school_id');
-  if (!schoolId) return { success: false, error: 'School context not found.' };
+  // Strict input validation — these arrive straight from the client.
+  if (attendanceType !== 'check_in' && attendanceType !== 'check_out') {
+    return { success: false, error: 'Invalid attendance type.' };
+  }
+  if (
+    !Array.isArray(presentStudentIds) || !Array.isArray(absentStudentIds) ||
+    presentStudentIds.length + absentStudentIds.length > 1000 ||
+    ![...presentStudentIds, ...absentStudentIds].every((id) => typeof id === 'string' && UUID_RE.test(id))
+  ) {
+    return { success: false, error: 'Invalid student reference provided.' };
+  }
+  presentStudentIds = Array.from(new Set(presentStudentIds));
+  absentStudentIds = Array.from(new Set(absentStudentIds)).filter((id) => !presentStudentIds.includes(id));
 
   const adminClient = createAdminClient();
 
-  // Re-verify Teacher PIN server-side
-  const pinVerification = await verifyTeacherPin(classId, teacherId, pin);
+  // Re-verify Teacher PIN server-side (scoped to this school)
+  const pinVerification = await verifyTeacherPinScoped(schoolId, classId, teacherId, pin, ctx.user.id);
   if (!pinVerification.success) {
     return { success: false, error: pinVerification.error || 'Invalid Teacher PIN.' };
   }
@@ -248,21 +354,8 @@ export async function submitClassAttendance(
     }
   }
   
-  // Resolve staff_users.id for marked_by FK constraint
-  let markedByStaffUserId: string | null = null;
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  
-  if (teacherId && uuidRegex.test(teacherId)) {
-    const { data: staffUser } = await supabase
-      .from('staff_users')
-      .select('id')
-      .or(`id.eq.${teacherId},person_id.eq.${teacherId}`)
-      .maybeSingle();
-
-    if (staffUser) {
-      markedByStaffUserId = staffUser.id;
-    }
-  }
+  // marked_by comes from the verified staff record — never from client input.
+  const markedByStaffUserId: string | null = pinVerification.data.staffUserId;
 
   const now = new Date();
   const { startIso, endIso } = getEatTodayRange(now);
@@ -273,6 +366,7 @@ export async function submitClassAttendance(
     const { data: existingLogs } = await adminClient
       .from('attendance_logs')
       .select('person_id, attendance_type')
+      .eq('school_id', schoolId)
       .in('person_id', presentStudentIds)
       .gte('occurred_at', startIso)
       .lte('occurred_at', endIso);
@@ -347,12 +441,13 @@ export async function submitClassAttendance(
       const { data: studentsData } = await adminClient
         .from('people')
         .select('id, full_name')
+        .eq('school_id', schoolId)
         .in('id', eligibleStudentIds);
         
       // 2. Fetch Parents (prefer primary contact, fallback to any linked parent with phone)
       const { data: parentsData } = await adminClient
         .from('student_parents')
-        .select('student_id, parent_id, is_primary_contact, parents(phone, full_name)')
+        .select('student_id, parent_id, is_primary_contact, parents(phone, full_name, school_id)')
         .in('student_id', eligibleStudentIds);
 
       if (studentsData && parentsData && parentsData.length > 0) {
@@ -364,6 +459,8 @@ export async function submitClassAttendance(
         for (const sp of parentsData) {
           const phone = (sp.parents as any)?.phone;
           if (!phone) continue;
+          // MULTI-TENANT: never message a guardian registered under another school.
+          if ((sp.parents as any)?.school_id !== schoolId) continue;
           
           const existing = parentByStudent.get(sp.student_id);
           if (!existing || (!existing.is_primary_contact && sp.is_primary_contact)) {
@@ -402,6 +499,7 @@ export async function submitClassAttendance(
               hour12: true 
             });
 
+            const smsRows: Record<string, unknown>[] = [];
             for (const notif of notificationsToSend) {
               let smsMessageText = `Dear Parent,`;
               if (attendanceType === 'check_in') {
@@ -412,21 +510,21 @@ export async function submitClassAttendance(
                 smsMessageText += ` your child ${notif.studentName} checked OUT of school and is heading home at ${timestampStr}.`;
               }
 
-              // Queue the notification in school.notifications
-              await adminClient
-                .from('notifications')
-                .insert({
-                  school_id: cls.school_id,
-                  recipient_type: 'parent',
-                  recipient_id: notif.parentId,
-                  recipient_phone_snapshot: notif.phone,
-                  channel: 'sms',
-                  notification_type: 'attendance',
-                  status: 'pending',
-                  message: smsMessageText
-                });
+              smsRows.push({
+                // One SMS per child, direction and day (double submissions can't double-charge)
+                dedupe_key: attendanceSmsKey(notif.studentId, attendanceType, now),
+                school_id: cls.school_id,
+                recipient_type: 'parent',
+                recipient_id: notif.parentId,
+                recipient_phone_snapshot: notif.phone,
+                channel: 'sms',
+                notification_type: 'attendance',
+                status: 'pending',
+                message: smsMessageText
+              });
             }
-            console.log(`[Class Manual Attendance] Queued ${notificationsToSend.length} SMS notifications for ${attendanceType} at ${timestampStr} EAT`);
+            const { queued, duplicates } = await queueNotifications(adminClient, smsRows);
+            console.log(`[Class Manual Attendance] Queued ${queued} SMS notifications for ${attendanceType} at ${timestampStr} EAT${duplicates ? ` (${duplicates} already queued today, skipped)` : ''}`);
           }
         }
       }

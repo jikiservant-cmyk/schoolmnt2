@@ -1,5 +1,5 @@
 import { DeviceAdapter, DeviceRecord, AttendanceEvent, EnrollPersonInput, EnrollCommandResult, HandshakeResponse } from '../types';
-import { isAuthorizedToken } from '../metadata';
+import { isAuthorizedDevice } from '../metadata';
 
 export class HikvisionIsapiAdapter implements DeviceAdapter {
   readonly deviceType = 'hikvision_isapi';
@@ -27,7 +27,7 @@ export class HikvisionIsapiAdapter implements DeviceAdapter {
       }
     }
 
-    return isAuthorizedToken(providedToken, device.device_secret);
+    return isAuthorizedDevice(providedToken, device);
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {

@@ -1,4 +1,4 @@
-import { createClient } from '@/utils/supabase/server';
+import { requireSchoolAdminPage } from '@/lib/auth-guard';
 import PeopleDirectoryClient from './PeopleDirectoryClient';
 
 interface SearchProps {
@@ -9,24 +9,13 @@ export default async function PeoplePage({ searchParams }: SearchProps) {
   const params = await searchParams;
   const initialRoleFilter = params.role || 'all';
 
-  const supabase = await createClient();
-
-  // 1. Resolve school ID
-  const { data: userData } = await supabase.auth.getUser();
-  let schoolId: string | null = null;
-  if (userData?.user) {
-    const { data: rpcSchoolId } = await supabase.rpc('auth_school_id');
-    schoolId = rpcSchoolId || null;
-    if (!schoolId) {
-       const { data: stf } = await supabase.from('staff_users').select('people(school_id)').eq('auth_user_id', userData.user.id).maybeSingle();
-       if (stf?.people && (stf.people as any).school_id) schoolId = (stf.people as any).school_id;
-    }
-  }
+  // MULTI-TENANT: the school comes from the verified admin context. Previously,
+  // if it couldn't be resolved, the class query ran WITHOUT a school filter
+  // (fail-open) and listed every school's classes.
+  const { supabase, schoolId } = await requireSchoolAdminPage();
 
   // 2. Fetch school classes
-  const classesQuery = supabase.from('classes').select('id, name').order('name');
-  if (schoolId) classesQuery.eq('school_id', schoolId);
-  const { data: classesData } = await classesQuery;
+  const { data: classesData } = await supabase.from('classes').select('id, name').eq('school_id', schoolId).order('name');
   const classes = classesData || [];
 
   // 3. Fetch Initial Counts (Fast!)
@@ -57,6 +46,10 @@ export default async function PeoplePage({ searchParams }: SearchProps) {
 
   return (
     <PeopleDirectoryClient 
+      // Remount when the sidebar switches ?role= (Students <-> Teachers): the
+      // client keeps its filter in useState, which ignores new props, so the
+      // "Teachers" link kept showing students after "Students" was opened.
+      key={initialRoleFilter}
       classes={classes} 
       initialRoleFilter={initialRoleFilter} 
       initialCounts={aggregateCounts}

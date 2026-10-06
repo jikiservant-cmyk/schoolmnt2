@@ -2,9 +2,18 @@
 
 import { createClient } from '@/utils/supabase/server';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
+import { createAdminClient } from '@/utils/supabase/admin';
 import { revalidatePath } from 'next/cache';
 
+/**
+ * DEMO ONLY: marks queued SMS as "sent" with made-up provider data WITHOUT
+ * sending anything. With real parents and paid SMS this would hide messages
+ * that were never delivered, so it is disabled unless SMS_SIMULATION_MODE=true.
+ */
 export async function processPendingNotificationsAction() {
+  if (process.env.SMS_SIMULATION_MODE !== 'true') {
+    return { error: 'SMS simulation is disabled. Queued messages are delivered by the SMS gateway.' };
+  }
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
     // 1. Fetch pending notifications for this school only
@@ -29,7 +38,9 @@ export async function processPendingNotificationsAction() {
       // Simulate real latency of outbound SMS providers (e.g. Africa's Talking or Twilio)
       await new Promise((resolve) => setTimeout(resolve, 300));
 
-      const { error: updateErr } = await supabase
+      // Clients can no longer write the SMS queue (migration 06): use the
+      // server client, still scoped to this admin's school.
+      const { error: updateErr } = await createAdminClient()
         .from('notifications')
         .update({
           status: 'sent',
@@ -42,7 +53,8 @@ export async function processPendingNotificationsAction() {
             cost: '22 UGX'
           })
         })
-        .eq('id', item.id);
+        .eq('id', item.id)
+        .eq('school_id', schoolId);
 
       if (updateErr) {
         console.error(`Failed to update notification ${item.id}:`, updateErr);

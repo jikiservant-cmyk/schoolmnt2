@@ -1,314 +1,348 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createPublicAdminClient } from '@/utils/supabase/admin';
 import crypto from 'crypto';
+import { createAdminClient, createPublicAdminClient } from '@/utils/supabase/admin';
+import { UUID_RE } from '@/lib/tenant';
+import { classifyPayment, collectReferences, paidAmount, paidCurrency } from '@/lib/payments/webhook';
+import { loadSchoolWallet, isMissingFunction } from '@/lib/payments/wallet';
+
+/**
+ * NaJiki payment + SMS delivery webhook.
+ *
+ * MONEY INTEGRITY (see SECURITY_AUDIT.md Part 5):
+ *  - Credits go through school.apply_payment() (migration 05): one DB
+ *    transaction, matched to a top-up the school actually started, never more
+ *    than the amount requested, exactly once per payment, every webhook logged.
+ *  - Errors return 5xx so NaJiki retries; we never answer "OK" for a payment we
+ *    failed to record.
+ *  - Only real successes count: "payment.success" with status FAILED is not paid.
+ *  - Non-UGX payments are not credited as UGX.
+ *  - Bodies over 64 KB are refused before parsing.
+ *  - NAJIKI_WEBHOOK_SECRET (if set) replaces the outbound API key as the
+ *    webhook password.
+ */
+
+const MAX_BODY_BYTES = 64 * 1024;
+
+type Json = any;
+
+/** Read the body, refusing anything over MAX_BODY_BYTES (also without Content-Length). */
+async function readLimitedBody(req: NextRequest): Promise<string | null> {
+  const declared = Number(req.headers.get('content-length') || 0);
+  if (declared > MAX_BODY_BYTES) return null;
+  if (!req.body) return '';
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BODY_BYTES) {
+      try { await reader.cancel(); } catch { /* ignore */ }
+      return null;
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8');
+}
+
+function webhookSecret(): { secret: string | null; dedicated: boolean } {
+  const dedicated = process.env.NAJIKI_WEBHOOK_SECRET;
+  if (dedicated) return { secret: dedicated, dedicated: true };
+  // Legacy: the same key the app sends to NaJiki on every API call.
+  const legacy = process.env.NAJIKI_API_KEY || process.env.SCHOOL_SECRET_KEY || process.env.NAJIKI_SECRET_KEY || null;
+  return { secret: legacy, dedicated: false };
+}
+
+const safeEqual = (a: string, b: string): boolean => {
+  const x = crypto.createHash('sha256').update(a).digest();
+  const y = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(x, y);
+};
+
+/**
+ * NaJiki signs every outbound notification (payment completion AND SMS
+ * delivery) the same way (najiki-finance2 src/lib/notification-signature.ts):
+ *
+ *   X-Najiki-Timestamp: <unix ms>
+ *   X-Najiki-Signature: t=<unix ms>,v=<hex HMAC-SHA256(secret, "<t>.<raw body>")>
+ *
+ * The timestamp is inside the signed string, so it cannot be swapped. The age
+ * window is deliberately generous (default 72h): NaJiki's QStash retries
+ * re-send the ORIGINAL headers for up to ~2 days, and rejecting them would
+ * strand paid top-ups. Replays inside the window are harmless because
+ * school.apply_payment() credits each payment at most once.
+ */
+const FUTURE_SKEW_MS = 5 * 60 * 1000;
+function maxSignatureAgeMs(): number {
+  const h = Number(process.env.NAJIKI_WEBHOOK_MAX_AGE_HOURS);
+  return (Number.isFinite(h) && h > 0 ? h : 72) * 60 * 60 * 1000;
+}
+
+type AuthResult = { ok: true; scheme: 'timestamped' | 'legacy' } | { ok: false; reason: string };
+
+export function verifyNajikiSignature(
+  headers: { get(name: string): string | null },
+  rawBody: string,
+  secret: string,
+  now: number = Date.now(),
+): AuthResult {
+  const sigHeader = (headers.get('x-najiki-signature') || '').trim();
+  const m = /^t=(\d{9,16})\s*,\s*v=([0-9a-fA-F]{64})$/.exec(sigHeader);
+  if (m) {
+    const t = m[1];
+    const tsHeader = headers.get('x-najiki-timestamp');
+    if (tsHeader !== null && tsHeader.trim() !== t) return { ok: false, reason: 'timestamp header does not match signed timestamp' };
+    const expected = crypto.createHmac('sha256', secret).update(`${t}.${rawBody}`).digest('hex');
+    if (!safeEqual(expected, m[2].toLowerCase())) return { ok: false, reason: 'bad signature' };
+    const tsMs = Number(t) < 1e11 ? Number(t) * 1000 : Number(t); // tolerate seconds
+    if (tsMs - now > FUTURE_SKEW_MS) return { ok: false, reason: 'timestamp in the future' };
+    if (now - tsMs > maxSignatureAgeMs()) return { ok: false, reason: 'signature too old (replay window exceeded)' };
+    return { ok: true, scheme: 'timestamped' };
+  }
+
+  // Older NaJiki builds: bare HMAC of the body, or the secret itself as a
+  // Bearer token. Neither has replay protection and the second puts the secret
+  // in a header, so they are OFF unless explicitly enabled for a migration.
+  const legacyAllowed = process.env.NAJIKI_WEBHOOK_ALLOW_LEGACY_SIGNATURE === 'true';
+  let legacyValid = false;
+  const authHeader = headers.get('authorization');
+  if (authHeader && safeEqual(authHeader.replace(/^Bearer\s+/i, '').trim(), secret)) legacyValid = true;
+  const bare = sigHeader || headers.get('x-signature') || headers.get('x-webhook-signature') || '';
+  if (!legacyValid && bare) {
+    const digest = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+    if (safeEqual(digest, bare.replace(/^sha256=/i, '').trim().toLowerCase())) legacyValid = true;
+  }
+  if (legacyValid && legacyAllowed) return { ok: true, scheme: 'legacy' };
+  if (legacyValid) return { ok: false, reason: 'legacy (untimestamped) signature format; set NAJIKI_WEBHOOK_ALLOW_LEGACY_SIGNATURE=true only if your NaJiki build predates timestamped signatures' };
+  return { ok: false, reason: sigHeader ? 'unrecognised signature' : 'missing signature' };
+}
+
+/**
+ * MULTI-TENANT: decide which school a payment belongs to.
+ *
+ * Previously the first truthy field won, and tenant CODES were checked before
+ * the explicit school UUID that we send ourselves (externalEntityId /
+ * metadata.schoolId). If the payment provider echoed back a shared or
+ * ambiguous tenant code, the top-up could be credited to another school's
+ * wallet. Any non-UUID string was also interpolated into a PostgREST `.or()`
+ * filter.
+ *
+ * Now:
+ *  1. Explicit school UUIDs win. If they disagree, the payment is rejected.
+ *  2. Only when no UUID is present is a tenant code resolved, and it must map
+ *     to exactly one school.
+ *  3. The resolved school must exist.
+ */
+async function resolveWebhookSchool(publicAdmin: any, eventData: Json): Promise<{ schoolId: string; via: string } | { error: string }> {
+  const md = (eventData && typeof eventData.metadata === 'object' && eventData.metadata) || {};
+  const uuidCandidates = [
+    eventData?.school_id, eventData?.schoolId, md.schoolId, md.school_id,
+    eventData?.externalEntityId, eventData?.external_entity_id,
+    eventData?.tenant_id, eventData?.tenantId, md.tenantId, md.tenant_id,
+  ].filter((v) => typeof v === 'string' && UUID_RE.test(v)).map((v: string) => v.toLowerCase());
+
+  const distinct = Array.from(new Set(uuidCandidates));
+  let schoolId: string | null = null;
+  let via = 'school_uuid';
+
+  if (distinct.length > 1) {
+    return { error: 'Conflicting school identifiers in payment payload' };
+  }
+  if (distinct.length === 1) {
+    schoolId = distinct[0];
+  } else {
+    const code = [eventData?.tenantCode, eventData?.tenant_code, md.tenantCode, md.tenant_code, eventData?.code]
+      .find((v) => typeof v === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(v));
+    if (!code) return { error: 'Missing school identifier' };
+    via = 'tenant_code';
+
+    const { data: tenants } = await publicAdmin.from('tenants').select('id').eq('code', code).limit(2);
+    if (Array.isArray(tenants) && tenants.length === 1 && UUID_RE.test(String(tenants[0].id))) {
+      schoolId = String(tenants[0].id).toLowerCase();
+    } else if (!tenants || tenants.length === 0) {
+      const { data: profiles } = await publicAdmin.from('profiles').select('school_id').eq('code', code).limit(2);
+      if (Array.isArray(profiles) && profiles.length === 1 && UUID_RE.test(String(profiles[0].school_id))) {
+        schoolId = String(profiles[0].school_id).toLowerCase();
+      }
+    }
+    if (!schoolId) return { error: 'Tenant code does not map to exactly one school' };
+  }
+
+  const { data: school, error } = await createAdminClient().from('schools').select('id').eq('id', schoolId).maybeSingle();
+  if (error || !school) return { error: 'Unknown school' };
+  return { schoolId, via };
+}
 
 export async function handleNajikiWebhook(req: NextRequest) {
   try {
-    const rawBody = await req.text();
-    const headersList = req.headers;
-
-    // Secret key for verification
-    const expectedSecret = 
-      process.env.NAJIKI_API_KEY || 
-      process.env.SCHOOL_SECRET_KEY || 
-      process.env.NAJIKI_SECRET_KEY;
-
-    if (!expectedSecret) {
-      console.error('[NaJiki Webhook] Missing webhook secret configuration in environment variables.');
+    const { secret, dedicated } = webhookSecret();
+    if (!secret) {
+      console.error('[NaJiki Webhook] No webhook secret configured (NAJIKI_WEBHOOK_SECRET or NAJIKI_API_KEY).');
       return NextResponse.json({ error: 'Server configuration error' }, { status: 500 });
     }
 
-    const authHeader = headersList.get('authorization');
-    const signatureHeader = headersList.get('x-najiki-signature') || headersList.get('x-signature') || headersList.get('x-webhook-signature');
+    const rawBody = await readLimitedBody(req);
+    if (rawBody === null) {
+      return NextResponse.json({ error: 'Payload too large' }, { status: 413 });
+    }
 
-    if (!authHeader && !signatureHeader) {
-      console.warn('[NaJiki Webhook] Missing authentication headers.');
+    const hasAuth = req.headers.get('authorization') || req.headers.get('x-najiki-signature') ||
+      req.headers.get('x-signature') || req.headers.get('x-webhook-signature');
+    if (!hasAuth) {
       return NextResponse.json({ error: 'Unauthorized: Missing authentication headers' }, { status: 401 });
     }
-
-    let isAuthorized = false;
-
-    // 1. Verify Authorization Bearer token
-    if (authHeader) {
-      const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-      if (token === expectedSecret) {
-        isAuthorized = true;
-      }
-    }
-
-    // 2. Verify X-Najiki-Signature header (HMAC-SHA256)
-    if (!isAuthorized && signatureHeader) {
-      try {
-        const hmac = crypto.createHmac('sha256', expectedSecret);
-        const digest = hmac.update(rawBody).digest('hex');
-        if (crypto.timingSafeEqual(Buffer.from(signatureHeader), Buffer.from(digest))) {
-          isAuthorized = true;
-        }
-      } catch (sigErr) {
-        console.warn('[NaJiki Webhook] HMAC signature verification failed:', sigErr);
-      }
-    }
-
-    if (!isAuthorized) {
-      console.warn('[NaJiki Webhook] Unauthorized NaJiki webhook attempt.');
+    const auth = verifyNajikiSignature(req.headers, rawBody, secret);
+    if (!auth.ok) {
+      console.warn(`[NaJiki Webhook] Unauthorized NaJiki webhook attempt: ${auth.reason}.`);
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    if (auth.scheme === 'legacy') {
+      console.warn('[NaJiki Webhook] Accepted a LEGACY untimestamped signature (NAJIKI_WEBHOOK_ALLOW_LEGACY_SIGNATURE=true). Upgrade NaJiki and turn this off.');
+    }
+    if (!dedicated) {
+      console.warn('[NaJiki Webhook] Verified with NAJIKI_API_KEY. Copy the application\'s webhook secret (njk_whsec_...) from NaJiki into NAJIKI_WEBHOOK_SECRET.');
+    }
 
-    let payload: any;
+    let payload: Json;
     try {
       payload = JSON.parse(rawBody);
     } catch {
       return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
     }
-
-    // Remove PII from logging
-    const safeLogPayload = { ...payload };
-    if (safeLogPayload.data) {
-      delete safeLogPayload.data.phone;
-      delete safeLogPayload.data.email;
-      delete safeLogPayload.data.customer_name;
+    if (!payload || typeof payload !== 'object') {
+      return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
     }
-    console.log('[NaJiki Webhook] Received payload:', JSON.stringify(safeLogPayload));
+    const eventData: Json = (payload.data && typeof payload.data === 'object') ? payload.data : payload;
 
-    const publicAdmin = createPublicAdminClient();
-    const eventType = (payload.event || payload.eventType || payload.type || payload.event_type || '').toString().toLowerCase();
-    const rawStatus = (payload.status || payload.data?.status || '').toString().toUpperCase();
-    const eventData = payload.data || payload;
+    // Log without personal data.
+    const safe = { ...payload, data: payload.data ? { ...payload.data } : undefined };
+    for (const o of [safe, safe.data]) if (o) { delete o.phone; delete o.email; delete o.customer_name; delete o.msisdn; delete o.phoneNumber; delete o.phone_number; }
+    console.log('[NaJiki Webhook] Received payload:', JSON.stringify(safe).slice(0, 2000));
 
-    // Check if this is a payment success event or status
-    const isPaymentSuccess = 
-      eventType.includes('payment.success') ||
-      eventType.includes('payment_success') ||
-      eventType.includes('payment.completed') ||
-      eventType.includes('charge.success') ||
-      eventType.includes('transaction.success') ||
-      eventType === 'success' ||
-      rawStatus === 'SUCCESS' ||
-      rawStatus === 'COMPLETED' ||
-      rawStatus === 'PAID';
+    const cls = classifyPayment(payload);
+    const isDeliveryReport = !cls.eventType.includes('payment') &&
+      (cls.eventType === 'message.status' || cls.eventType === 'sms_delivery_update' ||
+       cls.eventType.includes('sms') || cls.eventType.includes('delivery') || cls.eventType.includes('message'));
 
-    if (isPaymentSuccess) {
-      const schoolId = 
-        eventData.school_id || 
-        eventData.schoolId || 
-        eventData.tenant_id ||
-        eventData.tenantId ||
-        eventData.tenantCode || 
-        eventData.tenant_code ||
-        eventData.externalEntityId ||
-        eventData.external_entity_id ||
-        eventData.metadata?.schoolId || 
-        eventData.metadata?.school_id ||
-        eventData.metadata?.tenantId ||
-        eventData.metadata?.tenant_id;
-
-      const amount = Number(
-        eventData.amount || 
-        eventData.value || 
-        eventData.total || 
-        eventData.metadata?.amount || 
-        0
-      );
-
-      const txRef = 
-        eventData.transaction_ref || 
-        eventData.transactionRef ||
-        eventData.transaction_id ||
-        eventData.transactionId ||
-        eventData.reference || 
-        eventData.paymentIntentId || 
-        eventData.idempotencyKey ||
-        eventData.idempotency_key ||
-        eventData.ext_ref ||
-        `tx_${Date.now()}`;
-      
-      if (schoolId && amount > 0) {
-        let targetSchoolId = schoolId;
-        // If schoolId was passed as a tenant code, resolve to school_id or user id from public.profiles
-        try {
-          const { data: prof } = await publicAdmin
-            .from('profiles')
-            .select('id, user_id, school_id, code')
-            .eq('code', schoolId)
-            .maybeSingle();
-
-          if (prof?.school_id) {
-            targetSchoolId = prof.school_id;
-          } else if (prof?.id) {
-            targetSchoolId = prof.id;
-          }
-        } catch {
-          // ignore
-        }
-
-        console.log(`[NaJiki Webhook] Processing wallet credit for school ${targetSchoolId} (raw identifier: ${schoolId}) with amount ${amount} UGX, ref: ${txRef}`);
-        
-        // Strict Idempotency Check: Verify if txRef already exists
-        const { data: existingTx } = await publicAdmin
-          .from('transactions')
-          .select('id')
-          .eq('reference', txRef)
-          .maybeSingle();
-
-        if (existingTx) {
-          console.log(`[NaJiki Webhook] Transaction ${txRef} already processed (Idempotency Hit). Ignoring.`);
-          return NextResponse.json({ success: true, message: 'Transaction already processed' }, { status: 200 });
-        }
-
-        let credited = false;
-
-        // 1. Try RPC credit_wallet
-        try {
-          const { data: rpcResult, error: rpcError } = await publicAdmin.rpc("credit_wallet", {
-            p_school_id: targetSchoolId,
-            p_amount: amount,
-            p_tx_ref: txRef,
-          });
-
-          if (!rpcError) {
-            console.log('[NaJiki Webhook] Successfully credited wallet via RPC:', rpcResult);
-            credited = true;
-          } else {
-            console.warn('[NaJiki Webhook] RPC credit_wallet returned notice:', rpcError.message);
-          }
-        } catch (rpcEx) {
-          console.warn('[NaJiki Webhook] RPC credit_wallet call exception:', rpcEx);
-        }
-
-        // 2. Direct database update fallback (wallets + schools settings + transactions)
-        if (!credited) {
-          try {
-            // Find existing wallet by tenant_id or school_id
-            let { data: walletData } = await publicAdmin
-              .from('wallets')
-              .select('id, balance')
-              .or(`tenant_id.eq.${targetSchoolId},school_id.eq.${targetSchoolId}`)
-              .maybeSingle();
-
-            let walletId = walletData?.id;
-            const currentBal = Number(walletData?.balance || 0);
-            const newBal = currentBal + amount;
-
-            if (!walletData) {
-              const genId = crypto.randomUUID();
-              const { data: newWallet } = await publicAdmin
-                .from('wallets')
-                .insert({ 
-                  id: genId,
-                  school_id: targetSchoolId, 
-                  tenant_id: targetSchoolId,
-                  balance: amount,
-                  currency: 'UGX',
-                  sms_rate: 50
-                })
-                .select('id')
-                .maybeSingle();
-              walletId = newWallet?.id || genId;
-            }
-
-            // 4. Record transaction FIRST to enforce unique constraint on reference (idempotency fallback for race conditions)
-            if (walletId) {
-              const { error: tErr } = await publicAdmin.from('transactions').insert({
-                wallet_id: walletId,
-                amount: amount,
-                type: 'credit',
-                reference: txRef,
-                status: 'completed',
-                description: `NaJiki Mobile Money Top-up (+${amount.toLocaleString()} UGX)`
-              });
-
-              if (tErr) {
-                console.warn('[NaJiki Webhook] Failed inserting transactions row, likely duplicate reference during race condition:', tErr);
-                return NextResponse.json({ success: true, message: 'Transaction already processed or failed to insert' }, { status: 200 });
-              }
-            }
-
-            // If we successfully recorded the transaction, update the balance
-            if (walletData) {
-              await publicAdmin
-                .from('wallets')
-                .update({ balance: newBal })
-                .eq('id', walletId);
-            }
-
-            // 3. Keep schools.settings.balance in sync
-            try {
-              const { data: schoolRecord } = await publicAdmin
-                .from('schools')
-                .select('id, settings')
-                .eq('id', targetSchoolId)
-                .maybeSingle();
-
-              if (schoolRecord) {
-                const currentSettings = schoolRecord.settings || {};
-                await publicAdmin
-                  .from('schools')
-                  .update({
-                    settings: {
-                      ...currentSettings,
-                      balance: (Number(currentSettings.balance) || 0) + amount
-                    }
-                  })
-                  .eq('id', targetSchoolId);
-              }
-            } catch (schErr) {
-              console.warn('[NaJiki Webhook] Notice updating schools.settings:', schErr);
-            }
-
-            credited = true;
-            console.log(`[NaJiki Webhook] Successfully credited wallet (fallback). New balance: ${newBal} UGX`);
-          } catch (dbErr) {
-            console.error('[NaJiki Webhook] Database fallback error:', dbErr);
-            if (!credited) {
-              return NextResponse.json({ error: 'Failed to credit wallet' }, { status: 500 });
-            }
-          }
-        }
-
-        return NextResponse.json({ 
-          success: true, 
-          message: `Successfully credited ${amount} UGX to school ${schoolId}`,
-          reference: txRef 
-        }, { status: 200 });
-
-      } else {
-        console.warn('[NaJiki Webhook] Missing required fields for payment.success', { schoolId, amount, txRef, eventData });
-        return NextResponse.json({ error: 'Missing required payment fields (schoolId, amount)' }, { status: 400 });
-      }
-    } 
-    
-    // Handle SMS delivery reports
-    else if (
-      eventType === "message.status" || 
-      eventType === "sms_delivery_update" ||
-      eventType.includes("sms") ||
-      eventType.includes("delivery")
-    ) {
-      const smsId = eventData.messageId || eventData.smsId || eventData.id || eventData.provider_ref;
-      const statusStr = (eventData.status || '').toString().toUpperCase();
-      const status = (statusStr === 'DELIVERED' || statusStr === 'SENT' || statusStr === 'SUCCESS') ? 'sent' : 'failed';
-      
-      if (smsId) {
-        // Try updating by provider_ref first
-        const { data: updatedByRef } = await publicAdmin
-          .from('notifications')
-          .update({ status: status })
-          .eq('provider_ref', smsId)
-          .select();
-          
-        if (!updatedByRef || updatedByRef.length === 0) {
-          await publicAdmin
-            .from('notifications')
-            .update({ status: status })
-            .eq('id', smsId);
-        }
-      }
+    if (!isDeliveryReport && cls.isPayment) {
+      return await handlePayment(eventData, cls);
     }
-
+    if (isDeliveryReport) {
+      await handleDeliveryReport(eventData);
+    }
     return NextResponse.json({ received: true }, { status: 200 });
-
-  } catch (err: any) {
+  } catch (err) {
     console.error('[NaJiki Webhook] Error handling webhook:', err);
+    // 5xx: NaJiki will retry. Never acknowledge a payment we failed to record.
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
+  }
+}
+
+async function handlePayment(eventData: Json, cls: ReturnType<typeof classifyPayment>) {
+  const { refs, providerRef } = collectReferences(eventData);
+
+  if (!cls.isPaid) {
+    console.log(`[NaJiki Webhook] Payment not successful (event="${cls.eventType}", status=${cls.statuses.join('/') || 'none'}), ref ${providerRef || refs[0] || '-'}: nothing credited.`);
+    return NextResponse.json({ received: true, credited: false, reason: 'not_paid' }, { status: 200 });
+  }
+
+  const amount = paidAmount(eventData);
+  const currency = paidCurrency(eventData);
+  if (refs.length === 0 && !providerRef) {
+    await recordRejectedPayment('rejected_no_reference', eventData, amount, currency);
+    return NextResponse.json({ error: 'Missing transaction reference' }, { status: 400 });
+  }
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 50_000_000) {
+    await recordRejectedPayment('rejected_invalid_amount', eventData, amount, currency);
+    return NextResponse.json({ error: 'Invalid amount' }, { status: 400 });
+  }
+
+  // The school named in the payload is only a CLAIM: the payment is matched to
+  // the top-up the school started, and a mismatch is refused.
+  const publicAdmin = createPublicAdminClient();
+  const resolved = await resolveWebhookSchool(publicAdmin, eventData);
+  if ('error' in resolved && resolved.error.startsWith('Conflicting')) {
+    console.warn('[NaJiki Webhook] Conflicting school identifiers in payment payload.');
+    await recordRejectedPayment('rejected_conflicting_school', eventData, amount, currency);
+    return NextResponse.json({ error: resolved.error }, { status: 400 });
+  }
+  const claimedSchool = 'schoolId' in resolved ? resolved.schoolId : null;
+  const requireIntent = process.env.NAJIKI_REQUIRE_PAYMENT_INTENT !== 'false';
+
+  const { data: result, error } = await createAdminClient().rpc('apply_payment', {
+    p_refs: providerRef && !refs.includes(providerRef) ? [...refs, providerRef] : refs,
+    p_provider_ref: providerRef,
+    p_amount: amount,
+    p_currency: currency,
+    p_claimed_school: claimedSchool,
+    p_require_intent: requireIntent,
+    p_detail: { event: cls.eventType, statuses: cls.statuses, via: 'schoolId' in resolved ? resolved.via : null },
+  });
+
+  if (error) {
+    if (isMissingFunction(error)) {
+      // FAIL CLOSED. The old fallback credited without intent matching
+      // (pentest: never-initiated payments, overpay, double credit and
+      // wrong-school credit all succeeded). 503 makes NaJiki retry (up to
+      // ~2 days), so nothing is lost while migration 05 gets installed.
+      console.error('[NaJiki Webhook] Migration 05 (school.apply_payment) is NOT installed: payment NOT credited, NaJiki will retry. Run supabase_migrations/05_sms_payment_integrity.sql now.');
+      return NextResponse.json({ error: 'Payments temporarily unavailable, please retry' }, { status: 503 });
+    }
+    console.error('[NaJiki Webhook] apply_payment failed, asking NaJiki to retry:', error.message);
+    return NextResponse.json({ error: 'Could not record payment, please retry' }, { status: 500 });
+  }
+
+  const outcome = (result && result.outcome) || 'unknown';
+  if (outcome === 'credited') {
+    console.log(`[NaJiki Webhook] Credited ${result.amount} UGX to school ${result.school_id} (reported ${amount}), ref ${result.reference}. New balance ${result.balance}.`);
+    return NextResponse.json({ success: true, credited: Number(result.amount), reference: result.reference }, { status: 200 });
+  }
+  if (outcome === 'duplicate') {
+    console.log(`[NaJiki Webhook] Payment ${providerRef || refs[0]} already processed (idempotency hit).`);
+    return NextResponse.json({ success: true, message: 'Transaction already processed' }, { status: 200 });
+  }
+  // unmatched / school_mismatch / currency_mismatch / invalid_amount / no_school:
+  // recorded in school.payment_events for manual reconciliation, NOT credited.
+  console.warn(`[NaJiki Webhook] Payment ${providerRef || refs[0]} NOT credited (${outcome}); held in school.payment_events for review.`);
+  return NextResponse.json({ received: true, credited: false, outcome }, { status: 202 });
+}
+
+/**
+ * Signed payment notifications we refuse with a 4xx are never retried by
+ * NaJiki (najiki-finance2 backoff.ts: 4xx = permanent). Record them so no
+ * money event disappears without a trace. Best effort: never throws.
+ */
+async function recordRejectedPayment(outcome: string, eventData: Json, amount: number, currency: string) {
+  try {
+    const { refs, providerRef } = collectReferences(eventData);
+    const sid = [eventData?.externalEntityId, eventData?.metadata?.schoolId].find((v) => typeof v === 'string' && UUID_RE.test(v)) || null;
+    const { error } = await createAdminClient().from('payment_events').insert({
+      outcome,
+      idempotency_key: refs[0] ?? null,
+      provider_ref: providerRef,
+      school_id: sid,
+      amount: Number.isFinite(amount) ? amount : null,
+      currency: currency || null,
+      detail: { status: eventData?.status ?? null, refs: refs.slice(0, 5), schoolIds: [eventData?.externalEntityId ?? null, eventData?.metadata?.schoolId ?? null, eventData?.schoolId ?? null] },
+    });
+    if (error) console.warn('[NaJiki Webhook] Could not record rejected payment:', error.message);
+  } catch (e) {
+    console.warn('[NaJiki Webhook] Could not record rejected payment:', e);
+  }
+}
+
+async function handleDeliveryReport(eventData: Json) {
+  const raw = eventData?.messageId || eventData?.smsId || eventData?.id || eventData?.provider_ref;
+  const smsId = typeof raw === 'string' || typeof raw === 'number' ? String(raw).slice(0, 200) : '';
+  if (!smsId) return;
+  const statusStr = String(eventData?.status || '').toUpperCase();
+  const status = (statusStr === 'DELIVERED' || statusStr === 'SENT' || statusStr === 'SUCCESS') ? 'sent' : 'failed';
+  // Notifications live in the `school` schema (this used the public-schema
+  // client before, so delivery reports never reached the queue).
+  const admin = createAdminClient();
+  const { data: updatedByRef } = await admin.from('notifications').update({ status }).eq('provider_ref', smsId).select('id');
+  if ((!updatedByRef || updatedByRef.length === 0) && UUID_RE.test(smsId)) {
+    await admin.from('notifications').update({ status }).eq('id', smsId);
   }
 }

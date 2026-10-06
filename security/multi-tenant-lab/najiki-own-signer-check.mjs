@@ -1,0 +1,13 @@
+import crypto from 'crypto'; import pg from 'pg';
+const { buildNotificationHeaders, verifyNotificationSignature } = await import((process.env.NAJIKI_REPO || '/home/user/najiki-finance2') + '/src/lib/notification-signature.ts');
+const db = new pg.Client('postgres://postgres:pw@127.0.0.1:54329/mtlab'); await db.connect();
+const S = 'aaaaaaaa-0000-4000-8000-000000000001', ref = 'sch_topup_' + crypto.randomUUID();
+await db.query("INSERT INTO school.payment_intents(school_id, reference, amount) VALUES ($1,$2,3100)", [S, ref]);
+const bal = async () => Number((await db.query('SELECT coalesce(sum(balance),0) b FROM public.wallets WHERE tenant_id=$1', [S])).rows[0].b);
+const b0 = await bal();
+const payloadString = JSON.stringify({ paymentIntentId: crypto.randomUUID(), reference: 'SCHOOL-PAY-1', status: 'success', amount: 3100, currency: 'UGX', providerPaymentId: 'lp', failureReason: null, externalEntityId: S, metadata: { schoolId: S, idempotencyKey: ref, amount: 3100 } });
+const headers = buildNotificationHeaders(process.env.NAJIKI_WEBHOOK_SECRET, payloadString);
+const r = await fetch('http://127.0.0.1:3201/api/internal/payment-completed', { method: 'POST', headers, body: payloadString });
+console.log('signed by NaJiki source -> HTTP', r.status, 'credited', (await bal()) - b0, 'of 3100');
+console.log("NaJiki's own verifier agrees signature valid:", verifyNotificationSignature({ secret: process.env.NAJIKI_WEBHOOK_SECRET, payloadString, timestamp: headers['X-Najiki-Timestamp'], signature: headers['X-Najiki-Signature'] }));
+await db.end();

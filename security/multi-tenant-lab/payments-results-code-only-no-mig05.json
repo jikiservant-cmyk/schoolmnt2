@@ -1,0 +1,107 @@
+{
+ "vulnerable": 4,
+ "total": 20,
+ "broken": [],
+ "results": [
+  {
+   "name": "P1 credit for a payment that was never initiated",
+   "vulnerable": true,
+   "detail": "200 B delta=5000000"
+  },
+  {
+   "name": "P2 webhook amount larger than the top-up requested",
+   "vulnerable": true,
+   "detail": "200 delta=900000"
+  },
+  {
+   "name": "P3 concurrent duplicate webhooks credit more than once",
+   "vulnerable": false,
+   "detail": "delta=3000 (expected 3000)"
+  },
+  {
+   "name": "P3b one top-up credited twice (two provider notifications)",
+   "vulnerable": true,
+   "detail": "delta=4400 (expected 2200)"
+  },
+  {
+   "name": "P4 concurrent different payments lose money (lost update)",
+   "vulnerable": false,
+   "detail": "delta=1045 (expected 1045)"
+  },
+  {
+   "name": "P5 failed payment credited because event name says success",
+   "vulnerable": false,
+   "detail": "200 delta=0"
+  },
+  {
+   "name": "P6 non-UGX payment credited as UGX",
+   "vulnerable": false,
+   "detail": "202 delta=0"
+  },
+  {
+   "name": "P7 A's payment credited to another school",
+   "vulnerable": true,
+   "detail": "200 B delta=1400"
+  },
+  {
+   "name": "P8 DB error swallowed: provider told OK, payment never credited",
+   "vulnerable": false,
+   "detail": "500 {\"error\":\"Internal Server Error\"}"
+  },
+  {
+   "name": "P9 concurrent top-up clicks create duplicate wallets",
+   "vulnerable": false,
+   "detail": "wallets=0"
+  },
+  {
+   "name": "P9b paid top-up not visible on dashboard (wallet confusion)",
+   "vulnerable": false,
+   "detail": "dashboard delta=2500 wallets=1"
+  },
+  {
+   "name": "P10 admin can mark queued SMS as delivered without sending",
+   "vulnerable": false,
+   "detail": "action not exposed in this build"
+  },
+  {
+   "name": "P11 3MB unauthenticated webhook body accepted for processing",
+   "vulnerable": false,
+   "detail": "status=413"
+  },
+  {
+   "name": "P12 outbound API key accepted as webhook secret",
+   "vulnerable": false,
+   "detail": "401 (webhook secret configured: yes)"
+  },
+  {
+   "name": "S1 captured webhook replayed after the 72h window",
+   "vulnerable": false,
+   "detail": "401 delta=0"
+  },
+  {
+   "name": "S2 signed body altered (amount raised) in transit",
+   "vulnerable": false,
+   "detail": "401 delta=0"
+  },
+  {
+   "name": "S3 timestamp header swapped (signature for another time)",
+   "vulnerable": false,
+   "detail": "401 delta=0"
+  },
+  {
+   "name": "S4 legacy untimestamped body-HMAC accepted",
+   "vulnerable": false,
+   "detail": "401 delta=0"
+  },
+  {
+   "name": "S5 raw secret in Authorization header accepted",
+   "vulnerable": false,
+   "detail": "401 delta=0"
+  },
+  {
+   "name": "S6 signature from far in the future (pre-signed replay)",
+   "vulnerable": false,
+   "detail": "401 delta=0"
+  }
+ ]
+}

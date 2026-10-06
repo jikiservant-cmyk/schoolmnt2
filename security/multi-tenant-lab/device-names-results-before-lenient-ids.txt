@@ -1,0 +1,20 @@
+FAILED push-all button: teacher 101 appears on the device  [queued 2, screen null]
+FAILED push-all button: student 102 appears with class  [screen null]
+FAILED new student appears on the device with her class  [saved, screen null]
+FAILED new teacher appears as "Tr. Okello James"  [saved, screen null]
+FAILED device ID changed 150 -> 155: name now on 155  [screen 155 null]
+OK     device ID changed 150 -> 155: old 150 entry removed (no ghost)  [screen 150 null]
+OK     device ID removed: student no longer on the device  [screen 155 null]
+FAILED hostile name: stored safely, no admin rights, no extra command  [saved, entry null, teacher 101 still there: false]
+FAILED name with ë and apostrophe shows exactly  [screen null]
+FAILED very long name trimmed to 24 characters  [screen null]
+FAILED auto-assign button: new ID given and name appears on the device  [{"success":true,"count":2,"message":"Assigned sequential PINs to 2 mem, ID 155, screen null]
+FAILED device accepted every command (no bad IDs / unknown commands)  [unknown command: DATA UPDATE userinfo PIN=102	N | unknown command: DATA UPDATE userinfo PIN=101	N | unknown command: DATA UPDATE userinfo PIN=150	N]
+FAILED every command the device ran is marked "acknowledged" in the app  [failed=10]
+FAILED every school-A person with a device ID is on school A's device  [missing 101,102,151,152,153,154,155,156]
+OK     school B's device never receives school A's names  [B device has 1 entries]
+
+school A device screen list:
+  999   A-SECRETCMD  (Pri undefined)
+
+12 FAILED

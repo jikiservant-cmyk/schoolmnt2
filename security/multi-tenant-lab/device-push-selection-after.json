@@ -1,0 +1,132 @@
+{
+  "Teachers (incl. admins)": {
+    "queued": [
+      "101",
+      "401",
+      "402"
+    ],
+    "preview": [
+      "101",
+      "401",
+      "402"
+    ],
+    "total": 3,
+    "withPin": 3,
+    "withoutPin": 0,
+    "count": 3
+  },
+  "Support staff": {
+    "queued": [
+      "501"
+    ],
+    "preview": [
+      "501"
+    ],
+    "total": 2,
+    "withPin": 1,
+    "withoutPin": 1,
+    "count": 1
+  },
+  "All students": {
+    "queued": [
+      "102",
+      "301",
+      "302",
+      "311",
+      "312",
+      "321"
+    ],
+    "preview": [
+      "102",
+      "301",
+      "302",
+      "311",
+      "312",
+      "321"
+    ],
+    "total": 7,
+    "withPin": 6,
+    "withoutPin": 1,
+    "count": 6
+  },
+  "Stream S.2 East": {
+    "queued": [
+      "301",
+      "302"
+    ],
+    "preview": [
+      "301",
+      "302"
+    ],
+    "total": 3,
+    "withPin": 2,
+    "withoutPin": 1,
+    "count": 2
+  },
+  "Stream S.2 West": {
+    "queued": [
+      "311",
+      "312"
+    ],
+    "preview": [
+      "311",
+      "312"
+    ],
+    "total": 2,
+    "withPin": 2,
+    "withoutPin": 0,
+    "count": 2
+  },
+  "Class P.5": {
+    "queued": [
+      "321"
+    ],
+    "preview": [
+      "321"
+    ],
+    "total": 1,
+    "withPin": 1,
+    "withoutPin": 0,
+    "count": 1
+  },
+  "Everyone": {
+    "queued": [
+      "101",
+      "102",
+      "301",
+      "302",
+      "311",
+      "312",
+      "321",
+      "401",
+      "402",
+      "501"
+    ],
+    "preview": [
+      "101",
+      "102",
+      "301",
+      "302",
+      "311",
+      "312",
+      "321",
+      "401",
+      "402",
+      "501"
+    ],
+    "total": 12,
+    "withPin": 10,
+    "withoutPin": 2,
+    "count": 10
+  },
+  "auto-assign S.2 East": {
+    "assigned": [
+      "Kato Nopin"
+    ],
+    "count": 1
+  },
+  "class without classId": {
+    "push": "pushed 7",
+    "autoAssignTouchedTeacher": false
+  }
+}

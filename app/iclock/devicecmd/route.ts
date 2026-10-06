@@ -1,85 +1,70 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createAdminClient } from '@/utils/supabase/admin';
-import { parseDeviceMetadata } from '@/lib/devices/metadata';
-import { getDeviceAdapter } from '@/lib/devices/registry';
+import { authenticateDeviceRequest, readDeviceBody, payloadTooLarge } from '@/lib/devices/gateway';
+import { isUuid } from '@/lib/tenant';
+import { deviceCommandId, isDeviceCommandId } from '@/lib/devices/commandId';
 
-// Device responding with the execution status of a command (ZKTeco ADMS /iclock/devicecmd)
+export const dynamic = 'force-dynamic';
+
+const text = (body: string, status = 200) => new NextResponse(body, { status, headers: { 'Content-Type': 'text/plain' } });
+
+// Device reports the execution result of queued commands (ADMS /iclock/devicecmd).
 export async function POST(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const sn = searchParams.get('SN');
-  
-  if (!sn || !sn.trim()) {
-    return new NextResponse('ERROR: Missing SN', { status: 400 });
-  }
+  const sn = new URL(req.url).searchParams.get('SN');
+  if (!sn || !sn.trim()) return text('ERROR: Missing SN', 400);
 
-  const rawBody = await req.text();
-  console.log(`[ZKTeco ADMS] DeviceCmd POST from SN: ${sn}`);
+  // Authenticate BEFORE reading the body (it used to be read first, unbounded).
+  const auth = await authenticateDeviceRequest(req, sn, 'devicecmd');
+  if (!auth.ok) return auth.response;
+  const { device, supabase, serial } = auth;
 
-  const supabase = createAdminClient();
-  const cleanSn = sn.trim().toUpperCase().replace(/[%_]/g, '');
+  const rawBody = await readDeviceBody(req, 256 * 1024);
+  if (rawBody === null) return payloadTooLarge();
 
-  // Validate device exists and is active
-  const { data: rawDevice } = await supabase
-    .from('devices')
-    .select('*')
-    .eq('serial_number', cleanSn)
-    .maybeSingle();
+  const lines = rawBody.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, 500);
 
-  if (!rawDevice || !rawDevice.is_active) {
-    console.warn(`[ZKTeco ADMS] devicecmd from unauthorized or inactive device SN: ${cleanSn}`);
-    return new NextResponse('ERROR: UNAUTHORIZED_DEVICE', { status: 401 });
-  }
-
-  const device = parseDeviceMetadata(rawDevice);
-  const adapter = getDeviceAdapter(device.device_type);
-
-  // Enforce token/secret verification
-  const isAuth = await adapter.buildAuthCheck(req, device);
-  if (!isAuth) {
-    console.warn(`[ZKTeco ADMS] devicecmd authentication failed for SN: ${cleanSn}`);
-    return new NextResponse('ERROR: INVALID_CREDENTIALS', { status: 401 });
-  }
-
-  if (rawBody && rawBody.trim()) {
-    try {
-      const supabase = createAdminClient();
-      const lines = rawBody.split('\n').map(l => l.trim()).filter(Boolean);
-
-      for (const line of lines) {
-        // Line format: ID=<cmdId>&Return=<0|other>&CMD=...
-        const params = new URLSearchParams(line);
-        const cmdId = params.get('ID');
-        const returnCode = params.get('Return');
-
-        if (cmdId) {
-          const isSuccess = returnCode === '0';
-          const updatePayload: Record<string, any> = {
-            status: isSuccess ? 'acknowledged' : 'failed',
-            acknowledged_at: new Date().toISOString()
-          };
-          if (!isSuccess) {
-            updatePayload.error_message = `Terminal execution return code: ${returnCode}`;
-          }
-
-          // If cmdId is a UUID, update primary school.device_commands table
-          const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cmdId);
-          if (isUuid) {
-            await supabase
-              .from('device_commands')
-              .update(updatePayload)
-              .eq('id', cmdId)
-              .eq('school_id', device.school_id);
-          }
-        }
-      }
-    } catch (err) {
-      console.warn('[ZKTeco ADMS] Error updating command acknowledgment:', err);
+  // Terminals echo the short id from getrequest (deviceCommandId). Map it back
+  // to the queue row among this device's commands that are awaiting a reply.
+  // (Full UUIDs are still accepted for commands sent before this change.)
+  let shortIdMap: Map<string, string> | null = null;
+  const resolveId = async (echoed: string | null): Promise<string | null> => {
+    if (!echoed) return null;
+    if (isUuid(echoed)) return echoed;
+    if (!isDeviceCommandId(echoed)) return null;
+    if (!shortIdMap) {
+      shortIdMap = new Map();
+      const { data: awaiting } = await supabase
+        .from('device_commands')
+        .select('id')
+        .eq('school_id', device.school_id)
+        .in('target_serial', [serial, 'ALL'])
+        .eq('status', 'sent')
+        .order('sent_at', { ascending: false })
+        .limit(1000);
+      for (const row of awaiting || []) shortIdMap.set(deviceCommandId(String(row.id)), String(row.id));
     }
+    return shortIdMap.get(echoed) ?? null;
+  };
+
+  for (const line of lines) {
+    const params = new URLSearchParams(line);
+    const cmdId = await resolveId(params.get('ID'));
+    if (!cmdId) continue;
+    const returnCode = (params.get('Return') || '').slice(0, 16);
+    const ok = returnCode === '0';
+    const update: Record<string, unknown> = {
+      status: ok ? 'acknowledged' : 'failed',
+      acknowledged_at: new Date().toISOString(),
+    };
+    if (!ok) update.error_message = `Terminal execution return code: ${returnCode}`;
+
+    const { error } = await supabase
+      .from('device_commands')
+      .update(update)
+      .eq('id', cmdId)
+      .eq('school_id', device.school_id)
+      .in('target_serial', [serial, 'ALL']);
+    if (error) console.warn(`[ZKTeco ADMS] ack update failed for ${serial}:`, error.message);
   }
 
-  // Return OK to acknowledge receiving the command execution result
-  return new NextResponse('OK', {
-    status: 200,
-    headers: { 'Content-Type': 'text/plain' }
-  });
+  return text('OK');
 }

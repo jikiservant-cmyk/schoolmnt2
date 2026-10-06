@@ -5,6 +5,8 @@ import { createAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 import bcrypt from 'bcryptjs';
+import { generateTeacherPin, PIN_BCRYPT_ROUNDS } from '@/lib/security/pin';
+import { allClassesOwned, getOwnedClass, isUuid } from '@/lib/tenant';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
   // 1. Try auth_school_id RPC
@@ -57,6 +59,9 @@ export async function addPersonAction(formData: FormData) {
     const adminClient = createAdminClient();
     const rawDeviceId = formData.get('deviceUserId') as string;
     const cleanDeviceId = rawDeviceId && rawDeviceId.trim() ? rawDeviceId.trim() : null;
+    if (cleanDeviceId && (cleanDeviceId.length > 32 || !/^[A-Za-z0-9_-]+$/.test(cleanDeviceId))) {
+      return { error: 'Biometric Enrollment ID may only contain letters, digits, "_" or "-" (max 32).' };
+    }
 
     // Check for duplicate biometric device user ID in this school
     if (cleanDeviceId) {
@@ -148,7 +153,14 @@ export async function addPersonAction(formData: FormData) {
       if (!classId) {
         return { error: 'Please select a class for the student.' };
       }
-      studentClassId = classId;
+      // MULTI-TENANT: the class must belong to the caller's school. Otherwise a
+      // student could be attached to another school's class (cross-tenant FK)
+      // and that school's class name would leak back through joins.
+      const ownedClass = await getOwnedClass(adminClient, schoolId, classId);
+      if (!ownedClass) {
+        return { error: 'Selected class was not found in your school.' };
+      }
+      studentClassId = ownedClass.id;
       params.p_class_id = classId;
 
       const guardianName = formData.get('guardianName') as string;
@@ -169,10 +181,16 @@ export async function addPersonAction(formData: FormData) {
       let classIds: string[] = [];
       if (classIdsJson) {
         try {
-          classIds = JSON.parse(classIdsJson);
+          const parsed = JSON.parse(classIdsJson);
+          classIds = Array.isArray(parsed) ? parsed : [];
         } catch (e) {
           console.error('Failed to parse classIds:', e);
+          return { error: 'Invalid class selection.' };
         }
+      }
+      // MULTI-TENANT: every assigned class must belong to the caller's school.
+      if (!(await allClassesOwned(adminClient, schoolId, classIds))) {
+        return { error: 'One or more selected classes were not found in your school.' };
       }
 
       if (phone && phone.trim()) {
@@ -181,36 +199,8 @@ export async function addPersonAction(formData: FormData) {
         params.p_phone = null;
       }
 
-      // Auto-generate a globally unique Teacher Attendance Passcode / PIN (alphanumeric, e.g. T7K9M2)
-      const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-      const { data: existingStaff } = await adminClient
-        .from('staff_users')
-        .select('pin_hash')
-        .not('pin_hash', 'is', null);
-
-      let isUnique = false;
-      let attempts = 0;
-      while (!isUnique && attempts < 50) {
-        attempts++;
-        let candidate = 'T';
-        for (let i = 0; i < 5; i++) {
-          candidate += chars.charAt(Math.floor(Math.random() * chars.length));
-        }
-
-        let collision = false;
-        if (existingStaff && existingStaff.length > 0) {
-          for (const su of existingStaff) {
-            if (su.pin_hash && bcrypt.compareSync(candidate, su.pin_hash)) {
-              collision = true;
-              break;
-            }
-          }
-        }
-        if (!collision) {
-          generatedTeacherPin = candidate;
-          isUnique = true;
-        }
-      }
+      // Auto-generate a Teacher Attendance Passcode / PIN (alphanumeric, e.g. T7K9M2) via CSPRNG
+      generatedTeacherPin = generateTeacherPin();
 
       params.p_pin = generatedTeacherPin;
       params.p_class_ids = classIds.length > 0 ? classIds : null;
@@ -311,12 +301,12 @@ export async function addPersonAction(formData: FormData) {
         }
 
         if (generatedTeacherPin) {
-          const salt = bcrypt.genSaltSync(6);
-          const pinHash = bcrypt.hashSync(generatedTeacherPin, salt);
+          const pinHash = await bcrypt.hash(generatedTeacherPin, PIN_BCRYPT_ROUNDS);
           try {
             await adminClient
               .from('staff_users')
               .insert({
+                school_id: schoolId,
                 person_id: newPerson.id,
                 pin_hash: pinHash,
                 role: 'teacher'
@@ -389,55 +379,20 @@ export async function resetTeacherPinAction(personId: string) {
       return { error: 'Teacher record not found or access denied.' };
     }
 
-    // 2. Auto-generate a unique 6-character PIN (e.g. T7K9M2)
-    const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+    // 2. Generate a new 6-character PIN (e.g. T7K9M2) with a CSPRNG
+    const newPin = generateTeacherPin();
 
-    const { data: existingStaff } = await adminClient
-      .from('staff_users')
-      .select('pin_hash')
-      .not('pin_hash', 'is', null);
-
-    let isUnique = false;
-    let attempts = 0;
-    let newPin = '';
-
-    while (!isUnique && attempts < 50) {
-      attempts++;
-      let candidate = 'T';
-      for (let i = 0; i < 5; i++) {
-        candidate += chars.charAt(Math.floor(Math.random() * chars.length));
-      }
-
-      let collision = false;
-      if (existingStaff && existingStaff.length > 0) {
-        for (const su of existingStaff) {
-          if (su.pin_hash && bcrypt.compareSync(candidate, su.pin_hash)) {
-            collision = true;
-            break;
-          }
-        }
-      }
-      if (!collision) {
-        newPin = candidate;
-        isUnique = true;
-      }
-    }
-
-    if (!newPin) {
-      return { error: 'Failed to generate a unique PIN. Please try again.' };
-    }
-
-    // 3. Hash the new PIN using bcrypt with salt rounds = 6
-    const salt = bcrypt.genSaltSync(6);
-    const pinHash = bcrypt.hashSync(newPin, salt);
+    // 3. Hash the new PIN (async bcrypt — never block the event loop)
+    const pinHash = await bcrypt.hash(newPin, PIN_BCRYPT_ROUNDS);
 
     // 4. Update staff_users table for this teacher
     const { error: updateErr } = await adminClient
       .from('staff_users')
       .update({
         pin_hash: pinHash,
-        pin_failed_attempts: 0,
-        pin_locked_until: null,
+        // Must match the columns read by verifyTeacherPin, otherwise a reset never clears a lockout.
+        failed_attempts: 0,
+        locked_until: null,
       })
       .eq('person_id', personId);
 
@@ -483,17 +438,21 @@ export async function searchPeopleAction(params: {
     query = query.eq('is_active', false);
   }
 
-  if (params.searchTerm && params.searchTerm.trim() !== '') {
-    const st = params.searchTerm.trim();
+  if (typeof params.searchTerm === 'string' && params.searchTerm.trim() !== '') {
+    // Strip PostgREST filter metacharacters so user input can't inject extra
+    // conditions into the .or() expression (e.g. "x,school_id.neq.null").
+    const st = params.searchTerm.trim().slice(0, 100).replace(/[,()*%\\:."'`]/g, ' ').trim();
     // ilike on full_name, phone, device_user_id
-    query = query.or(`full_name.ilike.%${st}%,phone.ilike.%${st}%,device_user_id.ilike.%${st}%`);
+    if (st) {
+      query = query.or(`full_name.ilike.%${st}%,phone.ilike.%${st}%,device_user_id.ilike.%${st}%`);
+    }
   }
 
   // order by full name
   query = query.order('full_name', { ascending: true });
 
-  const page = params.page || 1;
-  const limit = params.limit || 50;
+  const page = Number.isInteger(params.page) && (params.page as number) > 0 ? (params.page as number) : 1;
+  const limit = Number.isInteger(params.limit) && (params.limit as number) > 0 ? Math.min(params.limit as number, 200) : 50;
   const from = (page - 1) * limit;
   const to = from + limit - 1;
 
@@ -520,9 +479,13 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
     const cleanUid = deviceUserId && deviceUserId.trim() ? deviceUserId.trim() : null;
 
     // 1. Fetch person details to verify and get info for device command
+    if (!isUuid(personId)) return { error: 'Person record not found or access denied.' };
+    if (cleanUid && (cleanUid.length > 32 || !/^[A-Za-z0-9_-]+$/.test(cleanUid))) {
+      return { error: 'Biometric UID may only contain letters, digits, "_" or "-" (max 32).' };
+    }
     const { data: person, error: pErr } = await adminClient
       .from('people')
-      .select('id, full_name, role, school_id, class_id, classes:class_id(name)')
+      .select('id, full_name, role, school_id, class_id, device_user_id, classes:class_id(name)')
       .eq('id', personId)
       .eq('school_id', schoolId)
       .single();
@@ -552,11 +515,24 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
     const { error: updateErr } = await adminClient
       .from('people')
       .update({ device_user_id: cleanUid })
-      .eq('id', personId);
+      .eq('id', personId)
+      .eq('school_id', schoolId);
 
     if (updateErr) {
       console.error('Error updating device_user_id:', updateErr);
       return { error: updateErr.message || 'Failed to update biometric UID.' };
+    }
+
+    // 4a. The old device ID is no longer this person's: take it off the
+    //     terminals (queued before the new one, so the order is delete -> add).
+    const oldUid = typeof person.device_user_id === 'string' ? person.device_user_id.trim() : '';
+    if (oldUid && oldUid !== cleanUid) {
+      try {
+        const { enqueuePersonRemovalForSchool } = await import('@/utils/zkteco/commandQueue');
+        await enqueuePersonRemovalForSchool(oldUid, schoolId);
+      } catch (cmdErr) {
+        console.warn('Non-blocking: Failed to enqueue removal of old device ID:', cmdErr);
+      }
     }
 
     // 4. Sync into school.person_credentials table if cleanUid is present

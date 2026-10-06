@@ -3,6 +3,8 @@
 import { createClient } from '@/utils/supabase/server';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
+import { createAdminClient } from '@/utils/supabase/admin';
+import { getOwnedPerson } from '@/lib/tenant';
 
 export async function addClassAction(formData: FormData) {
   const supabase = await createClient();
@@ -21,6 +23,18 @@ export async function addClassAction(formData: FormData) {
 
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
+
+    if (trimmedName.length < 1 || trimmedName.length > 60) {
+      return { error: 'Class name must be between 1 and 60 characters.' };
+    }
+
+    // MULTI-TENANT: the class teacher must be an active teacher in this school.
+    if (teacherId) {
+      const teacher = await getOwnedPerson(createAdminClient(), schoolId, teacherId, ['teacher']);
+      if (!teacher) {
+        return { error: 'Selected teacher was not found in your school.' };
+      }
+    }
 
 
     // Find the current active academic year for this school

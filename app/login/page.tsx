@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useTransition } from 'react';
+import { useEffect, useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 import { loginAction } from './actions';
 import Link from 'next/link';
@@ -10,6 +10,14 @@ export default function LoginPage() {
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    // Set when a non-admin / revoked session is bounced from a protected page.
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('error') === 'access_denied') {
+      setError('Your session does not have admin access. Please sign in with a school admin account.');
+    }
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -25,7 +33,7 @@ export default function LoginPage() {
         if (err?.message?.includes('NEXT_REDIRECT')) {
           throw err;
         }
-        setError(err.message || 'An unexpected error occurred.');
+        setError('An unexpected error occurred. Please try again.');
       }
     });
   };
@@ -61,6 +69,8 @@ export default function LoginPage() {
               name="email"
               type="email"
               required
+              maxLength={254}
+              autoComplete="username"
               disabled={isPending}
               className="w-full px-3 py-2.5 bg-meridian-panel-raised border border-meridian-border text-sm rounded-lg focus:outline-none focus:ring-1 focus:ring-meridian-gold focus:border-meridian-gold transition-colors disabled:opacity-50 text-meridian-text-1"
             />
@@ -75,6 +85,8 @@ export default function LoginPage() {
               name="password"
               type="password"
               required
+              maxLength={256}
+              autoComplete="current-password"
               disabled={isPending}
               className="w-full px-3 py-2.5 bg-meridian-panel-raised border border-meridian-border text-sm rounded-lg focus:outline-none focus:ring-1 focus:ring-meridian-gold focus:border-meridian-gold transition-colors disabled:opacity-50 text-meridian-text-1"
             />

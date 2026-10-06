@@ -1,85 +1,58 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createAdminClient } from '@/utils/supabase/admin';
-import { parseDeviceMetadata } from '@/lib/devices/metadata';
-import { getDeviceAdapter } from '@/lib/devices/registry';
+import { authenticateDeviceRequest, isSafeDeviceCommand } from '@/lib/devices/gateway';
+import { deviceCommandId } from '@/lib/devices/commandId';
 
-// Device polling for server commands (ADMS /iclock/getrequest)
-// Required config to prevent caching the polling endpoint
+// Device polling for server commands (ADMS /iclock/getrequest). Never cache.
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
+const text = (body: string, status = 200) => new NextResponse(body, { status, headers: { 'Content-Type': 'text/plain' } });
+
 export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const sn = searchParams.get('SN');
-  
-  if (!sn || !sn.trim()) {
-    return new NextResponse('OK', { status: 200, headers: { 'Content-Type': 'text/plain' } });
-  }
+  const sn = new URL(req.url).searchParams.get('SN');
+  if (!sn || !sn.trim()) return text('OK');
 
-  const cleanSn = sn.trim().toUpperCase().replace(/[%_]/g, '');
-  const supabase = createAdminClient();
+  const auth = await authenticateDeviceRequest(req, sn, 'getrequest');
+  if (!auth.ok) return auth.response;
+  const { device, supabase, serial } = auth;
 
-  // Validate device exists and is active
-  const { data: rawDevice } = await supabase
-    .from('devices')
-    .select('*')
-    .eq('serial_number', cleanSn)
-    .maybeSingle();
+  await supabase.from('devices').update({ last_seen_at: new Date().toISOString() }).eq('id', device.id);
 
-  if (!rawDevice || !rawDevice.is_active) {
-    console.warn(`[ZKTeco ADMS] getrequest from unauthorized or inactive device SN: ${cleanSn}`);
-    return new NextResponse('ERROR: UNAUTHORIZED_DEVICE', { 
-      status: 401, 
-      headers: { 'Content-Type': 'text/plain' } 
-    });
-  }
+  const commandList: { id: string | number; text: string }[] = [];
 
-  const device = parseDeviceMetadata(rawDevice);
-  const adapter = getDeviceAdapter(device.device_type);
-
-  // Enforce token/secret verification
-  const isAuth = await adapter.buildAuthCheck(req, device);
-  if (!isAuth) {
-    console.warn(`[ZKTeco ADMS] getrequest authentication failed for SN: ${cleanSn}`);
-    return new NextResponse('ERROR: INVALID_CREDENTIALS', { status: 401 });
-  }
-
-  // 1. Update device heartbeat
-  await supabase
-    .from('devices')
-    .update({ last_seen_at: new Date().toISOString() })
-    .eq('id', device.id);
-
-  // 2. Fetch pending commands from primary school.device_commands queue
-  const { data: dbCommands, error: dbCmdsErr } = await supabase
+  // 1. Primary queue
+  const { data: dbCommands } = await supabase
     .from('device_commands')
     .select('id, raw_command')
     .eq('status', 'pending')
     .eq('school_id', device.school_id)
-    .in('target_serial', [cleanSn, 'ALL'])
+    .in('target_serial', [serial, 'ALL'])
     .order('created_at', { ascending: true })
     .limit(50);
 
-  const commandList: { id: string | number; text: string }[] = [];
-  const sentCommandIds: string[] = [];
-
   if (dbCommands && dbCommands.length > 0) {
-    dbCommands.forEach((c) => {
-      sentCommandIds.push(c.id);
-      commandList.push({
-        id: c.id,
-        text: c.raw_command.trim()
-      });
-    });
-
-    // Mark commands as sent to device
-    await supabase
-      .from('device_commands')
-      .update({ status: 'sent', sent_at: new Date().toISOString() })
-      .in('id', sentCommandIds);
+    const sentIds: string[] = [];
+    const rejectedIds: string[] = [];
+    for (const c of dbCommands) {
+      // A CR/LF inside a command would let it smuggle extra "C:<id>:..." lines
+      // (e.g. CLEAR ALL DATA) to the terminal. Refuse and mark it failed.
+      if (isSafeDeviceCommand(c.raw_command)) {
+        sentIds.push(c.id);
+        commandList.push({ id: c.id, text: c.raw_command.trim() });
+      } else {
+        rejectedIds.push(c.id);
+      }
+    }
+    if (sentIds.length) {
+      await supabase.from('device_commands').update({ status: 'sent', sent_at: new Date().toISOString() }).in('id', sentIds);
+    }
+    if (rejectedIds.length) {
+      console.warn(`[ZKTeco ADMS] Refused ${rejectedIds.length} unsafe command(s) for ${serial}`);
+      await supabase.from('device_commands').update({ status: 'failed', error_message: 'Rejected: command contains line breaks' }).in('id', rejectedIds);
+    }
   }
 
-  // Fallback: Check legacy device_logs queue if primary queue was empty
+  // 2. Legacy device_logs queue (only when the primary queue is empty)
   if (commandList.length === 0) {
     const { data: legacyCmds } = await supabase
       .from('device_logs')
@@ -87,47 +60,26 @@ export async function GET(req: NextRequest) {
       .eq('processed', false)
       .eq('device_user_id', 'COMMAND')
       .eq('school_id', device.school_id)
-      .in('raw_serial_number', [cleanSn, 'ALL'])
+      .in('raw_serial_number', [serial, 'ALL'])
       .order('event_timestamp', { ascending: true })
       .limit(50);
 
-    const processedLogIds: string[] = [];
     if (legacyCmds && legacyCmds.length > 0) {
       legacyCmds.forEach((c, idx) => {
-        processedLogIds.push(c.id);
-        const payloadObj = c.payload as { cmd?: string };
-        const rawCmd = payloadObj?.cmd?.trim();
-        if (rawCmd) {
-          commandList.push({
-            id: idx + 1,
-            text: rawCmd
-          });
-        }
+        const rawCmd = (c.payload as { cmd?: string } | null)?.cmd;
+        if (isSafeDeviceCommand(rawCmd)) commandList.push({ id: idx + 1, text: rawCmd.trim() });
       });
       await supabase
         .from('device_logs')
         .update({ processed: true, processed_at: new Date().toISOString() })
-        .in('id', processedLogIds);
+        .in('id', legacyCmds.map((c) => c.id));
     }
   }
 
-  if (commandList.length > 0) {
-    // 4. Format ZKTeco ADMS response: C:<id>:<command>
-    const responseBody = commandList.map((c) => {
-      return `C:${c.id}:${c.text}`;
-    }).join('\n');
-    
-    console.log(`[ZKTeco ADMS] Sending ${commandList.length} commands to terminal SN ${cleanSn}:\n${responseBody}`);
-    
-    return new NextResponse(responseBody, {
-      status: 200,
-      headers: { 'Content-Type': 'text/plain' }
-    });
-  }
+  if (commandList.length === 0) return text('OK');
 
-  return new NextResponse('OK', {
-    status: 200,
-    headers: { 'Content-Type': 'text/plain' }
-  });
+  // Log only the count: commands carry names/PINs (personal data).
+  console.log(`[ZKTeco ADMS] Sending ${commandList.length} command(s) to ${serial}`);
+  // CmdID must be 1-16 letters/digits (ZKTeco PUSH spec); UUIDs were refused.
+  return text(commandList.map((c) => `C:${deviceCommandId(c.id)}:${c.text}`).join('\n'));
 }
-

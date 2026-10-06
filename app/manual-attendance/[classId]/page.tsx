@@ -44,6 +44,10 @@ export default function ManualAttendancePage() {
         const res = await getTeachersForClass(classId);
         if (res.success && res.teachers) {
           setAvailableTeachers(res.teachers);
+        } else if (!res.success) {
+          // Wrong / other school's class link: say so instead of the
+          // misleading "No active teachers found for this class."
+          setError(res.error || 'Class not found or access denied.');
         }
       } catch (err) {
         console.error('Failed to load teachers', err);

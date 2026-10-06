@@ -1,5 +1,5 @@
 import { DeviceAdapter, DeviceRecord, AttendanceEvent, EnrollPersonInput, EnrollCommandResult, HandshakeResponse } from '../types';
-import { isAuthorizedToken } from '../metadata';
+import { isAuthorizedDevice } from '../metadata';
 
 export class SupremaBiostarAdapter implements DeviceAdapter {
   readonly deviceType = 'suprema_biostar';
@@ -15,7 +15,7 @@ export class SupremaBiostarAdapter implements DeviceAdapter {
       req.headers.get('authorization')?.replace(/^Bearer\s+/i, '') ||
       url.searchParams.get('token');
 
-    return isAuthorizedToken(providedToken, device.device_secret);
+    return isAuthorizedDevice(providedToken, device);
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {

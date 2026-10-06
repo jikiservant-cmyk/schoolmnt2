@@ -1,5 +1,5 @@
 import { DeviceAdapter, DeviceRecord, AttendanceEvent, EnrollPersonInput, EnrollCommandResult, HandshakeResponse } from '../types';
-import { isAuthorizedToken } from '../metadata';
+import { isAuthorizedDevice } from '../metadata';
 
 export class GenericWebhookAdapter implements DeviceAdapter {
   readonly deviceType = 'generic_webhook';
@@ -16,7 +16,7 @@ export class GenericWebhookAdapter implements DeviceAdapter {
       url.searchParams.get('token') ||
       url.searchParams.get('api_key');
 
-    return isAuthorizedToken(providedToken, device.device_secret);
+    return isAuthorizedDevice(providedToken, device);
   }
 
   buildHandshakeResponse(device: DeviceRecord): HandshakeResponse {

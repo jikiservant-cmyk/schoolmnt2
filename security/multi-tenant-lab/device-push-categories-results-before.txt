@@ -1,0 +1,46 @@
+OK     Teachers (incl. admins): device shows exactly the right people  [screen 101,401,402]
+OK     Teachers (incl. admins): preview list = what was pushed  [preview 3, pushed 3]
+OK     Teachers (incl. admins): names on device = names in the preview
+OK     Teachers (incl. admins): device rights unchanged (admin 14, everyone else 0)
+OK     Teachers (incl. admins): every command accepted
+OK     Support staff: device shows exactly the right people  [screen 501]
+OK     Support staff: preview list = what was pushed  [preview 1, pushed 1]
+OK     Support staff: names on device = names in the preview
+OK     Support staff: device rights unchanged (admin 14, everyone else 0)
+OK     Support staff: every command accepted
+OK     All students: device shows exactly the right people  [screen 102,301,302,311,312,321]
+OK     All students: preview list = what was pushed  [preview 6, pushed 6]
+OK     All students: names on device = names in the preview
+OK     All students: device rights unchanged (admin 14, everyone else 0)
+OK     All students: every command accepted
+OK     Stream S.2 East: device shows exactly the right people  [screen 301,302]
+OK     Stream S.2 East: preview list = what was pushed  [preview 2, pushed 2]
+OK     Stream S.2 East: names on device = names in the preview
+OK     Stream S.2 East: device rights unchanged (admin 14, everyone else 0)
+OK     Stream S.2 East: every command accepted
+OK     Stream S.2 West: device shows exactly the right people  [screen 311,312]
+OK     Stream S.2 West: preview list = what was pushed  [preview 2, pushed 2]
+OK     Stream S.2 West: names on device = names in the preview
+OK     Stream S.2 West: device rights unchanged (admin 14, everyone else 0)
+OK     Stream S.2 West: every command accepted
+OK     Class P.5: device shows exactly the right people  [screen 321]
+OK     Class P.5: preview list = what was pushed  [preview 1, pushed 1]
+OK     Class P.5: names on device = names in the preview
+OK     Class P.5: device rights unchanged (admin 14, everyone else 0)
+OK     Class P.5: every command accepted
+OK     Everyone: device shows exactly the right people  [screen 101,102,301,302,311,312,321,401,402,501]
+OK     Everyone: preview list = what was pushed  [preview 10, pushed 10]
+OK     Everyone: names on device = names in the preview
+OK     Everyone: device rights unchanged (admin 14, everyone else 0)
+OK     Everyone: every command accepted
+OK     screen names: "Akello Mary (S.2 East)", "Nambi Ruth (S.2 West)", "Tr. Okot Peter", "Adm. Head Admin", "Stf. Wasswa Guard"  [Akello Mary (S.2 East) | Nambi Ruth (S.2 West) | Tr. Okot Peter | Adm. Head Admin | Stf. Wasswa Guard]
+OK     other school's stream (same name 'S.2 East') refused on push / preview / auto-assign  [Class not found or access denied. / Class not found or access denied. / Class not found or access denied.]
+OK     other school's device refused  [Device not found or access denied.]
+OK     school B's device received nothing from school A  [0 entries]
+OK     auto-assign on stream S.2 East: only Kato (East, no ID) gets an ID  [{"Cook Nansubuga":null,"Kato Nopin":"502"}]
+OK     auto-assign on stream S.2 East: device shows only Kato  [Kato Nopin (S.2 East)]
+OK     auto-assign on support staff: cook gets a new, unused ID and shows on device  [ID 503, screen Stf. Cook Nansubuga]
+OK     auto-assign when everyone already has an ID: nothing changes  [All selected members already have a biometric PIN assigned.]
+FAILED "One class" with no class picked never gives a TEACHER an ID / pushes staff  [push: pushed 7; auto-assign: Assigned sequential PINs to 1 members and enqueued display names to terminal.; teacher ID now 504]
+
+1 FAILED
