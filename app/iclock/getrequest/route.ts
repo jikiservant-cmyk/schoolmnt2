@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { authenticateDeviceRequest, isSafeDeviceCommand } from '@/lib/devices/gateway';
+import { deviceCommandId } from '@/lib/devices/commandId';
 
 // Device polling for server commands (ADMS /iclock/getrequest). Never cache.
 export const dynamic = 'force-dynamic';
@@ -79,5 +80,6 @@ export async function GET(req: NextRequest) {
 
   // Log only the count: commands carry names/PINs (personal data).
   console.log(`[ZKTeco ADMS] Sending ${commandList.length} command(s) to ${serial}`);
-  return text(commandList.map((c) => `C:${c.id}:${c.text}`).join('\n'));
+  // CmdID must be 1-16 letters/digits (ZKTeco PUSH spec); UUIDs were refused.
+  return text(commandList.map((c) => `C:${deviceCommandId(c.id)}:${c.text}`).join('\n'));
 }

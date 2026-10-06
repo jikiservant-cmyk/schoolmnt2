@@ -1,6 +1,7 @@
 import { createAdminClient } from '@/utils/supabase/admin';
 import { parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
+import { zktecoDeleteUserCommand } from '@/lib/devices/adapters/zkteco';
 import { EnrollPersonInput } from '@/lib/devices/types';
 import { UUID_RE, normalizeSerial } from '@/lib/tenant';
 
@@ -197,3 +198,28 @@ export async function enqueuePersonEnrollmentForSchool(
     totalDevices: devices.length
   };
 }
+
+/**
+ * Remove a device PIN from every ZKTeco terminal the school owns (used when a
+ * person's device ID is changed or cleared; before, the old entry stayed on
+ * the terminal with the person's name: a "ghost" that a future person with
+ * that ID would inherit). Other vendors don't poll a command queue.
+ */
+export async function enqueuePersonRemovalForSchool(pin: string, schoolId: string) {
+  const command = zktecoDeleteUserCommand(pin);
+  if (!command) return { success: false, queuedCount: 0 };
+  const zk = getDeviceAdapter('zkteco_adms');
+  const devices = (await getActiveDevicesForSchool(schoolId)).filter((d) => getDeviceAdapter(d.device_type) === zk);
+  let queuedCount = 0;
+  for (const dev of devices) {
+    const res = await enqueueDeviceCommand(command, dev.serial_number, {
+      schoolId,
+      commandType: 'DELETE_USER',
+      payload: { pin: String(pin).trim() },
+      vendorProtocol: dev.device_type,
+    });
+    if (res.success) queuedCount++;
+  }
+  return { success: queuedCount > 0, queuedCount };
+}
+

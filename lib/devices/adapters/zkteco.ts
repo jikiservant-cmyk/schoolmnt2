@@ -153,7 +153,8 @@ export class ZKTecoAdmsAdapter implements DeviceAdapter {
 
     const pri = person.role === 'admin' ? 14 : 0;
     const cleanPin = person.pin.trim().replace(/[\t\r\n=]/g, '');
-    const command = `DATA UPDATE userinfo PIN=${cleanPin}\tName=${displayName}\tPri=${pri}`;
+    // Exact upper-case form from the PUSH spec; real firmware rejects other spellings.
+    const command = `DATA UPDATE USERINFO PIN=${cleanPin}\tName=${displayName}\tPri=${pri}`;
 
     return {
       command,
@@ -165,4 +166,10 @@ export class ZKTecoAdmsAdapter implements DeviceAdapter {
       }
     };
   }
+}
+
+/** Remove a user (by device PIN) from a ZKTeco terminal. */
+export function zktecoDeleteUserCommand(pin: string): string | null {
+  const cleanPin = String(pin ?? '').trim().replace(/[\t\r\n=\0]/g, '');
+  return cleanPin ? `DATA DELETE USERINFO PIN=${cleanPin}` : null;
 }

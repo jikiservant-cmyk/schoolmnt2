@@ -1,0 +1,31 @@
+OK     push-all button: teacher 101 appears on the device  [queued 2, screen "Teacher A-SECRETNAME"]
+OK     push-all button: student 102 appears (full name kept; long class left out)  [screen "Student A-SECRETNAME"]
+OK     new student appears on the device (full name, not chopped)  [saved, screen "Nakato Sarah"]
+OK     new teacher appears as "Tr. Okello James"  [saved, screen "Tr. Okello James"]
+OK     device ID changed 150 -> 155: name now on 155  [screen 155 "Nakato Sarah"]
+OK     device ID changed 150 -> 155: old 150 entry removed (no ghost)  [screen 150 null]
+OK     device ID removed: student no longer on the device  [screen 155 null]
+OK     hostile name: stored safely, no admin rights, no extra command  [saved, entry {"name":"Tr. Evil Pri 14 C:77:DAT","pri":"0"}, teacher 101 still there: true]
+OK     name with ë and apostrophe shows exactly  [screen "Tr. Zoë N'Kurunziza"]
+OK     very long name trimmed to 24 characters  [screen "Tr. Ssekandi Mukasa Byar"]
+OK     student in class P.5 shows "Namubiru Joan (P.5)"  [screen "Namubiru Joan (P.5)"]
+OK     auto-assign button: new ID given and name appears on the device  [{"success":true,"count":2,"message":"Assigned sequential PINs to 2 mem, ID 158, screen "Stf. Auma Grace"]
+OK     no name on the device is longer than the 24-character screen
+OK     device accepted every command (no bad IDs / unknown commands)
+OK     every command the device ran is marked "acknowledged" in the app  [acknowledged=13]
+OK     every school-A person with a device ID is on school A's device  [9 people]
+OK     school B's device never receives school A's names  [B device has 1 entries]
+
+school A device screen list:
+  101   Teacher A-SECRETNAME  (Pri 0)
+  102   Student A-SECRETNAME  (Pri 0)
+  151   Tr. Okello James  (Pri 0)
+  152   Tr. Evil Pri 14 C:77:DAT  (Pri 0)
+  153   Tr. Zoë N'Kurunziza  (Pri 0)
+  154   Tr. Ssekandi Mukasa Byar  (Pri 0)
+  157   Namubiru Joan (P.5)  (Pri 0)
+  158   Stf. Auma Grace  (Pri 0)
+  159   Nakato Sarah  (Pri 0)
+  999   A-SECRETCMD  (Pri undefined)
+
+DEVICE NAME PUSH: ALL CHECKS OK

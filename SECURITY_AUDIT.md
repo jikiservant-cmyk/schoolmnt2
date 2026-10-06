@@ -620,3 +620,66 @@ A new test, `security/multi-tenant-lab/money-reconcile.mjs`, runs 12 real-life p
 ## Go-live (Part 9)
 
 Run migrations **05 → 06 → 07 → 08** (back up first). 08 is safe to re-run.
+
+---
+
+# Part 10: Pushing student / teacher names to the device screen
+
+**Test:** `security/multi-tenant-lab/device-names-check.mjs`. It runs a simulated ZKTeco terminal that follows the official PUSH protocol strictly:
+
+- Command IDs may be at most 16 letters or digits.
+- Only the exact `DATA UPDATE USERINFO` / `DATA DELETE USERINFO` commands are accepted. Anything else gets `-1002`, as on real firmware.
+
+The terminal polls the real app, applies the commands to its own user list, and replies. The test covers:
+
+- the "push all" button
+- adding a student and adding a teacher
+- changing and removing a device ID
+- hostile names, `ë` and apostrophes, long names, a P.5 class
+- the "auto-assign IDs" button
+- acknowledgements
+- isolation from school B's device
+
+**Results** are in `device-names-results-*.txt`:
+
+| Run | Result |
+|---|---|
+| Before, strict device | **12 / 15 FAILED**: no name reached the screen and all commands stayed `sent` |
+| Before, lenient device (allows long IDs) | **12 / 15 FAILED**: every command was refused with `-1002` |
+| After | **17 / 17 OK**, the same with lenient IDs. The device list matches the school's people exactly |
+
+| # | Severity | Problem | Fix |
+|---|---|---|---|
+| N1 | Critical | The command ID was the 36-character queue UUID. The spec allows 16 letters or digits at most, so strict terminals ignored every command and no name was ever shown or acknowledged. | `lib/devices/commandId.ts` sends a stable number of at most 16 digits, derived from the UUID, so no migration is needed. `devicecmd` maps it back among this device's `sent` commands. UUID replies still work for commands sent before the deploy. 200,000 random IDs gave 0 collisions. |
+| N2 | High | `DATA UPDATE userinfo` was lowercase, in the adapter and in the auto-assign button. Firmware expects `USERINFO`. | Uppercase in both places. |
+| N3 | High | Changing a person's device ID left the old PIN on the terminal with their name (a "ghost" that a future person with that ID would inherit). Clearing the ID left the person on the terminal. | `enqueuePersonRemovalForSchool` queues `DATA DELETE USERINFO PIN=<old>` (before the new enrolment) for the school's ZKTeco devices. |
+| N4 | Medium | Students: the class was kept and the child's own name chopped to 8 letters ("Nalubega (Senior 2 East)"), and the text could go over the 24-character screen. A support staff member named "Stafford …" lost their "Stf." prefix. | The formatter shows "Name (Class)" if it fits, otherwise the full name. It is never over 24 characters and never splits an emoji. Prefix detection uses whole words. Control characters become spaces. |
+
+**Lab-only fix:** device-attack D9 used a fixed 15:00 punch, which is "in the future" before 15:00 EAT and was correctly dropped. It now uses a punch from 2 minutes ago.
+
+**Not changed (decisions for the school):**
+
+- Anyone with role `admin` is enrolled with `Pri=14`, which gives them the terminal's own admin menu.
+- A command that was `sent` but whose reply was lost is not re-sent automatically, because re-sending an old name could overwrite a newer one. Use **Devices → Push users** to re-sync a terminal.
+- Non-English letters (ë) are sent as UTF-8. Very old firmware may show them wrongly. Check once on the real device.
+
+**Battery after the fixes:**
+
+| Suite | Result |
+|---|---|
+| device | 0/15 |
+| attack | 1/42 (the known global-secret transition item) |
+| regress | OK |
+| rls | 0/32 |
+| flows | OK |
+| link-crawl | OK |
+| render | OK |
+| payments | 0/20 |
+| pay-rls | 0/8 |
+| round4 | 0/5 |
+| rogue | 0/21 |
+| reconcile | OK |
+| genuine NaJiki | credited 2000 |
+| tsc / eslint / build | clean |
+
+**Go-live:** no migration is needed for Part 10. After deploying, press **Devices → Push users to device** once per terminal, so every name is re-sent in the correct format.

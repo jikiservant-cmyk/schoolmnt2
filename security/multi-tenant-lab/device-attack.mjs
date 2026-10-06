@@ -97,8 +97,11 @@ const gen = (body) => ic('/api/devices/push', { sn: 'SNA0002' }, { method: 'POST
 }
 // D9 database failure is acknowledged as OK (device deletes its buffered punches)
 {
-  await q("ALTER TABLE school.attendance_logs ADD CONSTRAINT lab_fail CHECK (attendance_type <> 'check_out') NOT VALID");
-  const r = await ic('/iclock/cdata', { SN: 'SNA0001', table: 'ATTLOG', token: A_SECRET }, { method: 'POST', body: `102\t${today} 15:00:00\t1\t1\n` });
+  // Any write fails; the punch is from 2 minutes ago so it is valid at any time of day
+  // (a fixed 15:00 was "in the future" and dropped before the write in the morning).
+  await q("ALTER TABLE school.attendance_logs ADD CONSTRAINT lab_fail CHECK (false) NOT VALID");
+  const recent = new Date(Date.now() + 3 * 3600e3 - 120e3).toISOString().slice(0, 19).replace('T', ' ');
+  const r = await ic('/iclock/cdata', { SN: 'SNA0001', table: 'ATTLOG', token: A_SECRET }, { method: 'POST', body: `102\t${recent}\t1\t1\n` });
   await q("ALTER TABLE school.attendance_logs DROP CONSTRAINT lab_fail");
   rec('D9 failed DB write still answered "OK" (punches lost forever)', r.status === 200, r.status + ' ' + (await r.text()).slice(0, 40));
 }

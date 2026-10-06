@@ -4,51 +4,51 @@ interface PersonInfo {
   classes?: { name?: string | null } | null;
 }
 
+const MAX_SCREEN_CHARS = 24; // typical ZKTeco name field / LCD width
+
+/** Remove ADMS control characters (tab, CR, LF, NUL, '=') and tidy spaces. */
+function clean(value: string): string {
+  return value.replace(/[\t\r\n\0=]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/** Cut to n characters without splitting an emoji / surrogate pair. */
+function cut(value: string, n: number): string {
+  const chars = Array.from(value);
+  return chars.length <= n ? value : chars.slice(0, n).join('').trim();
+}
+
+const len = (value: string) => Array.from(value).length;
+
 /**
  * Format person display name for ZKTeco Biometric LCD screens (limited character length)
  * Example: "John Doe (P4)" or "Tr. Jane Smith"
  */
 export function formatZKTecoDisplayName(person: PersonInfo): string {
-  if (!person || !person.full_name) {
+  if (!person || !person.full_name || !clean(person.full_name)) {
     return 'User';
   }
 
-  const rawName = person.full_name.trim();
+  const rawName = clean(person.full_name);
   const role = (person.role || 'student').toLowerCase();
-  const className = person.classes?.name?.trim();
+  const className = person.classes?.name ? clean(person.classes.name) : '';
 
-  let formatted = rawName;
-
-  if (role === 'teacher') {
-    if (!formatted.toLowerCase().startsWith('tr.') && !formatted.toLowerCase().startsWith('teacher')) {
-      formatted = `Tr. ${formatted}`;
-    }
-  } else if (role === 'support_staff') {
-    if (!formatted.toLowerCase().startsWith('stf.') && !formatted.toLowerCase().startsWith('staff')) {
-      formatted = `Stf. ${formatted}`;
-    }
-  } else if (role === 'admin') {
-    if (!formatted.toLowerCase().startsWith('adm.') && !formatted.toLowerCase().startsWith('admin')) {
-      formatted = `Adm. ${formatted}`;
-    }
-  } else if (role === 'student' && className) {
-    formatted = `${formatted} (${className})`;
+  // Staff get a short role prefix, unless the name already carries it as a word
+  // ("Tr. Jane", "Teacher Jane"), not merely as letters ("Stafford" is a name).
+  const prefixes: Record<string, [string, RegExp]> = {
+    teacher: ['Tr. ', /^(tr\.|teacher\b)/i],
+    support_staff: ['Stf. ', /^(stf\.|staff\b)/i],
+    admin: ['Adm. ', /^(adm\.|admin\b)/i],
+  };
+  const prefix = prefixes[role];
+  if (prefix) {
+    return cut(prefix[1].test(rawName) ? rawName : prefix[0] + rawName, MAX_SCREEN_CHARS);
   }
 
-  // ZKTeco terminals usually have a 24-character display limit for names
-  if (formatted.length > 24) {
-    // If it has class at the end, keep the class
-    if (className && formatted.endsWith(`(${className})`)) {
-      const suffix = ` (${className})`;
-      const maxNameLen = Math.max(8, 24 - suffix.length);
-      formatted = `${rawName.substring(0, maxNameLen).trim()}${suffix}`;
-    } else {
-      formatted = formatted.substring(0, 24).trim();
-    }
+  // Students: "Name (Class)" when it fits. Otherwise the child's name wins:
+  // the full name without the class, never a chopped name to make room for it.
+  if (role === 'student' && className) {
+    const withClass = `${rawName} (${className})`;
+    if (len(withClass) <= MAX_SCREEN_CHARS) return withClass;
   }
-
-  // Sanitize out ADMS command control characters
-  formatted = formatted.replace(/[\t\r\n=]/g, '');
-
-  return formatted;
+  return cut(rawName, MAX_SCREEN_CHARS);
 }

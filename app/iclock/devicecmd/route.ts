@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { authenticateDeviceRequest, readDeviceBody, payloadTooLarge } from '@/lib/devices/gateway';
 import { isUuid } from '@/lib/tenant';
+import { deviceCommandId, isDeviceCommandId } from '@/lib/devices/commandId';
 
 export const dynamic = 'force-dynamic';
 
@@ -20,10 +21,34 @@ export async function POST(req: NextRequest) {
   if (rawBody === null) return payloadTooLarge();
 
   const lines = rawBody.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, 500);
+
+  // Terminals echo the short id from getrequest (deviceCommandId). Map it back
+  // to the queue row among this device's commands that are awaiting a reply.
+  // (Full UUIDs are still accepted for commands sent before this change.)
+  let shortIdMap: Map<string, string> | null = null;
+  const resolveId = async (echoed: string | null): Promise<string | null> => {
+    if (!echoed) return null;
+    if (isUuid(echoed)) return echoed;
+    if (!isDeviceCommandId(echoed)) return null;
+    if (!shortIdMap) {
+      shortIdMap = new Map();
+      const { data: awaiting } = await supabase
+        .from('device_commands')
+        .select('id')
+        .eq('school_id', device.school_id)
+        .in('target_serial', [serial, 'ALL'])
+        .eq('status', 'sent')
+        .order('sent_at', { ascending: false })
+        .limit(1000);
+      for (const row of awaiting || []) shortIdMap.set(deviceCommandId(String(row.id)), String(row.id));
+    }
+    return shortIdMap.get(echoed) ?? null;
+  };
+
   for (const line of lines) {
     const params = new URLSearchParams(line);
-    const cmdId = params.get('ID');
-    if (!cmdId || !isUuid(cmdId)) continue;
+    const cmdId = await resolveId(params.get('ID'));
+    if (!cmdId) continue;
     const returnCode = (params.get('Return') || '').slice(0, 16);
     const ok = returnCode === '0';
     const update: Record<string, unknown> = {

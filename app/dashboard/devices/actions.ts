@@ -552,7 +552,7 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
       });
 
       const pri = p.role === 'admin' ? 14 : 0;
-      const cmd = `DATA UPDATE userinfo PIN=${assignedPin}\tName=${displayName}\tPri=${pri}`;
+      const cmd = `DATA UPDATE USERINFO PIN=${assignedPin}\tName=${displayName}\tPri=${pri}`;
       if (validation.device) {
         await enqueueDeviceCommand(cmd, validation.device.serial_number, { schoolId });
       } else {

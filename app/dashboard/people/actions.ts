@@ -485,7 +485,7 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
     }
     const { data: person, error: pErr } = await adminClient
       .from('people')
-      .select('id, full_name, role, school_id, class_id, classes:class_id(name)')
+      .select('id, full_name, role, school_id, class_id, device_user_id, classes:class_id(name)')
       .eq('id', personId)
       .eq('school_id', schoolId)
       .single();
@@ -521,6 +521,18 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
     if (updateErr) {
       console.error('Error updating device_user_id:', updateErr);
       return { error: updateErr.message || 'Failed to update biometric UID.' };
+    }
+
+    // 4a. The old device ID is no longer this person's: take it off the
+    //     terminals (queued before the new one, so the order is delete -> add).
+    const oldUid = typeof person.device_user_id === 'string' ? person.device_user_id.trim() : '';
+    if (oldUid && oldUid !== cleanUid) {
+      try {
+        const { enqueuePersonRemovalForSchool } = await import('@/utils/zkteco/commandQueue');
+        await enqueuePersonRemovalForSchool(oldUid, schoolId);
+      } catch (cmdErr) {
+        console.warn('Non-blocking: Failed to enqueue removal of old device ID:', cmdErr);
+      }
     }
 
     // 4. Sync into school.person_credentials table if cleanUid is present
