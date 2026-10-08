@@ -763,3 +763,62 @@ All requested existing suites were rerun with migration 09 enabled. Payments, SM
 | `next build` | Passed |
 
 **Go-live:** run migrations **05 → 06 → 07 → 08 → 09** (back up first; run 09 outside gate hours).
+
+---
+
+# Part 12: Exports, PWA cache and the legacy device proxy
+
+A fresh pass over the surfaces the earlier rounds did not cover: the attendance
+export builders, `public/sw.js`, and the `app/legacy-adms-proxy` bridge that
+ships to schools. Test harness: `security/pentest/round12-check.mjs`
+(`node --experimental-strip-types security/pentest/round12-check.mjs`), results
+in `security/pentest/round12-results.txt`.
+
+## Findings (all fixed)
+
+| # | Severity | Issue | Fix |
+|---|---|---|---|
+| E1 | Medium | **CSV / formula injection (CWE-1236).** Both attendance exports built cells as `"${value}"` with only quote-doubling. Student names, guardian phones, class names and device UIDs are values the app does not fully control, and a cell beginning `=`, `+`, `-` or `@` is executed as a formula when the file is opened in Excel, LibreOffice or Sheets. `+2567…` phone numbers were mangled and `=HYPERLINK(...)`/DDE payloads ran. | New `lib/security/csv.ts` (`csvCell`/`csvRow`/`csvDocument`/`csvDataUri`): every cell is quoted per RFC 4180, CR/LF/NUL are stripped so a value cannot open a new record, and a leading `= + - @` is prefixed with `'` so spreadsheets store text instead of evaluating it. Both export paths now go through it. |
+| E2 | Medium | **The service worker cached authenticated HTML, including `/dashboard`.** `public/sw.js` precached `/dashboard`, wrote every successful HTML navigation into Cache Storage, and served it from `caches.match()` when the network failed. Cache Storage ignores the `Cache-Control: no-store` the app sets, so on a shared device (school office PC, gate kiosk) the previous user's server-rendered student data survived logout and could be read offline. Nothing purged the cache on logout. | Only public static assets are cached now; HTML navigations are network-only and never written to a cache; the offline fallback is a data-free shell instead of `/dashboard`; every cache is purged whenever a navigation to `/login` or `/signup` is seen (which includes the redirect after logout), and a `PURGE_CACHES` message handler is available for an explicit hook. `CACHE_NAME` moved to `smartskoolz-static-v3` so devices holding the old cache drop it on activation. |
+| E3 | Medium | **`app/legacy-adms-proxy/server.js` was an open relay.** It forwarded *every* method and *every* path to a hardcoded `*.run.app` host, copying all client headers upstream and all upstream headers back, with no body limit and no timeout. Anything else on the school LAN (guest laptop, student phone) could use the school's connection to reach the app, bypassing the per-IP device rate limits, or buffer unbounded bodies; `Connection`/`Transfer-Encoding` were passed through. | Only `GET`/`POST`/`HEAD` on `/iclock/…` are forwarded (else `404`/`405`); bodies are capped at 1 MB on both the declared and streamed path; request headers are allowlisted (no cookies, no `X-Forwarded-*`, no hop-by-hop) and so are response headers (no `Set-Cookie`, no internals); the target comes from `ADMS_TARGET_URL` and must be HTTPS unless it is loopback for the test harness; upstream requests time out with `504`. |
+
+## What was checked and held
+
+The rest of the launch surface was re-read this round and behaved: `lib/auth-guard.ts`
+and `lib/tenant.ts` (fail-closed, every foreign id proven owned), all nine
+`actions.ts` files call `requireSchoolAdmin`/`checkSchoolAdmin` except the two
+intentionally public ones (login, signup), no mass assignment anywhere
+(`...baseRecord` in devices is a fixed shape, not request input), no
+`dangerouslySetInnerHTML`/`eval`/`new Function`/`child_process`/`fs` use in app
+code, the single outbound `fetch` in `attendance/actions.ts` is built from
+environment variables and cannot be pointed at an arbitrary host, the NaJiki
+webhook verifies a timestamped HMAC with `timingSafeEqual` and fails closed
+without migration 05, migrations pin `search_path` on every `SECURITY DEFINER`
+function, and RLS uses restrictive `tenant_guard` policies rather than trusting
+`user_metadata`. The teacher-PIN lockout, kiosk scoping, guardian school checks
+and SMS dedupe keys are all as documented in Parts 1–11.
+
+## Results
+
+`security/pentest/round12-check.mjs` — **24/24 checks pass, 0 vulnerable**:
+
+| Area | Checks | Result |
+|---|---|---|
+| CSV cells (payload table, quoting, CR/LF, nulls, record integrity) | 6 | 6/6; before/after payloads recorded in `round12-results.txt` |
+| ADMS proxy (allowed path, Host rewrite, header allowlists both ways, blocked paths/methods, 2 MB body, upstream error, http:// refusal) | 13 | 13/13 |
+| Service worker (no `/dashboard` precache, no cached-HTML fallback, purge on `/login`, cache version bump, GET-only) | 5 | 5/5 (static assertions — executing the worker needs a browser) |
+
+Regression battery for this round: `tsc --noEmit` passed, `eslint` passed with
+0 errors, `next build` passed (all 18 routes). The multi-tenant, payment, device
+and auth labs were not re-run: none of these three fixes touches tenancy,
+money, device authentication or the session layer.
+
+## Go-live
+
+- No migration and no environment change is required for E1 or E2.
+- For E3: if a school's proxy was pointed at a hardcoded host, set
+  `ADMS_TARGET_URL` explicitly and restart the proxy; the default in
+  `server.js` still points at the old `ais-dev-…` hostname, so a *production*
+  deployment should set it to the live app URL.
+- Devices already in the field keep working: `/iclock/…` is exactly the path
+  set the terminals use.
