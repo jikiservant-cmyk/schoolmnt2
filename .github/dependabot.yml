@@ -1,0 +1,51 @@
+version: 2
+updates:
+  # Application dependencies (next, react, supabase, sharp, xlsx, ...).
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "Africa/Kampala"
+    open-pull-requests-limit: 5
+    versioning-strategy: increase
+    labels:
+      - dependencies
+    commit-message:
+      prefix: deps
+      prefix-development: deps-dev
+      include: scope
+    groups:
+      # Routine minor/patch bumps land as one PR. Security updates are left
+      # ungrouped so each advisory gets its own reviewable PR.
+      npm-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # xlsx is used for report/spreadsheet export. The npm-published line is
+      # stuck at 0.18.5 and every published version is affected by
+      # GHSA-4r6h-8v6p-xvw6 (prototype pollution) and
+      # GHSA-5pgg-2g8v-p4x9 (ReDoS); the fixed builds are only distributed from
+      # the SheetJS CDN, not npm. Pin it until the export code is moved to a
+      # maintained library, so Dependabot does not open unmergeable PRs.
+      - dependency-name: xlsx
+
+  # Workflow actions. These are pinned by full commit SHA in the workflow
+  # files; this entry keeps those pins moving.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "Africa/Kampala"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci
+      include: scope

@@ -1,0 +1,12 @@
+# Point security reports at the private channel instead of the public tracker.
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/jikiservant-cmyk/schoolmnt2/security/advisories/new
+    about: Please do not open a public issue for security bugs. Use GitHub private vulnerability reporting, as described in SECURITY.md.
+  - name: Read the security policy first
+    url: https://github.com/jikiservant-cmyk/schoolmnt2/blob/main/SECURITY.md
+    about: Scope, out-of-scope known issues, testing rules and response times.
+  - name: Existing audit history
+    url: https://github.com/jikiservant-cmyk/schoolmnt2/blob/main/SECURITY_AUDIT.md
+    about: Eleven audit rounds with before/after results. Check here before reporting.
