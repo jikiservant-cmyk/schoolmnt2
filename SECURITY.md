@@ -81,9 +81,10 @@ Out of scope / already known:
 
 ## Before you report, check the existing work
 
-`SECURITY_AUDIT.md` records eleven rounds of audits and pentests (auth, tenant
-isolation, RLS, devices, payments, SMS, reconciliation, launch checks), each
-with before/after results, and the reproduction scripts live in `security/`.
+`SECURITY_AUDIT.md` records twelve rounds of audits and pentests (auth, tenant
+isolation, RLS, devices, payments, SMS, reconciliation, launch checks, exports,
+PWA cache and the legacy device proxy), each with before/after results, and the
+reproduction scripts live in `security/`.
 If a finding is already listed there as fixed, please say which part you read
 and why you think the fix does not hold — regressions are exactly what we want
 to hear about.

@@ -2,6 +2,7 @@
 
 import React, { useState, useMemo } from 'react';
 import * as XLSX from 'xlsx';
+import { csvDataUri } from '@/lib/security/csv';
 import { 
   FileText, 
   Download, 
@@ -402,19 +403,20 @@ export default function AttendanceReports({
         return;
       }
       const headers = ['Roll Number', 'Student Name', 'Admission / Device UID', 'Class', 'Arrival Time', 'Status', 'Channel', 'Parent Phone'];
+      // csvDataUri quotes every cell (RFC 4180), strips CR/LF and neutralises a
+      // leading = + - @ so a student/guardian name cannot become a formula.
       const rows = classDailyRoster.map(r => [
         r.rollNumber,
-        `"${r.fullName.replace(/"/g, '""')}"`,
-        `"${r.deviceUserId}"`,
-        `"${r.className}"`,
-        `"${r.checkInTime}"`,
-        `"${r.status.toUpperCase()}"`,
-        `"${r.checkInType}"`,
-        `"${r.phone}"`
-      ].join(','));
+        r.fullName,
+        r.deviceUserId,
+        r.className,
+        r.checkInTime,
+        r.status.toUpperCase(),
+        r.checkInType,
+        r.phone
+      ]);
 
-      const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows].join('\n');
-      const encodedUri = encodeURI(csvContent);
+      const encodedUri = csvDataUri(headers, rows);
       const link = document.createElement('a');
       link.setAttribute('href', encodedUri);
       link.setAttribute('download', `Class_Register_${classMap.get(selectedClassId) || 'Class'}_${selectedDayDate}.csv`);
@@ -437,20 +439,11 @@ export default function AttendanceReports({
         const type = (log.attendance_type || 'check_in').replace(/_/g, ' ');
         const uid = log.people?.device_user_id || 'N/A';
 
-        return [
-          `"${dateStr}"`,
-          `"${timeStr}"`,
-          `"${name.replace(/"/g, '""')}"`,
-          `"${role}"`,
-          `"${className}"`,
-          `"${status.toUpperCase()}"`,
-          `"${type}"`,
-          `"${uid}"`
-        ].join(',');
+        return [dateStr, timeStr, name, role, className, status.toUpperCase(), type, uid];
       });
 
-      const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows].join('\n');
-      const encodedUri = encodeURI(csvContent);
+      // Same hardening as the class register export above.
+      const encodedUri = csvDataUri(headers, rows);
       const link = document.createElement('a');
       link.setAttribute('href', encodedUri);
       link.setAttribute('download', `Attendance_Report_${targetLabel.replace(/[^a-zA-Z0-9]/g, '_')}_${datePreset}.csv`);
