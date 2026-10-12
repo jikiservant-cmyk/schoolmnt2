@@ -8,12 +8,10 @@ export class SupremaBiostarAdapter implements DeviceAdapter {
   readonly defaultEndpoint = '/api/devices/push';
 
   buildAuthCheck(req: Request, device: DeviceRecord): boolean {
-    const url = new URL(req.url);
-    const providedToken = 
+    const providedToken =
       req.headers.get('bs-session-id') ||
       req.headers.get('x-device-token') ||
-      req.headers.get('authorization')?.replace(/^Bearer\s+/i, '') ||
-      url.searchParams.get('token');
+      req.headers.get('authorization')?.replace(/^Bearer\s+/i, '');
 
     return isAuthorizedDevice(providedToken, device);
   }

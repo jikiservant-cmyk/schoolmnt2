@@ -48,8 +48,8 @@ const line = (pin, epochMs, type = 'check_in') =>
 
 async function upload(lines) {
   const response = await fetch(
-    `${BASE}/iclock/cdata?${new URLSearchParams({ SN: 'SNA0001', table: 'ATTLOG', token: DEVICE_SECRET })}`,
-    { method: 'POST', headers: { 'content-type': 'text/plain' }, body: `${lines.join('\n')}\n` },
+    `${BASE}/iclock/cdata?${new URLSearchParams({ SN: 'SNA0001', table: 'ATTLOG' })}`,
+    { method: 'POST', headers: { 'content-type': 'text/plain', 'x-device-token': DEVICE_SECRET }, body: `${lines.join('\n')}\n` },
   );
   const body = await response.text();
   return { status: response.status, body };

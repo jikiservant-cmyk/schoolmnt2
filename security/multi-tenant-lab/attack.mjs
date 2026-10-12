@@ -157,14 +157,22 @@ for (const term of ['x,school_id.neq.null', 'B-SECRETNAME', '*)', 'a%']) {
   }
 }
 // 19. Device protocol (iclock) - per-device secret enforcement
-const ic = (path, qs, body) => fetch(BASE + path + '?' + new URLSearchParams(qs), body ? { method: 'POST', body } : {});
+const ic = (path, qs, body) => {
+  const params = new URLSearchParams(qs);
+  const token = params.get('token');
+  params.delete('token');
+  return fetch(BASE + path + '?' + params, {
+    ...(body ? { method: 'POST', body } : {}),
+    headers: token ? { 'x-device-token': token } : undefined,
+  });
+};
 {
   const r = await ic('/iclock/cdata', { SN: 'SNB0001', token: SECRETS.A });
   rec('iclock: B serial accepted with A\'s per-device secret', r.status === 200, r.status);
   const r2 = await ic('/iclock/cdata', { SN: 'SNA0001', token: SECRETS.A });
   rec('iclock (baseline): A serial + A secret is accepted', r2.status !== 200, r2.status);
   const r3 = await ic('/iclock/cdata', { SN: 'SNB0001', token: 'GLOBAL-shared-secret-123456' });
-  rec('iclock: B device accepted with GLOBAL shared secret (transition mode allows; strict mode must not)', r3.status === 200, r3.status + ' (expected 200 while ZKTECO_GLOBAL_SECRET_FALLBACK unset)');
+  rec('iclock: B device accepted with GLOBAL shared secret', r3.status === 200, r3.status + ' (must be rejected unless explicit legacy fallback is enabled)');
 }
 // 20. ATTLOG injection: B's person id punched on B's device using A's secret
 {

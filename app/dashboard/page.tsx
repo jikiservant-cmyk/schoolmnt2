@@ -1,6 +1,7 @@
 import { createClient } from '@/utils/supabase/server';
 import DashboardClient from './DashboardClient';
 import { getEATDayRange, getEATDateKey, formatEATDate } from '@/lib/eat-time';
+import { toPublicDeviceMetadata } from '@/lib/devices/metadata';
 
 export default async function DashboardPage() {
   const supabase = await createClient();
@@ -151,7 +152,10 @@ export default async function DashboardPage() {
     studentCount = students || 0;
     teacherCount = teachers || 0;
     classCount = classesData?.length || 0;
-    devicesList = devicesData || [];
+    // Legacy firmware metadata could contain a plaintext device secret. The
+    // dashboard is a client component, so explicitly strip it before props are
+    // serialized into the Flight response.
+    devicesList = (devicesData || []).map((device) => toPublicDeviceMetadata(device));
     todayLogs = todayLogsData || [];
     recentMessages = messagesData || [];
 

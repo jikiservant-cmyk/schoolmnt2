@@ -5,7 +5,7 @@ import { createPublicAdminClient } from '@/utils/supabase/admin';
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
 import { consumeRateLimit } from '@/lib/security/rate-limit';
-import { constantDelay, getClientIp, getFormString, normalizeEmail } from '@/lib/security/request';
+import { constantDelay, getClientIp, getFormString, normalizeEmail, requireSameOrigin } from '@/lib/security/request';
 
 const SIGNUP_IP_LIMIT = 5;
 const SIGNUP_IP_WINDOW_MS = 60 * 60 * 1000;
@@ -26,6 +26,13 @@ function validatePassword(password: string): string | null {
 
 export async function signupAction(formData: FormData) {
   const startedAt = Date.now();
+
+  try {
+    await requireSameOrigin();
+  } catch {
+    await constantDelay(startedAt);
+    return { error: 'Request could not be accepted.' };
+  }
 
   const email = normalizeEmail(getFormString(formData, 'email', 254));
   const password = getFormString(formData, 'password', 256);
@@ -102,8 +109,12 @@ export async function signupAction(formData: FormData) {
       console.error('[signup] profile lookup failed:', existingErr.message);
       return { error: 'Unable to complete registration. Please contact support.' };
     }
-    if (existingProfile && existingProfile.app_type && existingProfile.app_type !== 'school') {
-      return { error: 'Unable to complete registration. Please contact support.' };
+    // A profile for a supposedly new identity means an earlier request already
+    // reached the provisioning phase. Never call the non-idempotent onboarding
+    // RPC a second time: duplicate requests must not mint a second school.
+    if (existingProfile) {
+      await constantDelay(startedAt);
+      return { info: NEUTRAL_SIGNUP_MESSAGE };
     }
 
     const { error: adminProfileError } = await publicAdminClient

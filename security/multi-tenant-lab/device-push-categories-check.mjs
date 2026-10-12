@@ -51,8 +51,10 @@ const same = (a, b) => JSON.stringify([...a].sort()) === JSON.stringify([...b].s
 class Terminal {
   constructor(sn) { this.sn = sn; this.users = new Map(); this.rejected = []; }
   async poll() {
-    const qs = new URLSearchParams({ SN: this.sn, token: SECRETS[this.sn] });
-    const body = await (await fetch(`${BASE}/iclock/getrequest?${qs}`)).text();
+    const qs = new URLSearchParams({ SN: this.sn });
+    const body = await (await fetch(`${BASE}/iclock/getrequest?${qs}`, {
+      headers: { 'x-device-token': SECRETS[this.sn] },
+    })).text();
     if (body.trim() === 'OK') return 0;
     const replies = []; let n = 0;
     for (const line of body.split('\n')) {
@@ -65,7 +67,11 @@ class Terminal {
       if (d[1].toUpperCase() === 'UPDATE') this.users.set(f.PIN, { name: f.Name, pri: f.Pri }); else this.users.delete(f.PIN);
       replies.push(`ID=${id}&Return=0&CMD=DATA`);
     }
-    if (replies.length) await fetch(`${BASE}/iclock/devicecmd?${qs}`, { method: 'POST', body: replies.join('\n') + '\n' });
+    if (replies.length) await fetch(`${BASE}/iclock/devicecmd?${qs}`, {
+      method: 'POST',
+      headers: { 'x-device-token': SECRETS[this.sn] },
+      body: replies.join('\n') + '\n',
+    });
     return n;
   }
   async drain() { for (let i = 0; i < 20; i++) if (!(await this.poll())) break; }

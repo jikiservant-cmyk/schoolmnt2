@@ -8,13 +8,11 @@ export class GenericWebhookAdapter implements DeviceAdapter {
   readonly defaultEndpoint = '/api/devices/push';
 
   buildAuthCheck(req: Request, device: DeviceRecord): boolean {
-    const url = new URL(req.url);
-    const providedToken = 
+    // Query strings are routinely logged; bearer credentials belong in headers.
+    const providedToken =
       req.headers.get('x-device-token') ||
       req.headers.get('x-api-key') ||
-      req.headers.get('authorization')?.replace(/^Bearer\s+/i, '') ||
-      url.searchParams.get('token') ||
-      url.searchParams.get('api_key');
+      req.headers.get('authorization')?.replace(/^Bearer\s+/i, '');
 
     return isAuthorizedDevice(providedToken, device);
   }

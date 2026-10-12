@@ -19,7 +19,9 @@ export function generateDeviceSecret(): string {
 }
 
 /**
- * Packs device metadata into a string if columns are not yet present in Supabase table.
+ * Packs non-secret device metadata into a string for databases that predate
+ * first-class device metadata columns. Authentication material must never be
+ * packed here: firmware_version is routinely selected for dashboard rendering.
  */
 export function packDeviceMetadata(
   baseFirmware: string | null,
@@ -33,14 +35,85 @@ export function packDeviceMetadata(
   const payload = JSON.stringify({
     type: metadata.type || 'zkteco_adms',
     statusCodeMap: metadata.statusCodeMap,
-    config: metadata.config
+    config: metadata.config,
   });
   return `${base}|META:${payload}`;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Only these terminal settings are meaningful to dashboard rendering. Device
+ * config is otherwise an arbitrary JSON column, so copying it wholesale would
+ * recreate the same browser leak if a legacy integrator stored an API key,
+ * password, or vendor token in it.
+ */
+export function toPublicDeviceConfig(value: unknown): DeviceConfig {
+  const config = isPlainObject(value) ? value : {};
+  const safe: DeviceConfig = {};
+  const hour = config.lateCutoffHour;
+  const minute = config.lateCutoffMinute;
+  const timeZone = config.timeZone;
+
+  if (typeof hour === 'number' && Number.isInteger(hour) && hour >= 0 && hour <= 23) {
+    safe.lateCutoffHour = hour;
+  }
+  if (typeof minute === 'number' && Number.isInteger(minute) && minute >= 0 && minute <= 59) {
+    safe.lateCutoffMinute = minute;
+  }
+  if (typeof timeZone === 'string' && timeZone.length <= 64) {
+    try {
+      Intl.DateTimeFormat(undefined, { timeZone });
+      safe.timeZone = timeZone;
+    } catch {
+      // Ignore invalid IANA zone names.
+    }
+  }
+  if (typeof config.autoApproveCheckOut === 'boolean') {
+    safe.autoApproveCheckOut = config.autoApproveCheckOut;
+  }
+  return safe;
+}
+
+/**
+ * Legacy installs sometimes packed a plaintext `secret` in firmware_version.
+ * Keep reading it on the server until the device is rotated, but make it
+ * impossible for that historic secret (or arbitrary legacy metadata) to reach
+ * a React Server Component prop or browser response.
+ */
+export function sanitizeFirmwareMetadataForClient(value: unknown): string | null {
+  if (typeof value !== 'string') return value == null ? null : String(value);
+  if (!value.includes('|META:')) return value;
+
+  const base = value.split('|META:')[0].trim();
+  try {
+    const raw = value.slice(value.indexOf('|META:') + '|META:'.length);
+    const parsed: unknown = JSON.parse(raw);
+    if (!isPlainObject(parsed)) return base || null;
+
+    const type = typeof parsed.type === 'string' ? parsed.type as DeviceType : undefined;
+    const statusCodeMap = isPlainObject(parsed.statusCodeMap)
+      ? toPublicStatusCodeMap(parsed.statusCodeMap)
+      : undefined;
+    const config = isPlainObject(parsed.config) ? toPublicDeviceConfig(parsed.config) : undefined;
+
+    // Preserve only the known, non-sensitive compatibility fields.
+    if (!type && !statusCodeMap && !config) return base || null;
+    return packDeviceMetadata(base || null, { type, statusCodeMap, config });
+  } catch {
+    // A malformed packed payload can contain a secret too; show the firmware
+    // prefix only rather than reflecting untrusted opaque data to the browser.
+    return base || null;
+  }
 }
 
 /**
  * Resolves a raw database record into a fully-typed DeviceRecord,
  * gracefully supporting both first-class table columns AND packed metadata.
+ * This function is server-only whenever legacy plaintext authentication data
+ * may exist. Use toPublicDeviceMetadata() for values passed to clients.
  */
 export function parseDeviceMetadata(device: any): DeviceRecord {
   if (!device) {
@@ -78,8 +151,8 @@ export function parseDeviceMetadata(device: any): DeviceRecord {
   }
   if (device.status_code_map) {
     try {
-      statusCodeMap = typeof device.status_code_map === 'string' 
-        ? JSON.parse(device.status_code_map) 
+      statusCodeMap = typeof device.status_code_map === 'string'
+        ? JSON.parse(device.status_code_map)
         : device.status_code_map;
     } catch {
       // Keep default
@@ -87,8 +160,8 @@ export function parseDeviceMetadata(device: any): DeviceRecord {
   }
   if (device.config) {
     try {
-      const parsedCfg = typeof device.config === 'string' 
-        ? JSON.parse(device.config) 
+      const parsedCfg = typeof device.config === 'string'
+        ? JSON.parse(device.config)
         : device.config;
       config = { ...config, ...parsedCfg };
     } catch {
@@ -96,14 +169,16 @@ export function parseDeviceMetadata(device: any): DeviceRecord {
     }
   }
 
-  // 2. Packed metadata fallback in firmware_version or label
+  // 2. Packed metadata fallback in firmware_version. `secret` is supported
+  // only to authenticate and rotate old devices; it is stripped before any
+  // client serialization by toPublicDeviceMetadata().
   const fw = String(device.firmware_version || '');
   if (fw.includes('|META:')) {
     try {
-      const jsonStr = fw.split('|META:')[1];
+      const jsonStr = fw.slice(fw.indexOf('|META:') + '|META:'.length);
       const parsed = JSON.parse(jsonStr);
       if (parsed.type) deviceType = parsed.type;
-      if (parsed.secret) deviceSecret = parsed.secret;
+      if (typeof parsed.secret === 'string' && parsed.secret.trim()) deviceSecret = parsed.secret;
       if (parsed.statusCodeMap) statusCodeMap = { ...statusCodeMap, ...parsed.statusCodeMap };
       if (parsed.config) config = { ...config, ...parsed.config };
     } catch {
@@ -135,55 +210,50 @@ export function parseDeviceMetadata(device: any): DeviceRecord {
       lateCutoffMinute: config.lateCutoffMinute ?? 0,
       timeZone: config.timeZone || 'Africa/Kampala',
       ...config,
-    }
+    },
   };
 }
 
-/**
- * Checks if a provided token matches the device's per-device secret hash,
- * the legacy cleartext secret, or the legacy global environment secret.
- */
-export function isAuthorizedToken(
-  providedToken: string | null,
-  deviceSecretOrHash: string | null,
-  globalSecret: string | undefined = process.env.ZKTECO_DEVICE_SECRET
-): boolean {
-  if (!providedToken || !providedToken.trim()) {
-    return false; // Fail-closed: Never permit anonymous device pushes
-  }
+export type PublicDeviceRecord = Omit<DeviceRecord, 'device_secret' | 'device_secret_hash'>;
 
-  const cleanProvided = providedToken.trim();
-  const target = deviceSecretOrHash?.trim() || globalSecret?.trim();
-
-  if (!target) {
-    return false; // Fail-closed if no secret configured on server
-  }
-
-  // 1. Check if stored target is a SHA-256 hash (64 hex characters)
-  if (/^[0-9a-fA-F]{64}$/.test(target)) {
-    const computedHash = hashDeviceSecret(cleanProvided);
-    try {
-      return crypto.timingSafeEqual(
-        Buffer.from(computedHash, 'utf8'),
-        Buffer.from(target.toLowerCase(), 'utf8')
-      );
-    } catch {
-      return computedHash.toLowerCase() === target.toLowerCase();
+function toPublicStatusCodeMap(value: unknown): Record<string, 'check_in' | 'check_out'> {
+  if (!isPlainObject(value)) return {};
+  const safe: Record<string, 'check_in' | 'check_out'> = {};
+  for (const [key, mapped] of Object.entries(value)) {
+    // This is displayed/configured as an attendance map, not a metadata bag.
+    if (Object.keys(safe).length >= 32) break;
+    if (/^[A-Za-z0-9_-]{1,24}$/.test(key) && (mapped === 'check_in' || mapped === 'check_out')) {
+      safe[key] = mapped;
     }
   }
+  return safe;
+}
 
-  // 2. Direct timing-safe comparison for unhashed legacy secret
-  try {
-    // Pad or truncate to ensure equal length for timingSafeEqual if needed, 
-    // but easiest is to check length first to prevent Buffer throw.
-    if (cleanProvided.length !== target.length) return false;
-    return crypto.timingSafeEqual(
-      Buffer.from(cleanProvided, 'utf8'),
-      Buffer.from(target, 'utf8')
-    );
-  } catch {
-    return cleanProvided === target;
-  }
+/**
+ * Return a deliberately constructed device DTO safe for a Client Component.
+ * Do not spread the database row here: columns added by vendor integrations
+ * commonly contain API passwords/tokens and should default to server-only.
+ */
+export function toPublicDeviceMetadata(device: unknown): PublicDeviceRecord {
+  const parsed = parseDeviceMetadata(device);
+  return {
+    id: parsed.id,
+    school_id: parsed.school_id,
+    serial_number: parsed.serial_number,
+    label: parsed.label,
+    ip_address: parsed.ip_address,
+    firmware_version: sanitizeFirmwareMetadataForClient(parsed.firmware_version),
+    is_active: parsed.is_active,
+    last_seen_at: parsed.last_seen_at,
+    created_at: parsed.created_at ?? null,
+    device_type: parsed.device_type,
+    location_label: parsed.location_label ?? null,
+    status_code_map: toPublicStatusCodeMap(parsed.status_code_map),
+    config: toPublicDeviceConfig(parsed.config),
+    schools: parsed.schools && typeof parsed.schools === 'object'
+      ? { id: parsed.schools.id, name: parsed.schools.name }
+      : null,
+  };
 }
 
 function matchesSecret(provided: string, stored: string): boolean {
@@ -194,58 +264,68 @@ function matchesSecret(provided: string, stored: string): boolean {
     const expected = Buffer.from(target.toLowerCase(), 'utf8');
     return computed.length === expected.length && crypto.timingSafeEqual(computed, expected);
   }
+
+  // Hash both legacy plaintext values to fixed 32-byte buffers before comparing.
   const a = crypto.createHash('sha256').update(provided).digest();
   const b = crypto.createHash('sha256').update(target).digest();
   return crypto.timingSafeEqual(a, b);
 }
 
 /**
+ * Compatibility helper for callers that only have one per-device value. A
+ * shared global secret is deliberately disabled by default; it is a migration
+ * aid, not an authentication mode for normal operation.
+ */
+export function isAuthorizedToken(
+  providedToken: string | null,
+  deviceSecretOrHash: string | null,
+  globalSecret: string | undefined = process.env.ZKTECO_DEVICE_SECRET,
+): boolean {
+  if (!providedToken || !providedToken.trim()) return false;
+  const provided = providedToken.trim();
+  if (deviceSecretOrHash?.trim()) return matchesSecret(provided, deviceSecretOrHash);
+
+  const globalFallbackEnabled = process.env.ZKTECO_ALLOW_LEGACY_GLOBAL_SECRET === 'true' ||
+    process.env.ZKTECO_GLOBAL_SECRET_FALLBACK === 'true';
+  return globalFallbackEnabled && !!globalSecret?.trim() && matchesSecret(provided, globalSecret);
+}
+
+/**
  * Multi-tenant safe device authentication.
  *
- * Previously adapters compared the token against `device.device_secret`
- * (legacy plaintext column) only. Devices registered through the portal store
- * `device_secret_hash`, so their per-device secret was NEVER checked and every
- * ZKTeco device on the platform authenticated with the single shared
- * ZKTECO_DEVICE_SECRET. Anyone holding that shared secret could impersonate
- * ANY school's terminal just by knowing its serial number: inject attendance
- * (and parent SMS) into another tenant, or pull its enrollment commands.
- *
- * Order of checks:
- *   1. Per-device secret (hash, then legacy plaintext): the normal path.
- *   2. Shared global secret:
- *      - devices with NO per-device secret: allowed (legacy devices);
- *      - devices WITH a per-device secret: allowed only while
- *        ZKTECO_GLOBAL_SECRET_FALLBACK is not "false" (transition mode),
- *        and every use is logged so operators can migrate devices.
+ * Every normal device must use its own secret (hash preferred, legacy plaintext
+ * tolerated only until rotation). A shared global secret can authenticate only
+ * a device that has no per-device credential, and only with an explicit,
+ * temporary opt-in. The old default accepted the shared secret for every
+ * device, making disclosure of one global value a cross-school impersonation.
  */
 export function isAuthorizedDevice(
   providedToken: string | null | undefined,
   device: Pick<DeviceRecord, 'serial_number' | 'school_id'> & { device_secret?: string | null; device_secret_hash?: string | null },
-  globalSecret?: string
+  globalSecret?: string,
 ): boolean {
   if (!providedToken || !providedToken.trim()) return false;
   const provided = providedToken.trim();
 
   const perDevice = [device.device_secret_hash, device.device_secret].filter(
-    (v): v is string => typeof v === 'string' && v.trim().length > 0
+    (value): value is string => typeof value === 'string' && value.trim().length > 0,
   );
 
   for (const stored of perDevice) {
     if (matchesSecret(provided, stored)) return true;
   }
 
+  // Never let a global credential bypass a properly provisioned device.
+  if (perDevice.length > 0) return false;
+
+  const globalFallbackEnabled = process.env.ZKTECO_ALLOW_LEGACY_GLOBAL_SECRET === 'true' ||
+    process.env.ZKTECO_GLOBAL_SECRET_FALLBACK === 'true';
   const global = globalSecret?.trim();
-  if (!global || !matchesSecret(provided, global)) return false;
+  if (!globalFallbackEnabled || !global || !matchesSecret(provided, global)) return false;
 
-  if (perDevice.length === 0) return true;
-
-  const fallbackEnabled = (process.env.ZKTECO_GLOBAL_SECRET_FALLBACK || '').toLowerCase() !== 'false';
-  if (fallbackEnabled) {
-    console.warn(
-      `[Device Auth] Device ${device.serial_number} (school ${device.school_id}) authenticated with the SHARED global secret. ` +
-      'Reconfigure it with its per-device secret, then set ZKTECO_GLOBAL_SECRET_FALLBACK=false.'
-    );
-    return true;
-  }
-  return false;
+  console.warn(
+    `[Device Auth] Device ${device.serial_number} (school ${device.school_id}) authenticated with the legacy SHARED global secret. ` +
+    'Rotate this device to a per-device secret and remove ZKTECO_ALLOW_LEGACY_GLOBAL_SECRET.',
+  );
+  return true;
 }

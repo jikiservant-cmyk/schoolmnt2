@@ -9,13 +9,11 @@ export class ZKTecoAdmsAdapter implements DeviceAdapter {
   readonly defaultEndpoint = '/iclock/cdata';
 
   buildAuthCheck(req: Request, device: DeviceRecord): boolean {
-    const url = new URL(req.url);
-    const providedToken = 
+    // Do not accept credentials in URL parameters: reverse proxies, browser
+    // history, device diagnostics and Referer headers commonly retain URLs.
+    const providedToken =
       req.headers.get('x-device-token') ||
-      req.headers.get('authorization')?.replace(/^Bearer\s+/i, '') ||
-      url.searchParams.get('token') ||
-      url.searchParams.get('push_token') ||
-      url.searchParams.get('PushToken');
+      req.headers.get('authorization')?.replace(/^Bearer\s+/i, '');
 
     return isAuthorizedDevice(providedToken, device, process.env.ZKTECO_DEVICE_SECRET);
   }

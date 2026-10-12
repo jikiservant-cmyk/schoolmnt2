@@ -5,8 +5,15 @@ import { createAdminClient } from '@/utils/supabase/admin';
 import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
 import { isMissingColumnError } from '@/lib/tenant';
 import { isWithinAttendanceSmsWindow, getEatTodayRange, getAttendanceStatusForCheckIn } from '@/lib/attendance-window';
+import { requireSameOrigin } from '@/lib/security/request';
 
 async function getAuthenticatedSchoolId() {
+  try {
+    await requireSameOrigin();
+  } catch {
+    return { user: null, schoolId: null, error: 'Cross-site request rejected.' };
+  }
+
   // SECURITY: previously any authenticated Supabase user (including accounts
   // created directly against GoTrue with the public anon key, without an
   // admin profile) could drive the kiosk. Require a verified school admin.

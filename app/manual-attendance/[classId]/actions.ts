@@ -2,6 +2,7 @@
 
 import { checkSchoolAdmin } from '@/lib/auth-guard';
 import { consumeRateLimit, resetRateLimit } from '@/lib/security/rate-limit';
+import { requireSameOrigin } from '@/lib/security/request';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
 import { 
@@ -31,6 +32,12 @@ const PIN_LOCK_MS = 10 * 60 * 1000;
 const GENERIC_PIN_ERROR = 'Invalid teacher or PIN.';
 
 async function requireAdminContext() {
+  try {
+    await requireSameOrigin();
+  } catch {
+    return { ok: false as const, error: 'Cross-site request rejected.' };
+  }
+
   const result = await checkSchoolAdmin();
   if (!result.ok) {
     return { ok: false as const, error: result.reason === 'unauthenticated' ? 'Unauthorized.' : 'Access denied.' };

@@ -1,6 +1,5 @@
 'use server';
 
-import { createClient } from '@/utils/supabase/server';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
@@ -8,41 +7,7 @@ import bcrypt from 'bcryptjs';
 import { generateTeacherPin, PIN_BCRYPT_ROUNDS } from '@/lib/security/pin';
 import { allClassesOwned, getOwnedClass, isUuid } from '@/lib/tenant';
 
-async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
-  // 1. Try auth_school_id RPC
-  try {
-    const { data: rpcSchoolId } = await supabase.rpc('auth_school_id');
-    if (rpcSchoolId) {
-      return rpcSchoolId;
-    }
-  } catch (err) {
-    console.warn('RPC auth_school_id not available:', err);
-  }
-
-  // 2. Try staff_users linked via person_id -> people(school_id)
-  if (userId) {
-    try {
-      const { data: staffData } = await supabase
-        .from('staff_users')
-        .select('person_id, people(school_id)')
-        .eq('auth_user_id', userId)
-        .maybeSingle();
-
-      const peopleObj = Array.isArray(staffData?.people) ? staffData.people[0] : staffData?.people;
-      const resolvedSchoolId = (peopleObj as any)?.school_id;
-      if (resolvedSchoolId) {
-        return resolvedSchoolId;
-      }
-    } catch (err) {
-      console.error('Error resolving staff_users school context:', err);
-    }
-  }
-
-  return null;
-}
-
 export async function addPersonAction(formData: FormData) {
-  const supabase = await createClient();
   const fullName = formData.get('fullName') as string;
   const role = formData.get('role') as 'student' | 'teacher' | 'support_staff';
   
@@ -55,7 +20,7 @@ export async function addPersonAction(formData: FormData) {
   }
 
   try {
-    const { supabase, schoolId } = await requireSchoolAdmin();
+    const { schoolId } = await requireSchoolAdmin();
     const adminClient = createAdminClient();
     const rawDeviceId = formData.get('deviceUserId') as string;
     const cleanDeviceId = rawDeviceId && rawDeviceId.trim() ? rawDeviceId.trim() : null;
@@ -207,19 +172,21 @@ export async function addPersonAction(formData: FormData) {
       params.p_issue_manual_link = true;
     }
 
-    // Try invoking the RPC function school.fn_add_person
+    // `fn_add_person` is intentionally no longer callable by browser JWTs.
+    // Run it only through the service-role client after this action has checked
+    // the authenticated school admin and every supplied foreign key above.
     let rpcSuccess = false;
     let rpcData: any = null;
     try {
-      const { data, error } = await (supabase as any).rpc('fn_add_person', params);
+      const { data, error } = await (adminClient as any).rpc('fn_add_person', params);
       if (!error) {
         rpcSuccess = true;
         rpcData = data;
       } else {
-        console.warn('fn_add_person RPC returned error, using direct table fallback:', error);
+        console.warn('Server-side fn_add_person RPC returned error, using direct service fallback:', error);
       }
     } catch (rpcErr) {
-      console.warn('fn_add_person RPC invocation threw:', rpcErr);
+      console.warn('Server-side fn_add_person RPC invocation threw:', rpcErr);
     }
 
     // Fallback if RPC is not supported or failed

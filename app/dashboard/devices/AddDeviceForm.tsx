@@ -1,19 +1,10 @@
 'use client';
 
-import { useState, useTransition, useEffect } from 'react';
+import { useState, useTransition } from 'react';
 import { addDeviceAction } from './actions';
-import { Plus, HelpCircle, Key, RefreshCw, Copy, Check, ShieldCheck, Cpu } from 'lucide-react';
+import { Plus, HelpCircle, Key, Copy, Check, Cpu } from 'lucide-react';
 import { SUPPORTED_DEVICE_TYPES, DeviceTypeOption } from '@/lib/devices/registry';
 import { DeviceType } from '@/lib/devices/types';
-
-function createRandomSecret(): string {
-  const chars = '0123456789abcdef';
-  let rand = '';
-  for (let i = 0; i < 16; i++) {
-    rand += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return `dev_sec_${rand}`;
-}
 
 export default function AddDeviceForm() {
   const [isPending, startTransition] = useTransition();
@@ -22,17 +13,19 @@ export default function AddDeviceForm() {
   const [copied, setCopied] = useState<boolean>(false);
 
   const [selectedType, setSelectedType] = useState<DeviceType>('zkteco_adms');
-  const [deviceSecret, setDeviceSecret] = useState<string>(createRandomSecret);
+  // The server, not the browser, creates the credential with crypto.randomBytes.
+  // Keep the one-time returned value only in memory after registration.
+  const [issuedSecret, setIssuedSecret] = useState<string | null>(null);
 
-  const generateSecret = () => {
-    setDeviceSecret(createRandomSecret());
-  };
-
-  const handleCopySecret = () => {
-    if (!deviceSecret) return;
-    navigator.clipboard.writeText(deviceSecret);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const handleCopySecret = async () => {
+    if (!issuedSecret) return;
+    try {
+      await navigator.clipboard.writeText(issuedSecret);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setError('Unable to copy the secret. Select and copy it manually.');
+    }
   };
 
   const currentTypeMeta = SUPPORTED_DEVICE_TYPES.find(t => t.type === selectedType) || SUPPORTED_DEVICE_TYPES[0];
@@ -50,11 +43,12 @@ export default function AddDeviceForm() {
         const res = await addDeviceAction(formData);
         if (res && res.error) {
           setError(res.error);
-        } else {
+        } else if (res?.deviceSecret) {
+          setIssuedSecret(res.deviceSecret);
           setSuccess(true);
           form.reset();
-          generateSecret();
-          setTimeout(() => setSuccess(false), 4000);
+        } else {
+          setError('Terminal was registered, but no secure setup secret was returned. Rotate the terminal secret before connecting it.');
         }
       } catch (err: any) {
         setError(err?.message || 'A network error occurred. Please try again.');
@@ -82,7 +76,7 @@ export default function AddDeviceForm() {
 
       {success && (
         <div className="p-3 text-xs font-mono text-meridian-gold bg-meridian-gold/15 rounded-lg border border-meridian-gold/30 animate-fade-in">
-          Terminal registered successfully with assigned security credentials.
+          Terminal registered. Copy the one-time secret below before leaving this page; it is stored only as a hash.
         </div>
       )}
 
@@ -158,43 +152,35 @@ export default function AddDeviceForm() {
           />
         </div>
 
-        {/* Per-Device Authentication Secret */}
+        {/* Per-device authentication secret: issued by the server once. */}
         <div className="space-y-1.5">
           <div className="flex justify-between items-center">
-            <label htmlFor="deviceSecret" className="text-xs font-mono uppercase tracking-wider text-meridian-text-2 flex items-center gap-1.5">
+            <span className="text-xs font-mono uppercase tracking-wider text-meridian-text-2 flex items-center gap-1.5">
               <Key className="w-3 h-3 text-meridian-gold" />
               Per-Device Secret Token
-            </label>
-            <button
-              type="button"
-              onClick={generateSecret}
-              title="Generate new secret token"
-              className="text-[10px] font-mono text-meridian-gold hover:text-meridian-gold-dim flex items-center gap-1 transition"
-            >
-              <RefreshCw className="w-2.5 h-2.5" />
-              Regenerate
-            </button>
+            </span>
           </div>
-          <div className="relative flex items-center">
-            <input
-              id="deviceSecret"
-              name="deviceSecret"
-              type="text"
-              readOnly
-              value={deviceSecret}
-              className="w-full px-3 py-2 pr-10 bg-meridian-panel-raised border border-meridian-border text-xs rounded-lg font-mono text-meridian-gold select-all"
-            />
-            <button
-              type="button"
-              onClick={handleCopySecret}
-              className="absolute right-2 p-1.5 text-meridian-text-3 hover:text-meridian-text-1 transition"
-              title="Copy secret to clipboard"
-            >
-              {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
-            </button>
-          </div>
+          {issuedSecret ? (
+            <div className="relative flex items-center">
+              <code className="w-full px-3 py-2 pr-10 bg-meridian-panel-raised border border-meridian-border text-xs rounded-lg font-mono text-meridian-gold select-all break-all">
+                {issuedSecret}
+              </code>
+              <button
+                type="button"
+                onClick={handleCopySecret}
+                className="absolute right-2 p-1.5 text-meridian-text-3 hover:text-meridian-text-1 transition"
+                title="Copy one-time secret to clipboard"
+              >
+                {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+              </button>
+            </div>
+          ) : (
+            <p className="px-3 py-2 bg-meridian-panel-raised border border-meridian-border text-[10px] rounded-lg font-mono text-meridian-text-3">
+              A cryptographically random secret will be issued after registration. It is not stored in plaintext.
+            </p>
+          )}
           <p className="text-[10px] font-mono text-meridian-text-3">
-            Individual token for this unit. Authorizes HTTP push requests without exposing other terminals.
+            Configure this value in the terminal&apos;s <code>X-Device-Token</code> or <code>Authorization: Bearer</code> header. Never put it in a URL.
           </p>
         </div>
 
@@ -260,6 +246,7 @@ export default function AddDeviceForm() {
               <br />• Server Address: <code className="text-meridian-gold select-all">{typeof window !== 'undefined' ? window.location.hostname : 'your-cloud-domain.com'}</code>
               <br />• Server Port: <strong>443</strong> | HTTPS: <strong>ON</strong>
               <br />• Push Path: <code>/iclock/cdata</code>
+              <br />• Configure <code>X-Device-Token</code> (or an <code>Authorization: Bearer</code> header) with the issued secret. Do not append the secret to the URL.
             </p>
           </div>
         )}
@@ -274,7 +261,7 @@ export default function AddDeviceForm() {
               <code className="block bg-meridian-deep p-1.5 my-1 rounded text-meridian-gold break-all select-all">
                 {typeof window !== 'undefined' ? window.location.origin : 'https://your-domain.com'}/api/devices/push?sn=[SERIAL]
               </code>
-              Header: <code>X-Device-Token: {deviceSecret}</code>
+              Header: <code>X-Device-Token: {issuedSecret || '[issued after registration]'}</code>
             </p>
           </div>
         )}
@@ -289,7 +276,7 @@ export default function AddDeviceForm() {
               <code className="block bg-meridian-deep p-1.5 my-1 rounded text-meridian-gold break-all select-all">
                 {typeof window !== 'undefined' ? window.location.origin : 'https://your-domain.com'}/api/devices/push?sn=[SERIAL]
               </code>
-              Auth Token: <code>{deviceSecret}</code>
+              Auth Token: <code>{issuedSecret || '[issued after registration]'}</code>
             </p>
           </div>
         )}

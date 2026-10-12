@@ -1,6 +1,5 @@
 'use server';
 
-import { createClient } from '@/utils/supabase/server';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
@@ -18,41 +17,11 @@ function isValidTimeZone(tz: string) {
   }
 }
 
-async function resolveSchoolId(supabase: any, userId: string): Promise<string | null> {
-  // 1. Try auth_school_id RPC
-  try {
-    const { data: rpcSchoolId } = await supabase.rpc('auth_school_id');
-    if (rpcSchoolId) return rpcSchoolId;
-  } catch (err) {
-    console.warn('RPC auth_school_id failed:', err);
-  }
-
-  // 2. Try staff_users linked via person_id -> people -> school_id
-  try {
-    const { data: staffData } = await supabase
-      .from('staff_users')
-      .select('person_id, people(school_id)')
-      .eq('auth_user_id', userId)
-      .maybeSingle();
-
-    const peopleObj = Array.isArray(staffData?.people) ? staffData.people[0] : staffData?.people;
-    const resolvedSchoolId = (peopleObj as any)?.school_id;
-    if (resolvedSchoolId) {
-      return resolvedSchoolId;
-    }
-  } catch (err) {
-    console.warn('Error resolving via staff_users:', err);
-  }
-
-  return null;
-}
-
 export async function addDeviceAction(formData: FormData) {
   const serialNumber = formData.get('serialNumber') as string;
   const label = formData.get('label') as string;
   const ipAddress = (formData.get('ipAddress') as string) || null;
   const deviceType = ((formData.get('deviceType') as string) || 'zkteco_adms').trim();
-  const rawSecret = (formData.get('deviceSecret') as string)?.trim() || null;
   const lateCutoff = (formData.get('lateCutoff') as string)?.trim() || '08:00';
   const timeZone = (formData.get('timeZone') as string)?.trim() || 'Africa/Kampala';
 
@@ -64,9 +33,6 @@ export async function addDeviceAction(formData: FormData) {
   }
   if (!DEVICE_TYPES.includes(deviceType)) {
     return { error: 'Unsupported device type.' };
-  }
-  if (rawSecret && rawSecret.length < 16) {
-    return { error: 'Custom device secrets must be at least 16 characters (leave blank to auto-generate).' };
   }
   if (!isValidTimeZone(timeZone)) {
     return { error: 'Invalid time zone.' };
@@ -90,7 +56,9 @@ export async function addDeviceAction(formData: FormData) {
     }
 
     const { generateDeviceSecret, hashDeviceSecret, packDeviceMetadata } = await import('@/lib/devices/metadata');
-    const secretToSave = rawSecret || generateDeviceSecret();
+    // Generate on the server with crypto.randomBytes. A read-only form field is
+    // still attacker-controlled, and Math.random() is not a credential CSPRNG.
+    const secretToSave = generateDeviceSecret();
     const secretHashToSave = hashDeviceSecret(secretToSave);
 
     const [lateH, lateM] = lateCutoff.split(':').map(n => parseInt(n, 10));
@@ -168,10 +136,9 @@ export async function regenerateDeviceSecretAction(deviceId: string) {
 
     if (fetchErr || !dev) return { error: 'Device not found.' };
 
-    const { generateDeviceSecret, hashDeviceSecret, parseDeviceMetadata, packDeviceMetadata } = await import('@/lib/devices/metadata');
+    const { generateDeviceSecret, hashDeviceSecret } = await import('@/lib/devices/metadata');
     const newSecret = generateDeviceSecret();
     const newSecretHash = hashDeviceSecret(newSecret);
-    const parsed = parseDeviceMetadata(dev);
 
     // Attempt update with device_secret_hash first
     let { error: updateErr } = await adminClient
@@ -183,16 +150,9 @@ export async function regenerateDeviceSecretAction(deviceId: string) {
       .eq('school_id', schoolId);
 
     if (updateErr && (updateErr.code === 'PGRST204' || updateErr.message?.includes('column'))) {
-      const packedFw = packDeviceMetadata(dev.firmware_version, {
-        type: parsed.device_type,
-        config: parsed.config
-      });
-      const retryPacked = await adminClient
-        .from('devices')
-        .update({ firmware_version: packedFw, device_secret_hash: newSecretHash })
-        .eq('id', deviceId)
-        .eq('school_id', schoolId);
-      updateErr = retryPacked.error;
+      // Never fall back to storing a replacement secret in packed firmware
+      // metadata. Run migration 10 to add the hash column, then rotate again.
+      return { error: 'Secure device-secret storage is not installed. Run supabase_migrations/10_auth_rbac_device_hardening.sql before rotating this terminal.' };
     }
 
     if (updateErr) {

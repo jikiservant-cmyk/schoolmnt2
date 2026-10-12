@@ -15,6 +15,48 @@ export async function getClientIp(): Promise<string> {
   return (h.get('x-real-ip') || 'unknown').slice(0, 64);
 }
 
+/**
+ * Cross-site request check shared by Server Actions and route handlers.
+ *
+ * Next.js validates Server Action origins itself, but keeping this application
+ * check makes the protection explicit and also covers actions when auth cookies
+ * have deliberately been configured as SameSite=None for an embedded preview.
+ * A missing Origin is accepted for older same-origin form navigations; browser
+ * cross-site POSTs supply Origin and are rejected by the Fetch Metadata check.
+ */
+export function isSameOriginHeaders(requestHeaders: Pick<Headers, 'get'>): boolean {
+  const fetchSite = requestHeaders.get('sec-fetch-site');
+  if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') return false;
+
+  const origin = requestHeaders.get('origin');
+  if (!origin) return true;
+
+  // Proxies may append a list. The first host/protocol is the externally
+  // visible one. Compare scheme too: `http://app.example` and
+  // `https://app.example` are different browser origins.
+  const forwardedHost = requestHeaders.get('x-forwarded-host');
+  const host = (forwardedHost || requestHeaders.get('host') || '').split(',')[0]?.trim().toLowerCase();
+  const forwardedProto = requestHeaders.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
+  if (!host) return false;
+
+  try {
+    const parsedOrigin = new URL(origin);
+    if (parsedOrigin.host.toLowerCase() !== host) return false;
+    if (forwardedProto && parsedOrigin.protocol.replace(/:$/, '').toLowerCase() !== forwardedProto) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Throw before a state-changing Server Action accepts a cross-site request. */
+export async function requireSameOrigin(): Promise<void> {
+  const requestHeaders = await headers();
+  if (!isSameOriginHeaders(requestHeaders)) {
+    throw new Error('Cross-site request rejected');
+  }
+}
+
 /** Safely read a string field from FormData (rejects File values / non-strings). */
 export function getFormString(formData: FormData, key: string, maxLength = 1024): string | null {
   const value = formData.get(key);

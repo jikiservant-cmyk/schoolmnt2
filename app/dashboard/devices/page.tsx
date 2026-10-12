@@ -3,7 +3,7 @@ import AddDeviceForm from './AddDeviceForm';
 import DeviceLiveList from './DeviceLiveList';
 import { Smartphone, ArrowLeft, ShieldCheck, RefreshCw } from 'lucide-react';
 import Link from 'next/link';
-import { parseDeviceMetadata } from '@/lib/devices/metadata';
+import { toPublicDeviceMetadata } from '@/lib/devices/metadata';
 
 export default async function DevicesPage() {
   const supabase = await createClient();
@@ -29,7 +29,9 @@ export default async function DevicesPage() {
     .eq('school_id', schoolId)
     .order('name');
 
-  const registeredDevices = (devicesData || []).map(d => parseDeviceMetadata(d));
+  // Never serialize device secrets (including legacy secrets packed into the
+  // firmware metadata) into this client component.
+  const registeredDevices = (devicesData || []).map((device) => toPublicDeviceMetadata(device));
   const classesList = classesData || [];
 
   return (

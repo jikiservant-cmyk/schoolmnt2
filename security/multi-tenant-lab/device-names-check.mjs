@@ -27,8 +27,10 @@ const check = (name, pass, detail = '') => { if (!pass) failures++; console.log(
 class Terminal {
   constructor(sn) { this.sn = sn; this.users = new Map(); this.rejected = []; this.stray = []; }
   async poll() {
-    const qs = new URLSearchParams({ SN: this.sn, token: SECRETS[this.sn] });
-    const body = await (await fetch(`${BASE}/iclock/getrequest?${qs}`)).text();
+    const qs = new URLSearchParams({ SN: this.sn });
+    const body = await (await fetch(`${BASE}/iclock/getrequest?${qs}`, {
+      headers: { 'x-device-token': SECRETS[this.sn] },
+    })).text();
     if (body.trim() === 'OK') return 0;
     const replies = [];
     let n = 0;
@@ -49,8 +51,12 @@ class Terminal {
       replies.push(`ID=${id}&Return=0&CMD=DATA`);
     }
     if (replies.length) {
-      const qs2 = new URLSearchParams({ SN: this.sn, token: SECRETS[this.sn] });
-      await fetch(`${BASE}/iclock/devicecmd?${qs2}`, { method: 'POST', body: replies.join('\n') + '\n' });
+      const qs2 = new URLSearchParams({ SN: this.sn });
+      await fetch(`${BASE}/iclock/devicecmd?${qs2}`, {
+        method: 'POST',
+        headers: { 'x-device-token': SECRETS[this.sn] },
+        body: replies.join('\n') + '\n',
+      });
     }
     return n;
   }

@@ -24,8 +24,23 @@ const par = (await q("INSERT INTO school.parents(school_id,full_name,phone) VALU
 await q("INSERT INTO school.student_parents(student_id,parent_id,is_primary_contact) VALUES ($1,$2,true)", [inactive, par]);
 await fetch(SHIM + '/__reload', { method: 'POST' });
 const STUDENT = 'aaaaaaaa-0000-4000-8000-0000000000f1';
-const ic = (path, qs, init = {}) => fetch(BASE + path + '?' + new URLSearchParams(qs), init);
+// Normal terminals send their per-device credential in a header. Keep a raw
+// helper below only to assert that legacy URL credentials are rejected.
+const ic = (path, qs, init = {}) => {
+  const params = new URLSearchParams(qs);
+  const token = params.get('token');
+  params.delete('token');
+  const headers = new Headers(init.headers || {});
+  if (token) headers.set('x-device-token', token);
+  return fetch(BASE + path + '?' + params, { ...init, headers });
+};
+const icWithQueryToken = (path, qs, init = {}) => fetch(BASE + path + '?' + new URLSearchParams(qs), init);
 const today = new Date(Date.now() + 3 * 3600e3).toISOString().slice(0, 10); // EAT date
+// D0 URL credentials must never authenticate a terminal.
+{
+  const r = await icWithQueryToken('/iclock/cdata', { SN: 'SNA0001', token: A_SECRET });
+  rec('D0 device credential in URL query is accepted', r.status === 200, r.status);
+}
 // D1 serial enumeration via different error messages
 {
   const a = await (await ic('/iclock/cdata', { SN: 'NOPE9999', token: 'x' })).text();

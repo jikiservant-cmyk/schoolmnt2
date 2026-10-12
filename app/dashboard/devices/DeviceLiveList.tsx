@@ -21,8 +21,6 @@ import {
   Sparkles,
   Search,
   Key,
-  Eye,
-  EyeOff,
   Copy,
   Check,
   RefreshCw,
@@ -50,7 +48,6 @@ interface DeviceItem {
   school_id?: string | null;
   schools?: { id?: string; name?: string } | null;
   device_type?: string;
-  device_secret?: string | null;
   config?: {
     lateCutoffHour?: number;
     lateCutoffMinute?: number;
@@ -103,19 +100,21 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
   const [isPushing, setIsPushing] = useState(false);
   const [candidateFilter, setCandidateFilter] = useState('');
 
-  // Per-Device Secret state
-  const [revealedSecrets, setRevealedSecrets] = useState<Record<string, boolean>>({});
+  // A secret is returned only by the create/rotate action. It is intentionally
+  // kept in client state (not reloaded from the database) so it disappears on
+  // refresh and cannot be re-exposed from a legacy record.
+  const [issuedSecrets, setIssuedSecrets] = useState<Record<string, string>>({});
   const [copiedSecretId, setCopiedSecretId] = useState<string | null>(null);
   const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
 
-  const toggleSecretVisibility = (id: string) => {
-    setRevealedSecrets(prev => ({ ...prev, [id]: !prev[id] }));
-  };
-
-  const handleCopyToken = (id: string, token: string) => {
-    navigator.clipboard.writeText(token);
-    setCopiedSecretId(id);
-    setTimeout(() => setCopiedSecretId(null), 2000);
+  const handleCopyIssuedSecret = async (id: string, token: string) => {
+    try {
+      await navigator.clipboard.writeText(token);
+      setCopiedSecretId(id);
+      setTimeout(() => setCopiedSecretId(null), 2000);
+    } catch {
+      setSyncStatus({ msg: 'Unable to copy the secret. Select and copy it manually.', isError: true });
+    }
   };
 
   const handleRegenerateSecret = async (deviceId: string) => {
@@ -127,8 +126,11 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
       const res = await regenerateDeviceSecretAction(deviceId);
       if (res && (res as any).error) {
         alert((res as any).error);
-      } else {
+      } else if (res && (res as any).newSecret) {
+        setIssuedSecrets((current) => ({ ...current, [deviceId]: (res as any).newSecret }));
         router.refresh();
+      } else {
+        alert('The terminal secret was rotated, but the new value was not returned. Please rotate it again.');
       }
     } catch (err: any) {
       alert(err?.message || 'Failed to regenerate device secret');
@@ -372,8 +374,7 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
           manufacturer: 'Universal',
           description: ''
         };
-        const secretToken = dev.device_secret || 'dev_sec_default';
-        const isSecretVisible = !!revealedSecrets[dev.id];
+        const issuedSecret = issuedSecrets[dev.id] || null;
         const lateH = dev.config?.lateCutoffHour ?? 8;
         const lateM = dev.config?.lateCutoffMinute ?? 0;
         const lateCutoffDisplay = `${String(lateH).padStart(2, '0')}:${String(lateM).padStart(2, '0')}`;
@@ -477,34 +478,32 @@ export default function DeviceLiveList({ devices, classes = [] }: Props) {
 
             {/* Hardware Security & Push Ingestion Details */}
             <div className="pt-3 border-t border-gray-100 flex flex-wrap items-center justify-between gap-3 text-xs">
-              <div className="flex items-center gap-2 font-mono bg-gray-50 border border-gray-200 px-3 py-1.5 rounded-lg">
+              <div className="flex items-center gap-2 font-mono bg-gray-50 border border-gray-200 px-3 py-1.5 rounded-lg max-w-full">
                 <Key className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-                <span className="text-gray-500 text-[11px]">Secret:</span>
-                <span className="font-semibold text-gray-800 tracking-wider select-all text-xs">
-                  {isSecretVisible ? secretToken : '••••••••••••••••'}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => toggleSecretVisibility(dev.id)}
-                  className="text-gray-400 hover:text-gray-600 p-0.5 transition"
-                  title={isSecretVisible ? "Hide token" : "Reveal token"}
-                >
-                  {isSecretVisible ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleCopyToken(dev.id, secretToken)}
-                  className="text-gray-400 hover:text-gray-600 p-0.5 transition"
-                  title="Copy token"
-                >
-                  {copiedSecretId === dev.id ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                </button>
+                {issuedSecret ? (
+                  <>
+                    <span className="text-gray-500 text-[11px]">New secret:</span>
+                    <span className="font-semibold text-gray-800 tracking-wider select-all text-xs break-all">
+                      {issuedSecret}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyIssuedSecret(dev.id, issuedSecret)}
+                      className="text-gray-400 hover:text-gray-600 p-0.5 transition shrink-0"
+                      title="Copy new secret"
+                    >
+                      {copiedSecretId === dev.id ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
+                  </>
+                ) : (
+                  <span className="text-gray-500 text-[11px]">Secret stored as a hash. Rotate to issue a new one.</span>
+                )}
                 <button
                   type="button"
                   onClick={() => handleRegenerateSecret(dev.id)}
                   disabled={regeneratingId === dev.id}
-                  className="text-gray-400 hover:text-amber-600 p-0.5 transition disabled:opacity-50"
-                  title="Regenerate token"
+                  className="text-gray-400 hover:text-amber-600 p-0.5 transition disabled:opacity-50 shrink-0"
+                  title="Rotate secret"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${regeneratingId === dev.id ? 'animate-spin text-amber-600' : ''}`} />
                 </button>
