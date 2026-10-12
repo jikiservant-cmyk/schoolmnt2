@@ -1,4 +1,5 @@
 import { createServerClient } from '@supabase/ssr'
+import type { User } from '@supabase/supabase-js'
 import { NextResponse, type NextRequest } from 'next/server'
 import { createPublicAdminClient } from '@/utils/supabase/admin'
 import { hardenAuthCookieOptions } from './cookie-options'
@@ -66,37 +67,38 @@ export async function updateSession(request: NextRequest) {
     return redirectResponse
   }
 
-  // A logged-in session that is NOT a school admin (staff login, account whose
-  // school provisioning failed, revoked admin) is sent to
-  // /login?error=access_denied by the dashboard. Server components can't clear
-  // cookies, so the session survived and the block below sent the user straight
-  // back to /dashboard: an endless redirect loop ("too many redirects") with no
-  // way to reach the login form. Sign the session out HERE, then show the form.
-  // Only for sessions that really fail the dashboard's admin check, so a
-  // shared /login?error=access_denied link can't log a real admin out.
-  if (user && pathname === '/login' && request.nextUrl.searchParams.get('error') === 'access_denied' && !(await isWorkingSchoolAdmin(user.id, supabase))) {
+  // Never treat a merely authenticated Supabase session as an app session.
+  // This includes unverified addresses and profiles whose explicit school_id
+  // conflicts with their staff membership. In addition to closing that gate at
+  // the dashboard, clear invalid sessions at entry pages so they cannot cause
+  // an endless /login -> /dashboard -> access_denied redirect loop.
+  const isAuthEntryPath = pathname === '/login' || pathname === '/signup' || pathname === '/'
+  if (user && isAuthEntryPath) {
+    if (await isWorkingSchoolAdmin(user, supabase)) {
+      const url = request.nextUrl.clone()
+      url.pathname = '/dashboard'
+      url.search = ''
+      const redirectResponse = NextResponse.redirect(url)
+      supabaseResponse.headers.getSetCookie().forEach((cookieStr) => {
+        redirectResponse.headers.append('Set-Cookie', cookieStr)
+      })
+      return redirectResponse
+    }
+
     try {
       await supabase.auth.signOut()
     } catch {
-      /* cookies are expired below anyway */
+      /* Explicit expiry below is still mandatory. */
     }
     request.cookies.getAll()
       .filter((c) => c.name.startsWith('sb-'))
-      .forEach((c) => supabaseResponse.cookies.set(c.name, '', { maxAge: 0, path: '/' }))
+      .forEach((c) => supabaseResponse.cookies.set(c.name, '', {
+        ...hardenAuthCookieOptions({}),
+        maxAge: 0,
+        expires: new Date(0),
+      }))
     supabaseResponse.headers.set('Cache-Control', 'no-store')
     return supabaseResponse
-  }
-
-  // Redirect authenticated user away from login/signup
-  if (user && (pathname === '/login' || pathname === '/signup' || pathname === '/')) {
-    const url = request.nextUrl.clone()
-    url.pathname = '/dashboard'
-    url.search = ''
-    const redirectResponse = NextResponse.redirect(url)
-    supabaseResponse.headers.getSetCookie().forEach((cookieStr) => {
-      redirectResponse.headers.append('Set-Cookie', cookieStr)
-    })
-    return redirectResponse
   }
 
   // IMPORTANT: You *must* return the supabaseResponse object as it is. If you're
@@ -113,24 +115,29 @@ export async function updateSession(request: NextRequest) {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
- * Same test as lib/auth-guard checkSchoolAdmin (admin_profiles role/app_type
- * via service role + a school from auth_school_id). Any error -> false, i.e.
- * the session is signed out (fail closed, and no redirect loop).
+ * Mirror lib/auth-guard's admin test before redirecting a session away from an
+ * entry page. Any lookup failure is false so this middleware fails closed.
  */
 async function isWorkingSchoolAdmin(
-  userId: string,
+  user: User,
   supabase: ReturnType<typeof createServerClient>,
 ): Promise<boolean> {
   try {
+    const emailIsVerified = process.env.AUTH_REQUIRE_EMAIL_VERIFICATION === 'false'
+      || Boolean(user.email_confirmed_at || user.confirmed_at)
+    if (!emailIsVerified) return false
+
     const { data: profile, error } = await createPublicAdminClient()
       .from('admin_profiles')
-      .select('role, app_type')
-      .eq('id', userId)
+      .select('role, app_type, school_id')
+      .eq('id', user.id)
       .maybeSingle()
     if (error || !profile || profile.role !== 'school_admin') return false
     if (profile.app_type && profile.app_type !== 'school') return false
+
     const { data: schoolId, error: rpcErr } = await supabase.rpc('auth_school_id')
-    return !rpcErr && typeof schoolId === 'string' && UUID_RE.test(schoolId)
+    if (rpcErr || typeof schoolId !== 'string' || !UUID_RE.test(schoolId)) return false
+    return !profile.school_id || profile.school_id.toLowerCase() === schoolId.toLowerCase()
   } catch {
     return false
   }

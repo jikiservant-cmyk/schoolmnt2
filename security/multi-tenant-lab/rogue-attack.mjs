@@ -129,7 +129,11 @@ const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Kampala' }).f
 const nowEat = new Date(Date.now() - 2 * 60 * 1000);
 const hhmm = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Kampala', hour: '2-digit', minute: '2-digit', hour12: false }).format(nowEat);
 const punchTime = checkoutWindow ? hhmm : '17:00';
-const ic = (body) => fetch(BASE + '/iclock/cdata?' + new URLSearchParams({ SN: 'SNA0001', table: 'ATTLOG', token: SECRETS.A }), { method: 'POST', body });
+const ic = (body) => fetch(BASE + '/iclock/cdata?' + new URLSearchParams({ SN: 'SNA0001', table: 'ATTLOG' }), {
+  method: 'POST',
+  headers: { 'x-device-token': SECRETS.A },
+  body,
+});
 await Promise.all([0, 1, 2, 3, 4].map((i) => ic(`102\t${today} ${punchTime}:0${i}\t1\t1\n`)));
 const k3 = await smsFor();
 rec('K3 device: 5 simultaneous uploads of a check-out queue several paid SMS', k3 > 1, 'SMS queued=' + k3 + ' (should be 1)');

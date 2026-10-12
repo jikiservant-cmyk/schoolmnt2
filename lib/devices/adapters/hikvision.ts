@@ -8,12 +8,13 @@ export class HikvisionIsapiAdapter implements DeviceAdapter {
   readonly defaultEndpoint = '/api/devices/push';
 
   buildAuthCheck(req: Request, device: DeviceRecord): boolean {
-    const url = new URL(req.url);
     const authHeader = req.headers.get('authorization') || '';
     const tokenHeader = req.headers.get('x-device-token') || '';
-    
-    let providedToken = tokenHeader || url.searchParams.get('token') || url.searchParams.get('key');
-    
+
+    // ISAPI supports an Authorization header; URL token/key parameters are
+    // deliberately not accepted because they leak into request logs.
+    let providedToken = tokenHeader;
+
     if (!providedToken && authHeader.startsWith('Bearer ')) {
       providedToken = authHeader.replace(/^Bearer\s+/i, '');
     } else if (!providedToken && authHeader.startsWith('Basic ')) {

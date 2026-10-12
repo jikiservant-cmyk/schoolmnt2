@@ -763,3 +763,33 @@ All requested existing suites were rerun with migration 09 enabled. Payments, SM
 | `next build` | Passed |
 
 **Go-live:** run migrations **05 → 06 → 07 → 08 → 09** (back up first; run 09 outside gate hours).
+
+---
+
+# Part 12: Authentication and device-credential hardening (2026-10-12)
+
+## Findings fixed
+
+| Severity | Finding | Remediation |
+|---|---|---|
+| Critical | A successful Supabase password login could become an app session before verified-email, trusted profile role, tenant, and profile-school checks all completed. | Login, middleware, and the central guard now require a verified email (unless `AUTH_REQUIRE_EMAIL_VERIFICATION=false` is deliberately set), a service-role-read `school_admin` profile for the school app, exactly one tenant, and no explicit profile/tenant mismatch. Rejected sessions are revoked and `sb-*` cookies are expired. |
+| High | Direct PostgREST access used tenant-only RLS and exposed mutation/read paths to authenticated non-admin staff; exposed `school` RPCs could be called outside Server Actions. | Migration `10_auth_rbac_device_hardening.sql` adds a deterministic one-school resolver, an admin predicate backed by `admin_profiles`, restrictive RBAC policies, legacy `device_logs` protection through its device FK, and removes browser execution of application RPCs. `fn_add_person` is only attempted through a guarded service-role action. |
+| High | Per-device secrets were generated with browser `Math.random()`, shown again from persisted records, and legacy packed metadata could reach client props. | Secrets are generated server-side with `crypto.randomBytes`, stored only as SHA-256 hashes, returned exactly once after create/rotate, and retained only in browser memory for that page. Explicit device DTOs whitelist client-safe fields and strip legacy packed/config secrets. |
+| High | Device adapters accepted credentials in query strings, exposing them in URLs, proxy logs, device diagnostics, and referrers. | All adapters now require `X-Device-Token`, vendor API-key/session headers, or `Authorization`; query credentials are rejected. The global fallback is disabled unless explicitly opted in for a device with no per-device secret. |
+| Medium | Cross-site Server Action requests were not independently checked by app code, and entry-page middleware did not mirror the full admin gate. | Same-origin checks cover state-changing actions and logout; middleware now clears invalid/unverified/mismatched sessions rather than redirect-looping them. |
+| High | The unused AI/Firebase dependency trees brought multiple vulnerable production transitive packages; SheetJS had unfixed high-severity parser findings. Exported user values also allowed spreadsheet formula injection. | Removed unused dependencies, upgraded Next.js to 16.4.0 and its ESLint configuration, replaced SheetJS with a small write-only `fflate` XLSX creator, and escape formula sigils in XLSX/CSV exports. `npm audit --omit=dev --audit-level=high` now reports **0 vulnerabilities**. |
+
+## Verification performed
+
+- `node security/pentest/attack.mjs`: **17/17 secure** against the mock GoTrue/PostgREST harness, including unverified-email login, profile-school mismatch, forged direct-GoTrue session, cross-site Server Action request, profile lookup outage/malformed response, brute force, and logout CSRF.
+- `node security/pentest/regress.mjs`: all legitimate admin login, dashboard, logout, normalization, and input-size regressions passed.
+- `npx tsc --noEmit`, `npm run build`, and `npm audit --omit=dev --audit-level=high`: passed.
+- `npm run lint`: zero errors; one pre-existing `react-hooks/exhaustive-deps` warning remains in `app/dashboard/attendance/page.tsx`.
+
+## Required deployment sequence
+
+1. Back up the database, then apply migrations **05 → 06 → 07 → 08 → 09 → 10** in order.
+2. Resolve any duplicate normalized device serials reported by migration 10 before retrying it; global uniqueness is required because gateway authentication first locates a device by serial.
+3. Rotate every existing terminal secret in **Dashboard → Devices**. Copy the one-time returned value into the terminal's request header, never its URL.
+4. Remove any shared `ZKTECO_DEVICE_SECRET` and do not set `ZKTECO_ALLOW_LEGACY_GLOBAL_SECRET`; it exists only as a temporary migration bridge for terminals that have no per-device credential.
+5. Keep `AUTH_REQUIRE_EMAIL_VERIFICATION=true` in production and configure Supabase email confirmation. Do not set it to `false` unless a separately verified SSO/invitation system supplies the assurance.
