@@ -130,10 +130,22 @@ export default function AttendancePage() {
 
   const handleTopUpSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const amountNum = parseInt(topUpAmount);
-    if (isNaN(amountNum) || amountNum <= 0) return;
-    if (!phoneNumber || phoneNumber.length < 9) {
-      setError('Please enter a valid phone number');
+    if (isToppingUp) return;
+
+    const cleanAmt = topUpAmount.trim().replace(/,/g, '');
+    if (!/^\d+$/.test(cleanAmt)) {
+      setError('Top-up amount must be a whole UGX amount.');
+      return;
+    }
+    const amountNum = Number(cleanAmt);
+    if (!Number.isSafeInteger(amountNum) || amountNum < 1 || amountNum > 10_000_000) {
+      setError('Top-up amount must be between 1 and 10,000,000 UGX.');
+      return;
+    }
+
+    const digitsOnly = phoneNumber.replace(/\D/g, '');
+    if (digitsOnly.length < 9 || digitsOnly.length > 15) {
+      setError('Please enter a valid mobile money phone number.');
       return;
     }
 
@@ -301,7 +313,7 @@ export default function AttendancePage() {
 
           <div className="mt-4 flex flex-wrap items-center gap-2.5">
             <a 
-              href="/mark-attendance" 
+              href={kioskToken ? `/mark-attendance?token=${encodeURIComponent(kioskToken)}` : '/mark-attendance'}
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#171719] hover:bg-[#2c2c2e] text-white rounded-[8px] text-[11px] font-medium transition shadow-2xs"

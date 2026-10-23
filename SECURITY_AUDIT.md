@@ -815,3 +815,47 @@ All requested existing suites were rerun with migration 09 enabled. Payments, SM
 | `security/pentest/attack.mjs` & `security/pentest/regress.mjs` | **15/15 SECURE** & **14/14 PASS** |
 | `npm ci` + `npm audit --omit=dev` + `eslint` + `tsc --noEmit` + `npm run build` | **0 prod vulnerabilities, 0 errors, clean standalone build** |
 
+# Part 13: Round 13 Deep Money Integrity, Webhook Hardening & Live Penetration Testing
+
+## Adversarial Findings Reproduced Live & Closed (`money-round13-attack.mjs`)
+
+1. **Cross-Tenant Deduplication Black Hole via Placeholder References (`supabase_migrations/11_round13_money_integrity.sql`, `lib/payments/webhook.ts`):**
+   - **Pre-patch reproduction (`R13-01`, `R13-02`):** Auxiliary/placeholder values echoed by mobile money gateways (`providerPaymentId: "N/A"`, `"0"`, `"NONE"`, `"MTN"`, etc.) were stored in `school.payment_events.detail.refs` and matched globally via `(detail -> 'refs') ?| v_refs` *before* intent matching. Once any school completed a payment carrying `"N/A"`, every subsequent payment across every school carrying `"N/A"` returned `200 {"outcome":"duplicate"}`, permanently dropping paid money without retries.
+   - **Fix:** Added `school.clean_payment_refs(text[])` in PostgreSQL and `cleanReferenceToken()` in `lib/payments/webhook.ts` to strip placeholder/noise/short tokens before deduplicating or persisting `detail.refs`.
+2. **Payment Webhook Black Hole on Event Names Containing `sms` (`app/api/webhooks/najiki/handler.ts`, `lib/payments/webhook.ts`):**
+   - **Pre-patch reproduction (`R13-03`):** `isDeliveryReport` matched any event type containing `"sms"` when `"payment"` was absent (e.g. `sms_topup.completed`, `wallet.sms_topup`), skipping `handlePayment()` and answering `200 {"received":true}` without crediting or logging the payment.
+   - **Fix:** Added `hasPaymentIndicators()` and broadened `classifyPayment()` so any payload carrying payment/top-up identifiers (`paymentIntentId`, `providerPaymentId`, `sch_topup_*`) routes exclusively to `handlePayment()`.
+3. **Outer-Envelope Foreign Currency Bypass & Object Coercion (`lib/payments/webhook.ts`, `app/api/webhooks/najiki/handler.ts`):**
+   - **Pre-patch reproduction (`R13-04`):** `paidCurrency()` inspected only inner `payload.data` and coerced non-string objects (e.g. `{ code: "KES" }`) to `"" || "UGX"`, crediting `USD` and `KES` payments at 1:1 `UGX` value.
+   - **Fix:** `paidCurrency(eventData, payload)` inspects all currency fields across outer `payload`, inner `data`, `data.amount`, and `metadata`, rejects conflicting or malformed values, and passes non-UGX codes straight to `apply_payment()` (`currency_mismatch`, HTTP `202`).
+4. **Sub-Shilling Dust Attack (`0.001 UGX`) Burning Pending `50,000 UGX` Intents & Money Envelope Parsing (`lib/payments/webhook.ts`, `supabase_migrations/11_round13_money_integrity.sql`):**
+   - **Pre-patch reproduction (`R13-05`):** A webhook reporting `amount: 0.001` matched a `50,000 UGX` `pending` intent, marked it `credited` with `credited_amount = 0.00` while adding `0.001` to `public.wallets.balance` (breaking double-entry parity), and caused the genuine `50,000 UGX` webhook to be dropped as `duplicate`. Meanwhile, valid money envelopes (`{ value: 3500, currency: "UGX" }`) or whitespace `amount: "   "` + `amount_paid` failed with HTTP `400`.
+   - **Fix:** Enforced whole-shilling positive integer UGX validation (`>= 1`, `trunc(p_amount) = p_amount`, non-`NaN`) in both `paidAmount()` and SQL `school.apply_payment()`, while unwrapping `{ value | amount }` envelopes and skipping blank strings cleanly.
+5. **Outer vs Inner Envelope School ID Conflict Bypass (`app/api/webhooks/najiki/handler.ts`):**
+   - **Pre-patch reproduction (`R13-06`):** `resolveWebhookSchool()` ignored outer `payload.externalEntityId` / `payload.schoolId`, allowing conflicting outer vs inner tenant UUIDs to pass with HTTP `200`.
+   - **Fix:** Collected school UUID candidates across both outer and inner envelopes (plus `metadata`), rejecting any discrepancy with HTTP `400` and recording `rejected_conflicting_school`.
+6. **Blank / Punctuation-Only Phone Bypass, Cross-Tenant `profiles.code` Routing, & Multi-Instance Quota Race in `topUpBalance()` (`app/dashboard/attendance/actions.ts`, `app/dashboard/attendance/page.tsx`, `supabase_migrations/11_round13_money_integrity.sql`):**
+   - **Pre-patch reproduction (`R13-07`, `R13-08`, `R13-09`):** `"         "` and `"---------"` passed `/^\+?[0-9\s\-().]{9,20}$/`, inserting empty-phone intents and calling NaJiki; a stale `public.profiles` row pointing to another school routed Mobile Money collection into the other school's NaJiki merchant account; and concurrent requests across instances raced past `SELECT ... LIMIT maxTopUps` (`1003` rows vs `1000` limit).
+   - **Fix:** Normalized and validated 9–15 numeric MSISDN digits up front in both client UI and server action, verified `profiles.school_id === school.id` without raw `.or()` interpolation, sanitized error responses, and introduced advisory-locked `school.create_payment_intent()` (`pg_advisory_xact_lock`) with graceful `MIG11=0` fallback.
+7. **Wallet Kernel Constraints, `wallet_migrated` Persistence & Atomic SMS Debit (`supabase_migrations/11_round13_money_integrity.sql`, `lib/payments/wallet.ts`, `app/dashboard/attendance/actions.ts`):**
+   - **Pre-patch reproduction (`R13-10a`, `R13-10b`, `R13-10c`):** `public.wallets` allowed cross-tenant hybrid rows (`tenant_id = B, school_id = A`) and negative balances (`-500`), while `getSchoolBalance()` resurrected spent `settings.balance` when `settings.wallet_migrated = true`.
+   - **Fix:** Added `wallets_same_tenant_chk` and `wallets_non_negative_balance_chk` constraints on `public.wallets`, stamped `settings.wallet_migrated = true` on wallet updates, failed closed on non-missing-table errors in `legacyBalanceUsable()`, aligned single-tenant wallet selection across SQL and TypeScript, and added atomic server-only `school.debit_sms_wallet()` (verified under 20x concurrency in `R13-13`).
+8. **SMS Delivery State Machine, Schema Reconciliation & Retry Semantics (`app/api/webhooks/najiki/handler.ts`, `supabase_migrations/11_round13_money_integrity.sql`):**
+   - **Pre-patch reproduction (`R13-11a`–`d`):** Delayed `QUEUED` / `SUBMITTED` webhooks overwrote `'sent'` SMS rows back to `'failed'`; `school.notifications` lacked `provider_ref`, `sent_at`, and `provider_response` under strict PostgREST (`SHIM_NO_AUTOCOL=1`); explicit `schoolId` claims on delivery webhooks were unvalidated; and transient DB errors returned `200` instead of `500`.
+   - **Fix:** Added `provider_ref`, `sent_at`, and `provider_response` + partial index in `11_round13_money_integrity.sql` (with `MIG11=0` fallback), treated intermediate carrier statuses as non-terminal no-ops, guarded `.neq('status', 'sent')` against state regressions, scoped updates by explicit `schoolId` when provided, and returned HTTP `500` on DB failures so QStash retries cleanly.
+
+## Round 13 Verification Matrix
+
+| Suite | Pre-Patch | Post-Patch |
+|---|---|---|
+| `money-round13-attack.mjs` (21 red-team + double-entry + `MIG11=0` checks) | **16 vulnerable / 16 + ledger drift** | **0 vulnerable / 21; 0 legit failures** |
+| `payments-attack.mjs` | — | **0 vulnerable / 20; 0 legit failures** |
+| `money-reconcile.mjs` | — | **BOOKS BALANCE: ALL MONEY CHECKS OK (`21700 === 21700`)** |
+| `round4-attack.mjs` / `pay-rls-check.mjs` / `rogue-attack.mjs` | — | **0/5** / **0/8** / **0/23 vulnerable** |
+| `topup-limit-check.mjs` | — | **PASS: 6 allowed, then refused** |
+| `rls-attack.mjs` / strict `attack.mjs` / `device-attack.mjs` | — | **0/32** / **0/42** / **0/15 vulnerable** |
+| `round12-check.mjs` + all device, duplicate, crawl, SSR, orphan & `pentest` suites | — | **100% PASS (35/35, 15/15 SECURE, 14/14 PASS)** |
+
+**Go-live migration sequence:** run **05 → 06 → 07 → 08 → 09 → 10 → 11** (`supabase_migrations/11_round13_money_integrity.sql` is 100% idempotent).
+
+
