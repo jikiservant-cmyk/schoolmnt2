@@ -10,6 +10,9 @@ import { getOwnedPerson, UUID_RE } from '@/lib/tenant';
 import { loadSchoolWallet, isMissingFunction, isMissingTable, legacyBalanceUsable } from '@/lib/payments/wallet';
 import { consumeRateLimit } from '@/lib/security/rate-limit';
 import { createKioskCapabilityToken } from '@/lib/security/register-token';
+import { getEATDayRange } from '@/lib/eat-time';
+import { getAttendanceStatusForCheckIn } from '@/lib/attendance-window';
+import { getSchoolSettings } from '@/lib/school-settings';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
   // 1. Try auth_school_id RPC
@@ -47,6 +50,8 @@ async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<str
 export async function getAttendanceData(dateFilterStr?: string) {
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
+    const adminClient = createAdminClient();
+    const schoolSettings = await getSchoolSettings(adminClient, schoolId);
     
     // 1. Get attendance logs strictly scoped to this school
   let logs: any[] = [];
@@ -72,9 +77,8 @@ export async function getAttendanceData(dateFilterStr?: string) {
     .order('occurred_at', { ascending: false });
     
   if (dateFilterStr) {
-    // Expecting YYYY-MM-DD
-    const startIso = `${dateFilterStr}T00:00:00+03:00`; // EAT Start
-    const endIso = `${dateFilterStr}T23:59:59+03:00`;   // EAT End
+    // Expecting YYYY-MM-DD in school's configured timezone
+    const { startIso, endIso } = getEATDayRange(dateFilterStr, schoolSettings.timeZone);
     query = query.gte('occurred_at', startIso).lte('occurred_at', endIso).limit(2000);
   } else {
     query = query.limit(500);
@@ -161,6 +165,7 @@ export async function getAttendanceData(dateFilterStr?: string) {
       classes: classes || [],
       people: people || [],
       kioskToken,
+      schoolSettings,
       error: undefined as string | undefined
     };
   } catch (err: any) {
@@ -177,10 +182,11 @@ export async function getAttendanceData(dateFilterStr?: string) {
 export async function recordTeacherAttendance(personId: string, status?: 'present' | 'late' | 'excused') {
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
+    const adminClient = createAdminClient();
 
     // MULTI-TENANT: the person must belong to this school (previously any
     // person UUID was accepted and logged under the caller's school_id).
-    const person = await getOwnedPerson(createAdminClient(), schoolId, personId, ['teacher', 'support_staff', 'admin']);
+    const person = await getOwnedPerson(adminClient, schoolId, personId, ['teacher', 'support_staff', 'admin']);
     if (!person) {
       return { error: 'Staff member not found in your school.' };
     }
@@ -188,12 +194,14 @@ export async function recordTeacherAttendance(personId: string, status?: 'presen
       return { error: 'Invalid attendance status.' };
     }
 
+    const schoolSettings = await getSchoolSettings(adminClient, schoolId);
     const now = new Date();
-    // Default rule: if checking in after 08:30 AM East Africa Time, mark as late unless specified
-    const eatHours = (now.getUTCHours() + 3) % 24;
-    const eatMinutes = now.getUTCMinutes();
-    const isLate = eatHours > 8 || (eatHours === 8 && eatMinutes > 30);
-    const finalStatus = status || (isLate ? 'late' : 'present');
+    const computedStatus = getAttendanceStatusForCheckIn(now, {
+      timeZone: schoolSettings.timeZone,
+      role: person.role,
+      staffLateCutoff: schoolSettings.staffLateCutoff,
+    });
+    const finalStatus = status || computedStatus;
 
     const { data, error } = await supabase
       .from('attendance_logs')

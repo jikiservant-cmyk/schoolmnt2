@@ -5,27 +5,28 @@ import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { getOwnedPerson } from '@/lib/tenant';
+import { getSchoolSettings } from '@/lib/school-settings';
 
 export async function addClassAction(formData: FormData) {
-  const supabase = await createClient();
-  const name = formData.get('name') as string;
-  const teacherId = formData.get('teacherId') as string || null;
-
-  if (!name) {
-    return { error: 'Class name is required.' };
-  }
-
-  const trimmedName = name.trim();
-  const firstChar = trimmedName.charAt(0);
-  if (firstChar === 'p' || firstChar === 's') {
-    return { error: 'Class names starting with P or S must have their first letter capitalized (e.g., P3 or S4).' };
-  }
-
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
+    const name = formData.get('name') as string;
+    const teacherId = (formData.get('teacherId') as string) || null;
 
+    if (!name) {
+      return { error: 'Class name is required.' };
+    }
+
+    const trimmedName = name.trim();
     if (trimmedName.length < 1 || trimmedName.length > 60) {
       return { error: 'Class name must be between 1 and 60 characters.' };
+    }
+
+    const adminClient = createAdminClient();
+    const schoolSettings = await getSchoolSettings(adminClient, schoolId);
+    const firstChar = trimmedName.charAt(0);
+    if (schoolSettings.enforceStandardClassPrefix && (firstChar === 'p' || firstChar === 's')) {
+      return { error: 'Class names starting with P or S must have their first letter capitalized (e.g., P3 or S4).' };
     }
 
     // MULTI-TENANT: the class teacher must be an active teacher in this school.

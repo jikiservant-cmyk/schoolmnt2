@@ -7,6 +7,11 @@ import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue'
 import { isMissingColumnError, extractMissingColumn } from '@/lib/tenant';
 import { isWithinAttendanceSmsWindow, getEatTodayRange, getAttendanceStatusForCheckIn } from '@/lib/attendance-window';
 import {
+  getSchoolSettings,
+  isParentSmsEnabledForEvent,
+  renderAttendanceSmsMessage,
+} from '@/lib/school-settings';
+import {
   KIOSK_CAPABILITY_COOKIE,
   verifyKioskCapabilityToken,
 } from '@/lib/security/register-token';
@@ -147,10 +152,11 @@ export async function submitClockInAction(deviceUserId: string) {
     }
 
     // -------------------------------------------------------------
-    // Step B2 — Check today's existing attendance logs for this person in EAT
+    // Step B2 — Check today's existing attendance logs in school timezone & apply per-school cutoffs
     // -------------------------------------------------------------
+    const schoolSettings = await getSchoolSettings(adminClient, schoolId);
     const now = new Date();
-    const { startIso, endIso } = getEatTodayRange(now);
+    const { startIso, endIso } = getEatTodayRange(now, schoolSettings.timeZone);
 
     const { data: todayLogs } = await adminClient
       .from('attendance_logs')
@@ -172,7 +178,15 @@ export async function submitClockInAction(deviceUserId: string) {
       attendanceType = 'check_out';
     }
 
-    const calculatedStatus = attendanceType === 'check_in' ? getAttendanceStatusForCheckIn(now) : 'present';
+    const calculatedStatus = attendanceType === 'check_in'
+      ? getAttendanceStatusForCheckIn(now, {
+          timeZone: schoolSettings.timeZone,
+          role: person.role,
+          studentLateCutoff: schoolSettings.studentLateCutoff,
+          studentGraceMinutes: schoolSettings.studentGraceMinutes,
+          staffLateCutoff: schoolSettings.staffLateCutoff,
+        })
+      : 'present';
 
     // Resolve class name for snapshots
     let classNameAtTime: string | null = null;
@@ -226,76 +240,92 @@ export async function submitClockInAction(deviceUserId: string) {
     }
 
     if (person.role === 'student') {
-      const windowCheck = isWithinAttendanceSmsWindow(attendanceType, now);
-
-      if (!windowCheck.allowed) {
-        console.log(`[Manual Attendance] Attendance recorded for ${person.full_name}, but SMS skipped: ${windowCheck.reason}`);
+      if (!isParentSmsEnabledForEvent(schoolSettings, attendanceType, calculatedStatus)) {
+        console.log(`[Manual Attendance] Attendance recorded for ${person.full_name}; parent SMS disabled by school policy.`);
       } else {
-        // Retrieve the parent contact details (prefer primary contact, fallback to any linked parent)
-        let studentParent: any = null;
-        const { data: primaryParent } = await adminClient
-          .from('student_parents')
-          .select('parent_id, parents(phone, full_name, school_id)')
-          .eq('student_id', person.id)
-          .eq('is_primary_contact', true)
-          .maybeSingle();
+        const windowCheck = isWithinAttendanceSmsWindow(attendanceType, now, {
+          timeZone: schoolSettings.timeZone,
+          restrictSmsWindows: schoolSettings.restrictSmsWindows,
+          checkInSmsStart: schoolSettings.checkInSmsStart,
+          checkInSmsEnd: schoolSettings.checkInSmsEnd,
+          checkOutSmsStart: schoolSettings.checkOutSmsStart,
+          checkOutSmsEnd: schoolSettings.checkOutSmsEnd,
+        });
 
-        if (primaryParent) {
-          studentParent = primaryParent;
+        if (!windowCheck.allowed) {
+          console.log(`[Manual Attendance] Attendance recorded for ${person.full_name}, but SMS skipped: ${windowCheck.reason}`);
         } else {
-          const { data: fallbackParent } = await adminClient
+          // Retrieve the parent contact details (prefer primary contact, fallback to any linked parent)
+          let studentParent: any = null;
+          const { data: primaryParent } = await adminClient
             .from('student_parents')
             .select('parent_id, parents(phone, full_name, school_id)')
             .eq('student_id', person.id)
+            .eq('is_primary_contact', true)
             .maybeSingle();
-          studentParent = fallbackParent;
-        }
 
-        // MULTI-TENANT: never message a guardian registered under another school.
-        if (studentParent && (studentParent.parents as any)?.school_id !== schoolId) {
-          studentParent = null;
-        }
-
-        if (studentParent && studentParent.parents) {
-          const parentId = studentParent.parent_id;
-          const parentPhone = (studentParent.parents as any).phone;
-          
-          const timestampStr = windowCheck.eatTimeStr || now.toLocaleTimeString('en-US', { 
-            hour: '2-digit', 
-            minute: '2-digit', 
-            hour12: true 
-          });
-          
-          const smsMessageText = attendanceType === 'check_in'
-            ? `Dear Parent, your child ${person.full_name} checked in successfully at ${timestampStr}.`
-            : `Dear Parent, your child ${person.full_name} checked OUT of school successfully at ${timestampStr}.`;
-
-          // Queue the notification in school.notifications (one per child,
-          // direction and day: simultaneous taps cannot queue a second paid SMS)
-          let queueErr: unknown = null;
-          try {
-            await queueNotifications(adminClient, [{
-              dedupe_key: attendanceSmsKey(person.id, attendanceType, now),
-              school_id: schoolId,
-              recipient_type: 'parent',
-              recipient_id: parentId,
-              recipient_phone_snapshot: parentPhone,
-              channel: 'sms',
-              notification_type: 'attendance',
-              related_table: 'attendance_logs',
-              related_id: attendanceLog.id,
-              message: smsMessageText,
-              status: 'pending'
-            }]);
-          } catch (e) {
-            queueErr = e;
+          if (primaryParent) {
+            studentParent = primaryParent;
+          } else {
+            const { data: fallbackParent } = await adminClient
+              .from('student_parents')
+              .select('parent_id, parents(phone, full_name, school_id)')
+              .eq('student_id', person.id)
+              .maybeSingle();
+            studentParent = fallbackParent;
           }
 
-          if (queueErr) {
-            console.error('Error writing outbound notification queue row:', queueErr);
+          // MULTI-TENANT: never message a guardian registered under another school.
+          if (studentParent && (studentParent.parents as any)?.school_id !== schoolId) {
+            studentParent = null;
           }
-        } else {
-          console.warn(`No primary contact guardian registered for student "${person.full_name}".`);
+
+          if (studentParent && studentParent.parents) {
+            const parentId = studentParent.parent_id;
+            const parentPhone = (studentParent.parents as any).phone;
+            
+            const timestampStr = windowCheck.eatTimeStr || now.toLocaleTimeString('en-US', { 
+              timeZone: schoolSettings.timeZone,
+              hour: '2-digit', 
+              minute: '2-digit', 
+              hour12: true 
+            });
+            
+            const smsMessageText = renderAttendanceSmsMessage(schoolSettings, attendanceType, {
+              studentName: person.full_name,
+              schoolName: schoolSettings.schoolName,
+              time: timestampStr,
+              className: classNameAtTime,
+              status: calculatedStatus,
+            });
+
+            // Queue the notification in school.notifications (one per child,
+            // direction and day: simultaneous taps cannot queue a second paid SMS)
+            let queueErr: unknown = null;
+            try {
+              await queueNotifications(adminClient, [{
+                dedupe_key: attendanceSmsKey(person.id, attendanceType, now, schoolSettings.timeZone),
+                school_id: schoolId,
+                recipient_type: 'parent',
+                recipient_id: parentId,
+                recipient_phone_snapshot: parentPhone,
+                channel: 'sms',
+                notification_type: 'attendance',
+                related_table: 'attendance_logs',
+                related_id: attendanceLog.id,
+                message: smsMessageText,
+                status: 'pending'
+              }]);
+            } catch (e) {
+              queueErr = e;
+            }
+
+            if (queueErr) {
+              console.error('Error writing outbound notification queue row:', queueErr);
+            }
+          } else {
+            console.warn(`No primary contact guardian registered for student "${person.full_name}".`);
+          }
         }
       }
     }

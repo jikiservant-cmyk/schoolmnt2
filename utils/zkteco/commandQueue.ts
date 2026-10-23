@@ -4,6 +4,7 @@ import { getDeviceAdapter } from '@/lib/devices/registry';
 import { zktecoDeleteUserCommand } from '@/lib/devices/adapters/zkteco';
 import { EnrollPersonInput } from '@/lib/devices/types';
 import { UUID_RE, normalizeSerial, extractMissingColumn } from '@/lib/tenant';
+import { getSchoolSettings } from '@/lib/school-settings';
 
 async function insertWithMissingColumnFallback(
   admin: ReturnType<typeof createAdminClient>,
@@ -189,10 +190,24 @@ export async function enqueuePersonEnrollmentForSchool(
     return { success: false, queuedCount: 0, message: 'No active devices registered.' };
   }
 
+  let hydratedPerson: EnrollPersonInput = person;
+  if (!person.lcdOptions) {
+    const schoolSettings = await getSchoolSettings(createAdminClient(), schoolId);
+    hydratedPerson = {
+      ...person,
+      lcdOptions: {
+        prefixTeacher: schoolSettings.lcdPrefixTeacher,
+        prefixAdmin: schoolSettings.lcdPrefixAdmin,
+        prefixSupport: schoolSettings.lcdPrefixSupport,
+        showStudentClass: schoolSettings.lcdShowStudentClass,
+      },
+    };
+  }
+
   let successCount = 0;
   for (const dev of devices) {
     const adapter = getDeviceAdapter(dev.device_type);
-    const enrollResult = adapter.buildEnrollCommand(person, dev);
+    const enrollResult = adapter.buildEnrollCommand(hydratedPerson, dev);
 
     if (enrollResult.transportType === 'adms_command' || enrollResult.transportType === 'rest_api') {
       const res = await enqueueDeviceCommand(

@@ -5,6 +5,7 @@ import { getDeviceAdapter } from '@/lib/devices/registry';
 import { normalizeSerial } from '@/lib/tenant';
 import { consumeRateLimit, isRateLimited } from '@/lib/security/rate-limit';
 import { extractClientIpFromHeaders } from '@/lib/security/request';
+import { getSchoolSettings } from '@/lib/school-settings';
 import type { DeviceAdapter, DeviceRecord } from '@/lib/devices/types';
 
 /**
@@ -103,6 +104,23 @@ export async function authenticateDeviceRequest(req: Request, rawSerial: unknown
   const adapter = getDeviceAdapter(device.device_type);
   const authorized = await adapter.buildAuthCheck(req, device);
   if (!authorized) return fail(`bad secret for ${serial}`);
+
+  try {
+    const schoolSettings = await getSchoolSettings(supabase, device.school_id);
+    device.schoolSettings = schoolSettings;
+    if (!device.config.hasExplicitTimeZone) {
+      device.config.timeZone = schoolSettings.timeZone;
+    }
+    if (!device.config.hasExplicitLateCutoff) {
+      const [h, m] = schoolSettings.studentLateCutoff.split(':').map((n) => parseInt(n, 10));
+      if (!Number.isNaN(h) && !Number.isNaN(m)) {
+        device.config.lateCutoffHour = h;
+        device.config.lateCutoffMinute = m;
+      }
+    }
+  } catch (err) {
+    console.warn(`[Device Gateway] Could not hydrate school settings for ${serial}:`, err);
+  }
 
   return { ok: true, device, adapter, supabase, serial };
 }

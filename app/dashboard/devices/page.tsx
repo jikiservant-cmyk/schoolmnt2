@@ -4,6 +4,8 @@ import DeviceLiveList from './DeviceLiveList';
 import { Smartphone, ArrowLeft, ShieldCheck, RefreshCw } from 'lucide-react';
 import Link from 'next/link';
 import { parseDeviceMetadata } from '@/lib/devices/metadata';
+import { createAdminClient } from '@/utils/supabase/admin';
+import { getSchoolSettings } from '@/lib/school-settings';
 
 export default async function DevicesPage() {
   const supabase = await createClient();
@@ -14,6 +16,8 @@ export default async function DevicesPage() {
   if (!schoolId) {
     return <div>Error: School context not found.</div>;
   }
+
+  const schoolSettings = await getSchoolSettings(createAdminClient(), schoolId);
 
   // 1. Fetch registered physical devices with school information (excluding sensitive secrets)
   const { data: devicesData } = await supabase
@@ -89,7 +93,10 @@ export default async function DevicesPage() {
 
         {/* Register Device Form (4 columns) */}
         <div className="lg:col-span-4">
-          <AddDeviceForm />
+          <AddDeviceForm
+            schoolDefaultLateCutoff={schoolSettings.studentLateCutoff}
+            schoolDefaultTimeZone={schoolSettings.timeZone}
+          />
         </div>
 
       </div>

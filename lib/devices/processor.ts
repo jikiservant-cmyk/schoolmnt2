@@ -1,8 +1,14 @@
 import { AttendanceEvent, DeviceRecord } from './types';
 import { createAdminClient } from '@/utils/supabase/admin';
-import { isWithinAttendanceSmsWindow } from '@/lib/attendance-window';
+import { getAttendanceStatusForCheckIn, isWithinAttendanceSmsWindow } from '@/lib/attendance-window';
 import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
 import { isMissingColumnError, extractMissingColumn } from '@/lib/tenant';
+import {
+  DEFAULT_SCHOOL_POLICY_SETTINGS,
+  getSchoolSettings,
+  isParentSmsEnabledForEvent,
+  renderAttendanceSmsMessage,
+} from '@/lib/school-settings';
 
 const AMBIGUOUS_PIN = Symbol('AMBIGUOUS_PIN');
 type PinCandidate = any | typeof AMBIGUOUS_PIN;
@@ -30,15 +36,18 @@ export interface ProcessEventsResult {
  * Handles person lookup, deduplication, late-cutoff calculation, batch inserts, and SMS queues.
  */
 const MAX_EVENTS_PER_BATCH = 2000;
-const DEFAULT_ATTENDANCE_DUPLICATE_WINDOW_SECONDS = 120;
+const DEFAULT_ATTENDANCE_DUPLICATE_WINDOW_SECONDS = DEFAULT_SCHOOL_POLICY_SETTINGS.duplicatePunchWindowSeconds;
 
-function attendanceDuplicateWindowMs(): number {
+function attendanceDuplicateWindowMs(schoolConfiguredSeconds?: number): number {
   const configured = process.env.ATTENDANCE_DUPLICATE_WINDOW_SECONDS;
-  const parsed = configured == null || configured.trim() === ''
-    ? DEFAULT_ATTENDANCE_DUPLICATE_WINDOW_SECONDS
-    : Number(configured);
-  if (!Number.isFinite(parsed)) return DEFAULT_ATTENDANCE_DUPLICATE_WINDOW_SECONDS * 1000;
-  return Math.trunc(Math.max(0, Math.min(3600, parsed))) * 1000;
+  if (configured != null && configured.trim() !== '') {
+    const parsed = Number(configured);
+    if (!Number.isFinite(parsed)) return DEFAULT_ATTENDANCE_DUPLICATE_WINDOW_SECONDS * 1000;
+    return Math.trunc(Math.max(0, Math.min(3600, parsed))) * 1000;
+  }
+  const schoolSecs = schoolConfiguredSeconds ?? DEFAULT_ATTENDANCE_DUPLICATE_WINDOW_SECONDS;
+  if (!Number.isFinite(schoolSecs)) return DEFAULT_ATTENDANCE_DUPLICATE_WINDOW_SECONDS * 1000;
+  return Math.trunc(Math.max(0, Math.min(3600, schoolSecs))) * 1000;
 }
 
 export async function processAttendanceEvents(
@@ -209,11 +218,14 @@ export async function processAttendanceEvents(
     return result;
   }
 
+  // Load per-school configurable policies once per upload batch.
+  const schoolSettings = device.schoolSettings || (await getSchoolSettings(supabase, device.school_id));
+
   // 3. Deduplicate real instants in a configurable window. Processing oldest
   // first preserves the first thumb in a batch, and adding every kept punch to
   // knownPunches also catches repeats inside that same upload.
   matchedList.sort((a, b) => a.logDate.getTime() - b.logDate.getTime());
-  const duplicateWindowMs = attendanceDuplicateWindowMs();
+  const duplicateWindowMs = attendanceDuplicateWindowMs(schoolSettings.duplicatePunchWindowSeconds);
   const earliestMs = matchedList[0].logDate.getTime();
   const latestMs = matchedList[matchedList.length - 1].logDate.getTime();
   const earliestIso = new Date(earliestMs - duplicateWindowMs).toISOString();
@@ -253,7 +265,9 @@ export async function processAttendanceEvents(
     }));
 
   // 4. Resolve School/Device Late Cutoff and TimeZone configuration
-  const timeZone = device.config?.timeZone || 'Africa/Kampala';
+  const timeZone = device.config?.hasExplicitTimeZone
+    ? (device.config.timeZone || schoolSettings.timeZone)
+    : schoolSettings.timeZone;
   const lateCutoffHour = device.config?.lateCutoffHour ?? 8;
   const lateCutoffMinute = device.config?.lateCutoffMinute ?? 0;
 
@@ -316,20 +330,31 @@ export async function processAttendanceEvents(
       processed_at: nowIso
     });
 
-    // Determine status (present vs. late) according to per-school/device cutoff
+    // Determine status (present vs. late) according to per-school or explicit per-device cutoff
     const attendanceType = item.event.event_type;
-    let isLate = false;
+    let status: 'present' | 'late' = 'present';
     if (attendanceType === 'check_in') {
-      try {
-        const parts = localTimeFormatter.formatToParts(item.logDate);
-        const localH = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10) % 24;
-        const localM = parseInt(parts.find(p => p.type === 'minute')?.value || '0', 10);
-        isLate = (localH > lateCutoffHour) || (localH === lateCutoffHour && localM > lateCutoffMinute);
-      } catch {
-        isLate = false;
+      if (device.config?.hasExplicitLateCutoff) {
+        let isLate = false;
+        try {
+          const parts = localTimeFormatter.formatToParts(item.logDate);
+          const localH = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10) % 24;
+          const localM = parseInt(parts.find(p => p.type === 'minute')?.value || '0', 10);
+          isLate = (localH > lateCutoffHour) || (localH === lateCutoffHour && localM > lateCutoffMinute);
+        } catch {
+          isLate = false;
+        }
+        status = isLate ? 'late' : 'present';
+      } else {
+        status = getAttendanceStatusForCheckIn(item.logDate, {
+          timeZone,
+          role: item.person.role,
+          studentLateCutoff: schoolSettings.studentLateCutoff,
+          studentGraceMinutes: schoolSettings.studentGraceMinutes,
+          staffLateCutoff: schoolSettings.staffLateCutoff,
+        });
       }
     }
-    const status = attendanceType === 'check_in' ? (isLate ? 'late' : 'present') : 'present';
 
     // Attendance Log (business record)
     attendanceLogsToInsert.push({
@@ -346,9 +371,19 @@ export async function processAttendanceEvents(
       class_name_at_time: item.person.classes?.name || (item.person.role === 'teacher' ? 'Faculty Member' : null)
     });
 
-    // Check parent SMS notifications for students
-    if (item.person.role === 'student') {
-      const windowCheck = isWithinAttendanceSmsWindow(attendanceType, item.logDate, timeZone);
+    // Check parent SMS notifications for students using per-school toggles + SMS windows
+    if (
+      item.person.role === 'student' &&
+      isParentSmsEnabledForEvent(schoolSettings, attendanceType, status)
+    ) {
+      const windowCheck = isWithinAttendanceSmsWindow(attendanceType, item.logDate, {
+        timeZone,
+        restrictSmsWindows: schoolSettings.restrictSmsWindows,
+        checkInSmsStart: schoolSettings.checkInSmsStart,
+        checkInSmsEnd: schoolSettings.checkInSmsEnd,
+        checkOutSmsStart: schoolSettings.checkOutSmsStart,
+        checkOutSmsEnd: schoolSettings.checkOutSmsEnd,
+      });
       if (windowCheck.allowed) {
         validStudentRecords.push({
           ...item,
@@ -481,8 +516,14 @@ export async function processAttendanceEvents(
     for (const record of validStudentRecords) {
       const pInfo = parentMap.get(record.person.id);
       if (pInfo && pInfo.phone) {
-        const actionText = record.attendanceType === 'check_in' ? 'arrived safely at school' : 'clocked out from school';
         const timeFormatted = record.timeFormatted || record.logDate.toLocaleTimeString([], { timeZone, hour: '2-digit', minute: '2-digit' });
+        const messageText = renderAttendanceSmsMessage(schoolSettings, record.attendanceType, {
+          studentName: record.person.full_name,
+          schoolName: schoolSettings.schoolName,
+          time: timeFormatted,
+          className: record.person.classes?.name || null,
+          status: record.status,
+        });
 
         notificationsToInsert.push({
           dedupe_key: attendanceSmsKey(record.person.id, record.attendanceType, record.logDate, timeZone),
@@ -493,7 +534,7 @@ export async function processAttendanceEvents(
           channel: 'sms',
           notification_type: 'attendance',
           status: 'pending',
-          message: `${record.person.full_name} has ${actionText} at ${timeFormatted}.`
+          message: messageText
         });
       }
     }

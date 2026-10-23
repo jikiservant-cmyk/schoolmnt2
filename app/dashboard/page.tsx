@@ -1,6 +1,8 @@
 import { createClient } from '@/utils/supabase/server';
+import { createAdminClient } from '@/utils/supabase/admin';
 import DashboardClient from './DashboardClient';
 import { getEATDayRange, getEATDateKey, formatEATDate } from '@/lib/eat-time';
+import { getSchoolSettings, DEFAULT_SCHOOL_POLICY_SETTINGS } from '@/lib/school-settings';
 
 export default async function DashboardPage() {
   const supabase = await createClient();
@@ -13,46 +15,12 @@ export default async function DashboardPage() {
   let classBreakdown: any[] = [];
   let weekTrend: any[] = [];
   let recentMessages: any[] = [];
-  let adminName = 'Derrick';
+  let adminName = 'Admin';
+  let schoolTimeZone = DEFAULT_SCHOOL_POLICY_SETTINGS.timeZone;
+  let academicTermLabel = DEFAULT_SCHOOL_POLICY_SETTINGS.academicTermLabel;
 
-  // 1. Get current date range in East Africa Time (EAT, UTC+3)
   const now = new Date();
-  const todayRange = getEATDayRange(now);
-  const todayKey = todayRange.dateStr;
-
-  // 2. Calculate the 7 days of the current week (Monday through Sunday in EAT)
-  // Determine current day of week: 0 is Sun, 1 is Mon, ..., 6 is Sat
-  const dayOfWeek = now.getDay();
-  // Monday offset: if Sunday (0), it's 6 days behind; otherwise dayOfWeek - 1
-  const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-  
-  const mondayDate = new Date(now);
-  mondayDate.setDate(now.getDate() - daysSinceMonday);
-  mondayDate.setHours(0, 0, 0, 0);
-
-  const weekDaysData: { dayName: string; dateKey: string; dateLabel: string; startIso: string; endIso: string; isToday: boolean; isFuture: boolean }[] = [];
   const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-
-  for (let i = 0; i < 7; i++) {
-    const d = new Date(mondayDate);
-    d.setDate(mondayDate.getDate() + i);
-    const dayRange = getEATDayRange(d);
-    const isToday = dayRange.dateStr === todayKey;
-    const isFuture = dayRange.dateStr > todayKey;
-
-    weekDaysData.push({
-      dayName: dayNames[i],
-      dateKey: dayRange.dateStr,
-      dateLabel: formatEATDate(d, { month: 'short', day: 'numeric' }),
-      startIso: dayRange.startIso,
-      endIso: dayRange.endIso,
-      isToday,
-      isFuture,
-    });
-  }
-
-  const weekStartIso = weekDaysData[0].startIso;
-  const weekEndIso = weekDaysData[6].endIso;
 
   try {
     const { data: { user } } = await supabase.auth.getUser();
@@ -70,9 +38,9 @@ export default async function DashboardPage() {
 
       if (staffData && staffData.people) {
         const p = staffData.people as any;
-        adminName = p.full_name?.split(' ')[0] || 'Derrick';
+        adminName = p.full_name?.split(' ')[0] || 'Admin';
       } else {
-        adminName = user.user_metadata?.full_name?.split(' ')[0] || 'Derrick';
+        adminName = user.user_metadata?.full_name?.split(' ')[0] || 'Admin';
       }
     }
 
@@ -89,6 +57,44 @@ export default async function DashboardPage() {
     if (!targetSchoolId) {
       throw new Error('Tenant context required. Please log in with an assigned school.');
     }
+
+    const schoolSettings = await getSchoolSettings(createAdminClient(), targetSchoolId);
+    schoolTimeZone = schoolSettings.timeZone;
+    academicTermLabel = schoolSettings.academicTermLabel;
+
+    // 1. Get current date range in school's configured timezone
+    const todayRange = getEATDayRange(now, schoolTimeZone);
+    const todayKey = todayRange.dateStr;
+
+    // 2. Calculate the 7 days of the current week (Monday through Sunday in school's timezone)
+    const [ty, tm, td] = todayKey.split('-').map(Number);
+    const anchorUtc = new Date(Date.UTC(ty, tm - 1, td, 12, 0, 0));
+    const dayOfWeek = anchorUtc.getUTCDay();
+    const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+    const mondayUtc = new Date(anchorUtc);
+    mondayUtc.setUTCDate(anchorUtc.getUTCDate() - daysSinceMonday);
+
+    const weekDaysData: { dayName: string; dateKey: string; dateLabel: string; startIso: string; endIso: string; isToday: boolean; isFuture: boolean }[] = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(mondayUtc);
+      d.setUTCDate(mondayUtc.getUTCDate() + i);
+      const dayRange = getEATDayRange(d, schoolTimeZone);
+      const isToday = dayRange.dateStr === todayKey;
+      const isFuture = dayRange.dateStr > todayKey;
+
+      weekDaysData.push({
+        dayName: dayNames[i],
+        dateKey: dayRange.dateStr,
+        dateLabel: formatEATDate(d, { month: 'short', day: 'numeric' }, schoolTimeZone),
+        startIso: dayRange.startIso,
+        endIso: dayRange.endIso,
+        isToday,
+        isFuture,
+      });
+    }
+
+    const weekStartIso = weekDaysData[0].startIso;
+    const weekEndIso = weekDaysData[6].endIso;
 
     const [
       { count: students },
@@ -219,7 +225,7 @@ export default async function DashboardPage() {
     const logsByDateKey = new Map<string, Set<string>>();
     (weekLogsData || []).forEach((l: any) => {
       if ((l.people?.role || 'student') === 'student' && l.person_id) {
-        const key = getEATDateKey(l.occurred_at);
+        const key = getEATDateKey(l.occurred_at, schoolTimeZone);
         const set = logsByDateKey.get(key) || new Set<string>();
         set.add(l.person_id);
         logsByDateKey.set(key, set);
@@ -282,19 +288,30 @@ export default async function DashboardPage() {
   const teacherLatePct = teacherCount > 0 ? Number(((teacherLateCount / teacherCount) * 100).toFixed(1)) : 0;
   const teacherAbsentPct = teacherCount > 0 ? Number(((teacherAbsentCount / teacherCount) * 100).toFixed(1)) : 0;
 
-  // Dynamic greeting
-  const hour = new Date().getHours();
+  // Dynamic greeting in school's configured timezone
+  const hourStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: schoolTimeZone,
+    hour: 'numeric',
+    hour12: false,
+  }).format(now);
+  const hour = parseInt(hourStr, 10) % 24;
   let greeting = 'Good afternoon';
   if (hour < 12) greeting = 'Good morning';
   else if (hour >= 17) greeting = 'Good evening';
 
   // Format date in uppercase Apple style e.g. MONDAY · 31 AUGUST 2026
-  const formattedDate = formatEATDate(now, {
-    weekday: 'long',
-    day: 'numeric',
-    month: 'long',
-    year: 'numeric'
-  }).toUpperCase().replace(',', ' ·');
+  const formattedDate = formatEATDate(
+    now,
+    {
+      weekday: 'long',
+      day: 'numeric',
+      month: 'long',
+      year: 'numeric',
+    },
+    schoolTimeZone
+  )
+    .toUpperCase()
+    .replace(',', ' ·');
 
   return (
     <DashboardClient 
@@ -320,6 +337,7 @@ export default async function DashboardPage() {
       greeting={greeting}
       adminName={adminName}
       formattedDate={formattedDate}
+      academicTermLabel={academicTermLabel}
     />
   );
 }

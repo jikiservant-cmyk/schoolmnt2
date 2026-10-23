@@ -13,6 +13,11 @@ import {
   getCurrentAttendanceWindowMode
 } from '@/lib/attendance-window';
 import {
+  getSchoolSettings,
+  isParentSmsEnabledForEvent,
+  renderAttendanceSmsMessage,
+} from '@/lib/school-settings';
+import {
   REGISTER_CAPABILITY_COOKIE,
   REGISTER_PIN_COOKIE,
   verifyRegisterCapabilityToken,
@@ -126,15 +131,18 @@ async function verifyTeacherPinScoped(
   if (typeof teacherId !== 'string' || !UUID_RE.test(teacherId)) return { success: false, error: GENERIC_PIN_ERROR };
   if (typeof pin !== 'string' || !PIN_RE.test(pin.trim())) return { success: false, error: GENERIC_PIN_ERROR };
 
+  const adminClient = createAdminClient();
+  const schoolSettings = await getSchoolSettings(adminClient, schoolId);
+  const maxPinFailures = schoolSettings.maxPinFailures;
+  const pinLockMs = schoolSettings.pinLockoutMinutes * 60 * 1000;
+
   // Throttle before doing any expensive work (bcrypt) — per teacher and per operator session.
-  const perTeacher = consumeRateLimit(`pin:teacher:${teacherId}`, MAX_PIN_FAILURES * 2, PIN_LOCK_MS);
-  const perCaller = consumeRateLimit(`pin:caller:${callerId}`, 30, PIN_LOCK_MS);
+  const perTeacher = consumeRateLimit(`pin:teacher:${teacherId}`, maxPinFailures * 2, pinLockMs);
+  const perCaller = consumeRateLimit(`pin:caller:${callerId}`, 30, pinLockMs);
   if (!perTeacher.allowed || !perCaller.allowed) {
     const secs = Math.max(perTeacher.retryAfterSeconds, perCaller.retryAfterSeconds);
     return { success: false, error: `Too many attempts. Locked for ${Math.max(1, Math.ceil(secs / 60))} minute(s).` };
   }
-
-  const adminClient = createAdminClient();
 
   // 1. Tenant check FIRST: the teacher must be an active teacher in the caller's school.
   const { data: teacher } = await adminClient
@@ -198,7 +206,7 @@ async function verifyTeacherPinScoped(
     if (hasLockoutColumns) {
       const newFailures = (staffUser.failed_attempts || 0) + 1;
       const update: Record<string, unknown> = { failed_attempts: newFailures };
-      if (newFailures >= MAX_PIN_FAILURES) update.locked_until = new Date(Date.now() + PIN_LOCK_MS).toISOString();
+      if (newFailures >= maxPinFailures) update.locked_until = new Date(Date.now() + pinLockMs).toISOString();
       await adminClient.from('staff_users').update(update).eq('id', staffUser.id);
     }
     return { success: false, error: GENERIC_PIN_ERROR };
@@ -356,12 +364,18 @@ export async function getStudentsForClass(
     return { error: 'Failed to fetch students.' };
   }
 
+  const schoolSettings = await getSchoolSettings(adminClient, schoolId);
+  const activeMode = getCurrentAttendanceWindowMode(new Date(), {
+    timeZone: schoolSettings.timeZone,
+    afternoonSwitchoverTime: schoolSettings.afternoonSwitchoverTime,
+  });
+
   if (!students || students.length === 0) {
-    return { students: [], activeWindowMode: getCurrentAttendanceWindowMode() };
+    return { students: [], activeWindowMode: activeMode };
   }
 
-  // Fetch today's attendance logs in EAT for these students
-  const { startIso, endIso } = getEatTodayRange();
+  // Fetch today's attendance logs in the school's configured timezone for these students
+  const { startIso, endIso } = getEatTodayRange(new Date(), schoolSettings.timeZone);
   const studentIds = students.map(s => s.id);
 
   const { data: logs } = await adminClient
@@ -392,7 +406,7 @@ export async function getStudentsForClass(
 
     const checkInTime = checkInLog?.occurred_at
       ? new Date(checkInLog.occurred_at).toLocaleTimeString('en-US', {
-          timeZone: 'Africa/Kampala',
+          timeZone: schoolSettings.timeZone,
           hour: '2-digit',
           minute: '2-digit',
           hour12: true,
@@ -401,7 +415,7 @@ export async function getStudentsForClass(
 
     const checkOutTime = checkOutLog?.occurred_at
       ? new Date(checkOutLog.occurred_at).toLocaleTimeString('en-US', {
-          timeZone: 'Africa/Kampala',
+          timeZone: schoolSettings.timeZone,
           hour: '2-digit',
           minute: '2-digit',
           hour12: true,
@@ -422,7 +436,7 @@ export async function getStudentsForClass(
 
   return { 
     students: enrichedStudents,
-    activeWindowMode: getCurrentAttendanceWindowMode()
+    activeWindowMode: activeMode
   };
 }
 
@@ -488,8 +502,9 @@ export async function submitClassAttendance(
   // marked_by comes from the verified staff record — never from client input.
   const markedByStaffUserId: string | null = pinVerification.data.staffUserId;
 
+  const schoolSettings = await getSchoolSettings(adminClient, schoolId);
   const now = new Date();
-  const { startIso, endIso } = getEatTodayRange(now);
+  const { startIso, endIso } = getEatTodayRange(now, schoolSettings.timeZone);
 
   // Check today's existing attendance logs for these students (ensure strictly ONE mark per time frame)
   let eligibleStudentIds = presentStudentIds;
@@ -521,7 +536,12 @@ export async function submitClassAttendance(
   }
 
   const attendanceStatus: 'present' | 'late' = attendanceType === 'check_in'
-    ? getAttendanceStatusForCheckIn(now)
+    ? getAttendanceStatusForCheckIn(now, {
+        timeZone: schoolSettings.timeZone,
+        role: 'student',
+        studentLateCutoff: schoolSettings.studentLateCutoff,
+        studentGraceMinutes: schoolSettings.studentGraceMinutes,
+      })
     : 'present';
 
   const presentLogs = eligibleStudentIds.map(studentId => ({
@@ -618,13 +638,24 @@ export async function submitClassAttendance(
         }
         
 
-        if (notificationsToSend.length > 0) {
-          const windowCheck = isWithinAttendanceSmsWindow(attendanceType, now);
+        if (
+          notificationsToSend.length > 0 &&
+          isParentSmsEnabledForEvent(schoolSettings, attendanceType, attendanceStatus)
+        ) {
+          const windowCheck = isWithinAttendanceSmsWindow(attendanceType, now, {
+            timeZone: schoolSettings.timeZone,
+            restrictSmsWindows: schoolSettings.restrictSmsWindows,
+            checkInSmsStart: schoolSettings.checkInSmsStart,
+            checkInSmsEnd: schoolSettings.checkInSmsEnd,
+            checkOutSmsStart: schoolSettings.checkOutSmsStart,
+            checkOutSmsEnd: schoolSettings.checkOutSmsEnd,
+          });
 
           if (!windowCheck.allowed) {
             console.log(`[Class Manual Attendance] Recorded attendance for ${presentLogs.length} students, but SMS dispatch skipped: ${windowCheck.reason}`);
           } else {
             const timestampStr = windowCheck.eatTimeStr || now.toLocaleTimeString('en-US', { 
+              timeZone: schoolSettings.timeZone,
               hour: '2-digit', 
               minute: '2-digit', 
               hour12: true 
@@ -632,18 +663,17 @@ export async function submitClassAttendance(
 
             const smsRows: Record<string, unknown>[] = [];
             for (const notif of notificationsToSend) {
-              let smsMessageText = `Dear Parent,`;
-              if (attendanceType === 'check_in') {
-                smsMessageText += attendanceStatus === 'late'
-                  ? ` your child ${notif.studentName} checked IN LATE at school at ${timestampStr}.`
-                  : ` your child ${notif.studentName} checked IN at school successfully at ${timestampStr}.`;
-              } else {
-                smsMessageText += ` your child ${notif.studentName} checked OUT of school and is heading home at ${timestampStr}.`;
-              }
+              const smsMessageText = renderAttendanceSmsMessage(schoolSettings, attendanceType, {
+                studentName: notif.studentName,
+                schoolName: schoolSettings.schoolName,
+                time: timestampStr,
+                className: cls.name,
+                status: attendanceStatus,
+              });
 
               smsRows.push({
                 // One SMS per child, direction and day (double submissions can't double-charge)
-                dedupe_key: attendanceSmsKey(notif.studentId, attendanceType, now),
+                dedupe_key: attendanceSmsKey(notif.studentId, attendanceType, now, schoolSettings.timeZone),
                 school_id: cls.school_id,
                 recipient_type: 'parent',
                 recipient_id: notif.parentId,
@@ -655,7 +685,7 @@ export async function submitClassAttendance(
               });
             }
             const { queued, duplicates } = await queueNotifications(adminClient, smsRows);
-            console.log(`[Class Manual Attendance] Queued ${queued} SMS notifications for ${attendanceType} at ${timestampStr} EAT${duplicates ? ` (${duplicates} already queued today, skipped)` : ''}`);
+            console.log(`[Class Manual Attendance] Queued ${queued} SMS notifications for ${attendanceType} at ${timestampStr} (${schoolSettings.timeZone})${duplicates ? ` (${duplicates} already queued today, skipped)` : ''}`);
           }
         }
       }

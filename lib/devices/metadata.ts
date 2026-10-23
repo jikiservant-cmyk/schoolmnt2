@@ -62,6 +62,8 @@ export function parseDeviceMetadata(device: any): DeviceRecord {
     lateCutoffMinute: 0,
     timeZone: 'Africa/Kampala',
   };
+  let hasExplicitLateCutoff = false;
+  let hasExplicitTimeZone = false;
 
   // 1. Direct columns if present
   if (device.device_type) {
@@ -90,7 +92,15 @@ export function parseDeviceMetadata(device: any): DeviceRecord {
       const parsedCfg = typeof device.config === 'string' 
         ? JSON.parse(device.config) 
         : device.config;
-      config = { ...config, ...parsedCfg };
+      if (parsedCfg && typeof parsedCfg === 'object') {
+        if (parsedCfg.lateCutoffHour !== undefined || parsedCfg.lateCutoffMinute !== undefined) {
+          hasExplicitLateCutoff = parsedCfg.hasExplicitLateCutoff !== false;
+        }
+        if (parsedCfg.timeZone) {
+          hasExplicitTimeZone = parsedCfg.hasExplicitTimeZone !== false;
+        }
+        config = { ...config, ...parsedCfg };
+      }
     } catch {
       // Keep default
     }
@@ -105,7 +115,15 @@ export function parseDeviceMetadata(device: any): DeviceRecord {
       if (parsed.type) deviceType = parsed.type;
       if (parsed.secret) deviceSecret = parsed.secret;
       if (parsed.statusCodeMap) statusCodeMap = { ...statusCodeMap, ...parsed.statusCodeMap };
-      if (parsed.config) config = { ...config, ...parsed.config };
+      if (parsed.config && typeof parsed.config === 'object') {
+        if (parsed.config.lateCutoffHour !== undefined || parsed.config.lateCutoffMinute !== undefined) {
+          hasExplicitLateCutoff = parsed.config.hasExplicitLateCutoff !== false;
+        }
+        if (parsed.config.timeZone) {
+          hasExplicitTimeZone = parsed.config.hasExplicitTimeZone !== false;
+        }
+        config = { ...config, ...parsed.config };
+      }
     } catch {
       // Ignore parse failure
     }
@@ -135,6 +153,8 @@ export function parseDeviceMetadata(device: any): DeviceRecord {
       lateCutoffMinute: config.lateCutoffMinute ?? 0,
       timeZone: config.timeZone || 'Africa/Kampala',
       ...config,
+      hasExplicitLateCutoff,
+      hasExplicitTimeZone,
     }
   };
 }
