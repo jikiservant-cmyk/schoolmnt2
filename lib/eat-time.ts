@@ -154,9 +154,9 @@ export function getEATCurrentHour(date: Date = new Date()): number {
       hour: 'numeric',
       hour12: false,
     });
-    return parseInt(formatter.format(date), 10);
+    return parseInt(formatter.format(date), 10) % 24;
   } catch {
-    return date.getUTCHours() + 3;
+    return (date.getUTCHours() + 3) % 24;
   }
 }
 

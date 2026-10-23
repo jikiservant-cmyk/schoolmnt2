@@ -5,9 +5,31 @@ import { createAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 import { getOwnedClass, getOwnedDeviceBySerial, isUuid, normalizeSerial } from '@/lib/tenant';
+import { consumeRateLimit } from '@/lib/security/rate-limit';
+import { getClientIp } from '@/lib/security/request';
 
 const DEVICE_TYPES = ['zkteco_adms', 'hikvision_isapi', 'suprema_biostar', 'dahua_isapi', 'generic_webhook'];
 const PUSH_CATEGORIES = ['all', 'teachers', 'support_staff', 'all_students', 'class'];
+const DEFAULT_MAX_DEVICES_PER_SCHOOL = 20;
+const ADD_DEVICE_WINDOW_MS = 10 * 60 * 1000;
+
+function resolveMaxDevicesPerSchool(): number {
+  const raw = process.env.MAX_DEVICES_PER_SCHOOL;
+  if (raw !== undefined && raw.trim() !== '') {
+    const parsed = Number.parseInt(raw.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_MAX_DEVICES_PER_SCHOOL;
+}
+
+function resolveAddDeviceRateLimit(): number {
+  const raw = process.env.ADD_DEVICE_MAX_PER_10_MIN;
+  if (raw !== undefined && raw.trim() !== '') {
+    const parsed = Number.parseInt(raw.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 10;
+}
 
 function isValidTimeZone(tz: string) {
   try {
@@ -74,7 +96,34 @@ export async function addDeviceAction(formData: FormData) {
 
   try {
     const { schoolId } = await requireSchoolAdmin();
+    const ip = await getClientIp();
+    const maxAttempts = resolveAddDeviceRateLimit();
+    const schoolRl = consumeRateLimit(`add-device:school:${schoolId}`, maxAttempts, ADD_DEVICE_WINDOW_MS);
+    const ipRl = consumeRateLimit(`add-device:ip:${ip}`, maxAttempts * 2, ADD_DEVICE_WINDOW_MS);
+    if (!schoolRl.allowed || !ipRl.allowed) {
+      const waitSecs = Math.max(schoolRl.retryAfterSeconds, ipRl.retryAfterSeconds);
+      return {
+        error: `Too many device registration attempts. Please try again in ${Math.max(1, Math.ceil(waitSecs / 60))} minute(s).`,
+      };
+    }
+
     const adminClient = createAdminClient();
+
+    // Enforce per-school device quota BEFORE querying global serials (prevents unlimited serial enumeration too)
+    const maxDevices = resolveMaxDevicesPerSchool();
+    const { data: schoolDevices, error: quotaErr } = await adminClient
+      .from('devices')
+      .select('id')
+      .eq('school_id', schoolId);
+
+    if (quotaErr) {
+      return { error: 'Unable to verify school device quota. Please try again.' };
+    }
+    if ((schoolDevices?.length ?? 0) >= maxDevices) {
+      return {
+        error: `Device quota reached (maximum ${maxDevices} device(s) per school). Remove or deactivate an unused device, or contact support.`,
+      };
+    }
 
     // Check if device serial already exists
     const cleanSerial = normalizeSerial(serialNumber) as string;

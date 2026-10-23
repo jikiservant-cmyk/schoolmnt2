@@ -28,7 +28,7 @@ export function isWithinAttendanceSmsWindow(
     });
 
     const parts = formatter.formatToParts(date);
-    const hour = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10);
+    const hour = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10) % 24;
     const minute = parseInt(parts.find(p => p.type === 'minute')?.value || '0', 10);
     const totalMinutes = hour * 60 + minute;
 
@@ -103,7 +103,7 @@ export function getAttendanceStatusForCheckIn(
     });
 
     const parts = formatter.formatToParts(date);
-    const hour = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10);
+    const hour = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10) % 24;
     const minute = parseInt(parts.find(p => p.type === 'minute')?.value || '0', 10);
     const totalMinutes = hour * 60 + minute;
 
@@ -132,7 +132,7 @@ export function getCurrentAttendanceWindowMode(
       hour: 'numeric',
       hour12: false,
     });
-    const hour = parseInt(formatter.format(date), 10);
+    const hour = parseInt(formatter.format(date), 10) % 24;
     if (hour >= 13) {
       return 'check_out';
     }

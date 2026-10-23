@@ -1,7 +1,9 @@
 'use server';
 
+import { cookies, headers } from 'next/headers';
 import { checkSchoolAdmin } from '@/lib/auth-guard';
 import { consumeRateLimit, resetRateLimit } from '@/lib/security/rate-limit';
+import { getClientIp } from '@/lib/security/request';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
 import { 
@@ -10,6 +12,15 @@ import {
   getEatTodayRange,
   getCurrentAttendanceWindowMode
 } from '@/lib/attendance-window';
+import {
+  REGISTER_CAPABILITY_COOKIE,
+  REGISTER_PIN_COOKIE,
+  verifyRegisterCapabilityToken,
+  createVerifiedTeacherPinToken,
+  verifyTeacherPinSessionToken,
+  computePinHashTag,
+  buildCapabilityCookieOptions,
+} from '@/lib/security/register-token';
 import bcrypt from 'bcryptjs';
 
 export interface StudentAttendanceStatus {
@@ -30,12 +41,58 @@ const MAX_PIN_FAILURES = 5;
 const PIN_LOCK_MS = 10 * 60 * 1000;
 const GENERIC_PIN_ERROR = 'Invalid teacher or PIN.';
 
-async function requireAdminContext() {
-  const result = await checkSchoolAdmin();
-  if (!result.ok) {
-    return { ok: false as const, error: result.reason === 'unauthenticated' ? 'Unauthorized.' : 'Access denied.' };
+async function extractRefererToken(): Promise<string | null> {
+  try {
+    const h = await headers();
+    const ref = h.get('referer');
+    if (!ref) return null;
+    return new URL(ref, 'http://localhost').searchParams.get('token');
+  } catch {
+    return null;
   }
-  return { ok: true as const, supabase: result.supabase, schoolId: result.schoolId, user: result.user };
+}
+
+/**
+ * Resolves access to `/manual-attendance/[classId]` server actions:
+ *   1. Authenticated `school_admin` session (`mode: 'admin'`) — 100% compatible.
+ *   2. Verified Web-Crypto HMAC-SHA256 class capability token (`mode: 'token'`)
+ *      from HttpOnly cookie `sk_reg_cap` (or initial `?token=` query param).
+ */
+async function resolveRegisterContext(classId: string) {
+  if (typeof classId !== 'string' || !UUID_RE.test(classId)) {
+    return { ok: false as const, error: 'Invalid class.' };
+  }
+
+  const result = await checkSchoolAdmin();
+  if (result.ok) {
+    return {
+      ok: true as const,
+      mode: 'admin' as const,
+      schoolId: result.schoolId,
+      callerId: result.user.id,
+    };
+  }
+
+  const cookieStore = await cookies();
+  const rawToken =
+    cookieStore.get(REGISTER_CAPABILITY_COOKIE)?.value ||
+    (await extractRefererToken());
+
+  const cap = await verifyRegisterCapabilityToken(rawToken, classId);
+  if (cap) {
+    const ip = await getClientIp();
+    return {
+      ok: true as const,
+      mode: 'token' as const,
+      schoolId: cap.schoolId,
+      callerId: `cap:${cap.schoolId}:${cap.classId}:${ip}`,
+    };
+  }
+
+  return {
+    ok: false as const,
+    error: result.reason === 'unauthenticated' ? 'Unauthorized.' : 'Access denied.',
+  };
 }
 
 type VerifiedTeacher = {
@@ -163,21 +220,41 @@ function getDummyHash() {
 }
 
 export async function verifyTeacherPin(classId: string, teacherId: string, pin: string) {
-  const ctx = await requireAdminContext();
+  const ctx = await resolveRegisterContext(classId);
   if (!ctx.ok) return { success: false, error: ctx.error };
 
-  const result = await verifyTeacherPinScoped(ctx.schoolId, classId, teacherId, pin, ctx.user.id);
+  const result = await verifyTeacherPinScoped(ctx.schoolId, classId, teacherId, pin, ctx.callerId);
   if (!result.success) return { success: false, error: result.error };
+
+  const adminClient = createAdminClient();
+  const { data: staffRow } = await adminClient
+    .from('staff_users')
+    .select('pin_hash')
+    .eq('id', result.data.staffUserId)
+    .maybeSingle();
+
+  const { token: pinToken, maxAge } = await createVerifiedTeacherPinToken({
+    schoolId: ctx.schoolId,
+    classId,
+    teacherId: result.data.teacher.id,
+    staffUserId: result.data.staffUserId,
+    pinHash: staffRow?.pin_hash || null,
+  });
+
+  const cookieStore = await cookies();
+  cookieStore.set(REGISTER_PIN_COOKIE, pinToken, buildCapabilityCookieOptions(maxAge));
+
   return { success: true, teacher: result.data.teacher };
 }
 
 export async function getTeachersForClass(classId: string) {
-  const ctx = await requireAdminContext();
+  const ctx = await resolveRegisterContext(classId);
   if (!ctx.ok) return { success: false, error: ctx.error };
-  const { supabase, schoolId } = ctx;
-  if (typeof classId !== 'string' || !UUID_RE.test(classId)) return { success: false, error: 'Invalid class.' };
+  const { schoolId } = ctx;
 
-  const { data: cls } = await supabase
+  const adminClient = createAdminClient();
+
+  const { data: cls } = await adminClient
     .from('classes')
     .select('id')
     .eq('id', classId)
@@ -186,7 +263,7 @@ export async function getTeachersForClass(classId: string) {
 
   if (!cls) return { success: false, error: 'Class not found or access denied.' };
 
-  const { data: teachers } = await supabase
+  const { data: teachers } = await adminClient
     .from('people')
     .select('id, full_name')
     .eq('school_id', schoolId)
@@ -197,13 +274,67 @@ export async function getTeachersForClass(classId: string) {
   return { success: true, teachers: teachers || [] };
 }
 
-export async function getStudentsForClass(classId: string) {
-  const ctx = await requireAdminContext();
+export async function getStudentsForClass(
+  classId: string,
+  teacherId?: string,
+  pin?: string
+) {
+  const ctx = await resolveRegisterContext(classId);
   if (!ctx.ok) return { error: ctx.error };
-  const { supabase, schoolId } = ctx;
-  if (typeof classId !== 'string' || !UUID_RE.test(classId)) return { error: 'Invalid class.' };
+  const { schoolId } = ctx;
 
-  const { data: cls } = await supabase
+  const adminClient = createAdminClient();
+
+  // Scoped capability-token links MUST have a verified Teacher PIN before exposing student rosters.
+  if (ctx.mode === 'token') {
+    let pinVerified = false;
+    const cookieStore = await cookies();
+    const rawPinCookie = cookieStore.get(REGISTER_PIN_COOKIE)?.value;
+
+    if (rawPinCookie) {
+      const pinSession = await verifyTeacherPinSessionToken(rawPinCookie, schoolId, classId);
+      if (pinSession) {
+        const [{ data: staffRow }, { data: teacherRow }] = await Promise.all([
+          adminClient
+            .from('staff_users')
+            .select('id, pin_hash')
+            .eq('id', pinSession.staffUserId)
+            .maybeSingle(),
+          adminClient
+            .from('people')
+            .select('id, is_active')
+            .eq('id', pinSession.teacherId)
+            .eq('school_id', schoolId)
+            .eq('role', 'teacher')
+            .maybeSingle(),
+        ]);
+
+        if (staffRow && teacherRow && teacherRow.is_active !== false) {
+          if (!pinSession.pinTag) {
+            pinVerified = true;
+          } else {
+            const currentTag = staffRow.pin_hash ? await computePinHashTag(staffRow.pin_hash) : '';
+            if (currentTag === pinSession.pinTag) {
+              pinVerified = true;
+            }
+          }
+        }
+      }
+    }
+
+    if (!pinVerified && teacherId && pin) {
+      const inlineCheck = await verifyTeacherPinScoped(schoolId, classId, teacherId, pin, ctx.callerId);
+      if (inlineCheck.success) {
+        pinVerified = true;
+      }
+    }
+
+    if (!pinVerified) {
+      return { error: 'Teacher PIN verification is required before viewing the student roster.' };
+    }
+  }
+
+  const { data: cls } = await adminClient
     .from('classes')
     .select('id')
     .eq('id', classId)
@@ -212,7 +343,7 @@ export async function getStudentsForClass(classId: string) {
 
   if (!cls) return { error: 'Class not found or access denied.' };
 
-  const { data: students, error } = await supabase
+  const { data: students, error } = await adminClient
     .from('people')
     .select('id, full_name, device_user_id')
     .eq('class_id', classId)
@@ -233,7 +364,7 @@ export async function getStudentsForClass(classId: string) {
   const { startIso, endIso } = getEatTodayRange();
   const studentIds = students.map(s => s.id);
 
-  const { data: logs } = await supabase
+  const { data: logs } = await adminClient
     .from('attendance_logs')
     .select('person_id, attendance_type, status, occurred_at')
     .eq('school_id', schoolId)
@@ -303,9 +434,9 @@ export async function submitClassAttendance(
   attendanceType: 'check_in' | 'check_out' = 'check_in',
   pin: string = ''
 ) {
-  const ctx = await requireAdminContext();
+  const ctx = await resolveRegisterContext(classId);
   if (!ctx.ok) return { success: false, error: ctx.error };
-  const { supabase, schoolId } = ctx;
+  const { schoolId } = ctx;
 
   // Strict input validation — these arrive straight from the client.
   if (attendanceType !== 'check_in' && attendanceType !== 'check_out') {
@@ -324,13 +455,13 @@ export async function submitClassAttendance(
   const adminClient = createAdminClient();
 
   // Re-verify Teacher PIN server-side (scoped to this school)
-  const pinVerification = await verifyTeacherPinScoped(schoolId, classId, teacherId, pin, ctx.user.id);
+  const pinVerification = await verifyTeacherPinScoped(schoolId, classId, teacherId, pin, ctx.callerId);
   if (!pinVerification.success) {
     return { success: false, error: pinVerification.error || 'Invalid Teacher PIN.' };
   }
 
   // Get class and school info, scoped by schoolId
-  const { data: cls } = await supabase
+  const { data: cls } = await adminClient
     .from('classes')
     .select('id, name, school_id')
     .eq('id', classId)

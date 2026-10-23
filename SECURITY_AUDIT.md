@@ -762,4 +762,56 @@ All requested existing suites were rerun with migration 09 enabled. Payments, SM
 | `eslint` | Passed with 0 errors (one existing `loadData` hook-dependency warning in `app/dashboard/attendance/page.tsx`) |
 | `next build` | Passed |
 
-**Go-live:** run migrations **05 → 06 → 07 → 08 → 09** (back up first; run 09 outside gate hours).
+**Go-live:** run migrations **05 → 06 → 07 → 08 → 09 → 10** (back up first; run 09 outside gate hours).
+
+# Part 12: Round 12 Production Hardening, Scoped Capability Tokens & Zero-Vulnerability Supply Chain
+
+## Findings & Fixes (all 11 resolved)
+
+1. **Guardian linkage column & error propagation (`app/dashboard/people/actions.ts`):**
+   - Fixed `student_parents` fallback insert column from nonexistent `is_primary` to `is_primary_contact: true`.
+   - Checked `{ error }` on both `parents` and `student_parents` lookups/inserts, rolling back partial person rows and failing loudly instead of returning `guardian_linked: true` when guardian linking fails.
+   - Sanitized leading formula prefixes (`=`, `+`, `-`, `@`, control characters) on person and guardian names and enforced canonical numeric enrollment PIN collision checks (`0555` vs `555`) in both `addPersonAction` and `updatePersonDeviceUserIdAction`.
+2. **Production schema reconciliation & missing-column fallback resilience (`supabase_migrations/10_round12_production_hardening.sql`, `utils/zkteco/commandQueue.ts`, `app/iclock/devicecmd/route.ts`, `lib/devices/processor.ts`, `app/mark-attendance/actions.ts`, `security/multi-tenant-lab/seed.js`):**
+   - Added idempotent migration `10_round12_production_hardening.sql` reconciling 19 columns across `school.devices`, `school.device_commands`, `school.device_logs`, and `school.person_credentials`, adding unique index `person_credentials_school_type_val_uniq`, and refreshing column-level `SELECT` grants while keeping secret columns (`pin_hash`, `failed_attempts`, `locked_until`, `device_secret`, `device_secret_hash`) strictly server-only and preserving zero client writes on `school.staff_users` per `06_money_lockdown.sql`.
+   - Added `PGRST204` missing-column fallback loops in `commandQueue.ts`, `devicecmd/route.ts`, `processor.ts`, and `mark-attendance/actions.ts` so deployments stay operational even before migration `10` runs (`MIG10=0` + `SHIM_NO_AUTOCOL=1` verified).
+3. **Legacy ADMS proxy lockdown (`app/legacy-adms-proxy/server.js`):**
+   - Removed the hardcoded dev Cloud Run URL (`UPSTREAM_URL` required at startup), restricted paths/methods strictly to `GET|POST /iclock/cdata`, `GET /iclock/getrequest`, and `POST /iclock/devicecmd`, stripped incoming `x-forwarded-for`, `x-real-ip`, `x-device-token`, `authorization`, and `cookie` headers, enforced a 1 MiB body limit (`413`) and 15 s upstream timeout, and injected per-serial `X-Device-Token` values from `DEVICE_TOKENS_JSON` (falling back to `ZKTECO_DEVICE_SECRET`).
+4. **Trusted proxy client IP extraction, hardware GoTrue bypass & relative redirects (`lib/security/request.ts`, `lib/devices/gateway.ts`, `middleware.ts`, `utils/supabase/middleware.ts`, `scripts/start-standalone.mjs`):**
+   - Hardened `getClientIp` to ignore spoofed `X-Forwarded-For` headers unless running behind a verified proxy (`K_SERVICE`, `VERCEL`, or `TRUSTED_PROXY_HOPS`) and to read the right-most external hop rather than `split(',')[0]`.
+   - Bypassed `supabase.auth.getUser()` round-trips on `/iclock/*`, `/api/devices/*`, and `/api/webhooks/*`.
+   - Switched `middleware.ts` to `runtime: 'nodejs'` (ensuring live runtime secret resolution even on zero-secret Docker builds) and enforced host-header-immune relative `Location: /login` and `Location: /dashboard` 307 redirects preserving `Set-Cookie`.
+5. **Web-Crypto HMAC-SHA256 scoped capability tokens for classroom teachers & gate kiosks (`lib/security/register-token.ts`, `app/manual-attendance/[classId]/{layout.tsx,page.tsx,actions.ts}`, `app/mark-attendance/{layout.tsx,actions.ts}`, `app/dashboard/classes/{page.tsx,CopyLinkButton.tsx}`, `app/dashboard/attendance/{actions.ts,page.tsx}`):**
+   - Classroom teachers and gate kiosks now open `/manual-attendance/[classId]?token=...` (`sk_reg_cap` HttpOnly cookie) and `/mark-attendance?token=...` (`sk_kiosk_cap` HttpOnly cookie) without sharing the full `school_admin` session cookie.
+   - Student rosters on capability-scoped register sessions are withheld until a valid Teacher PIN is verified (`sk_reg_pin` cookie bound to `pin_hash` digest so PIN resets immediately revoke prior sessions), while `school_admin` sessions retain full compatibility.
+6. **PWA service worker v3 & logout `Clear-Site-Data` (`public/sw.js`, `app/api/logout/route.ts`):**
+   - Bumped service worker cache to `smartskoolz-pwa-v3`, purged stale caches on `activate`, removed `/dashboard` from `STATIC_ASSETS`, bypassed all dynamic/authenticated/API/hardware paths (`/`, `/dashboard*`, `/manual-attendance*`, `/mark-attendance*`, `/login`, `/signup`, `/api/*`, `/iclock/*`, `/auth/*`), and added `Clear-Site-Data: "cache", "cookies", "storage"` + capability cookie expiration to `POST /api/logout`.
+7. **Zero-dependency OpenXML `.xlsx` / Blob CSV export & dependency upgrades (`lib/security/safe-spreadsheet.ts`, `app/dashboard/attendance/AttendanceReports.tsx`, `package.json`, `scripts/start-standalone.mjs`):**
+   - Replaced vulnerable `xlsx@0.18.5` with a zero-dependency ECMA-376 OpenXML `.xlsx` + RFC 4180 `Blob` CSV builder neutralizing formula injection (`=`, `+`, `-`, `@`, `\t`, `\r`) and fixing `#` data-URI truncation.
+   - Removed unused `firebase-tools`, upgraded `next` & `eslint-config-next` to `15.5.28` and `sharp` to `^0.35.5`, added `scripts/start-standalone.mjs` for `"output": "standalone"`, and regenerated `package-lock.json` (`npm audit --omit=dev`: **0 vulnerabilities**; `npm audit --audit-level=critical`: **0 critical**).
+8. **Device quotas, invite gate, multi-gate `ALL` broadcasts, midnight `% 24` formatting & repository hygiene (`app/dashboard/devices/actions.ts`, `app/signup/actions.ts`, `app/iclock/getrequest/route.ts`, `lib/devices/processor.ts`, `lib/attendance-window.ts`, `lib/eat-time.ts`, `.gitignore`):**
+   - Added rate limiting and `MAX_DEVICES_PER_SCHOOL` quota enforcement to `addDeviceAction`, optional timing-safe `SIGNUP_INVITE_CODE` gating to `signupAction`, per-gate `delivered_device_ids` tracking on `target_serial = 'ALL'` broadcasts in `getrequest`, exact-match-first + canonical ambiguity guard on numeric PIN matching in `processor.ts`, `% 24` normalization on all `hour12: false` formatters, and purged tracked debug/cache artifacts (`fix-cdata.js`, `fix-route.js`, `.env.test.local`, `node-compile-cache/`).
+
+## Verification Summary (PostgreSQL 17.5 + `SHIM_NO_AUTOCOL=1` + Standalone Next.js 15.5.28)
+
+| Suite | Result |
+|---|---|
+| `round12-check.mjs` (`MIG10=0` fallback + `MIG10=1` full suite) | **35/35 PASSED** |
+| `rls-attack.mjs` | **0/32 vulnerable** |
+| `attack.mjs` (strict mode `ZKTECO_GLOBAL_SECRET_FALLBACK=false`) | **0/42 vulnerable** |
+| `regress.mjs` | **17/17 OK** |
+| `device-attack.mjs` | **0/15 vulnerable** |
+| `device-names-check.mjs` | **17/17 OK** |
+| `device-push-categories-check.mjs` | **45/45 OK** |
+| `double-thumb-check.mjs` / `double-thumb-migration-check.mjs` | **10/10 PASS** / **9/9 PASS** |
+| `payments-attack.mjs` (dedicated `NAJIKI_WEBHOOK_SECRET`) | **0/20 vulnerable; 0 legit failures** |
+| `rogue-attack.mjs` | **0/21 vulnerable; 0 legit failures** |
+| `round4-attack.mjs` | **0/5 vulnerable; 0 legit failures** |
+| `pay-rls-check.mjs` | **0/8 vulnerable** |
+| `money-reconcile.mjs` | **All money/reconciliation checks OK** |
+| `topup-limit-check.mjs` | **PASS: 6 allowed, then refused** |
+| `legacy-devlogs.mjs` | **punch 200 OK \| device_logs +1 \| attendance +1** |
+| `flows-check.mjs` / `render-check.mjs` / `link-crawl.mjs` / `orphan-check.mjs` | **25/25 OK** / **5/5 OK** / **No problems found** / **No leak** |
+| `security/pentest/attack.mjs` & `security/pentest/regress.mjs` | **15/15 SECURE** & **14/14 PASS** |
+| `npm ci` + `npm audit --omit=dev` + `eslint` + `tsc --noEmit` + `npm run build` | **0 prod vulnerabilities, 0 errors, clean standalone build** |
+

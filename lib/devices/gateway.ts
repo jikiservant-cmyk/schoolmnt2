@@ -4,6 +4,7 @@ import { parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
 import { normalizeSerial } from '@/lib/tenant';
 import { consumeRateLimit, isRateLimited } from '@/lib/security/rate-limit';
+import { extractClientIpFromHeaders } from '@/lib/security/request';
 import type { DeviceAdapter, DeviceRecord } from '@/lib/devices/types';
 
 /**
@@ -19,9 +20,7 @@ const AUTH_FAIL_IP_LIMIT = 100;
 const AUTH_FAIL_WINDOW_MS = 10 * 60 * 1000;
 
 export function deviceClientIp(req: Request): string {
-  const xff = req.headers.get('x-forwarded-for');
-  if (xff) return xff.split(',')[0].trim().slice(0, 64) || 'unknown';
-  return (req.headers.get('x-real-ip') || 'unknown').slice(0, 64);
+  return extractClientIpFromHeaders(req.headers);
 }
 
 /**

@@ -1,35 +1,33 @@
-# ZKTeco Legacy ADMS HTTP-to-HTTPS Proxy
+# ZKTeco ADMS HTTP-to-HTTPS Reverse Proxy (`legacy-adms-proxy`)
 
-Because Google Cloud physically rejects unencrypted HTTP connections at its front door, legacy ZKTeco devices (which lack HTTPS/Port settings) cannot connect directly to it.
+Older ZKTeco biometric terminals speak plain HTTP on port 80 and cannot negotiate modern TLS directly. This zero-dependency Node.js proxy runs on a school LAN box or dedicated VM and safely forwards ADMS traffic to your SmartSkoolz HTTPS origin.
 
-This small Node.js proxy server solves the problem by acting as a "translator".
+## Security Controls
 
-## How it works:
-1. The ZKTeco device sends plain `HTTP` traffic (Port 80) to this proxy running on a local PC.
-2. The proxy catches it, wraps it in secure `HTTPS` (Port 443), and forwards it to Google Cloud.
-3. Google Cloud replies securely to the proxy, which then hands it back to the ZKTeco device.
+- **Explicit Upstream Configuration**: Requires `UPSTREAM_URL` (no hardcoded staging or cloud URLs).
+- **Strict ADMS Endpoint Allowlist**: Only forwards:
+  - `GET /iclock/cdata` and `POST /iclock/cdata`
+  - `GET /iclock/getrequest`
+  - `POST /iclock/devicecmd`
+  All other paths return `403 Forbidden`; disallowed HTTP verbs return `405 Method Not Allowed`.
+- **Header Sanitization**: Strips incoming `X-Forwarded-For`, `X-Real-IP`, `X-Device-Token`, `Authorization`, and `Cookie` headers so LAN clients cannot spoof client IPs, forge admin sessions, or smuggle tokens.
+- **Per-Device Authentication Injection**: Injects `X-Device-Token` per hardware serial number from `DEVICE_TOKENS_JSON` (falling back to `ZKTECO_DEVICE_SECRET` if configured).
+- **Resource Limits**: Enforces a 1 MiB body limit (`413`) and a 15-second upstream timeout (`504`).
 
-## Instructions to Run
+## Configuration
 
-1. Copy this entire `legacy-adms-proxy` folder onto a Windows PC, Mac, or Linux computer (like a Raspberry Pi) that sits on the **same local Wi-Fi or Ethernet network** as the ZKTeco device.
-2. Ensure you have [Node.js](https://nodejs.org/) installed on that computer.
-3. Open a Command Prompt or Terminal as **Administrator / Sudo** (because running on Port 80 requires elevated privileges).
-4. Navigate to the folder:
-   ```bash
-   cd legacy-adms-proxy
-   ```
-5. Run the proxy server:
-   ```bash
-   npm start
-   ```
+| Environment Variable | Required | Description |
+| --- | --- | --- |
+| `UPSTREAM_URL` | **Yes** | Target SmartSkoolz origin, e.g. `https://attendance.school.example.com` |
+| `DEVICE_TOKENS_JSON` | Recommended | JSON object mapping serial numbers to per-device tokens, e.g. `{"SNA0001":"tok_gate_1","SNA0002":"tok_gate_2"}` |
+| `ZKTECO_DEVICE_SECRET` | Optional | Fallback token when a serial is not listed in `DEVICE_TOKENS_JSON` |
+| `PORT` | Optional | Local TCP port to listen on (defaults to `80`) |
+| `BIND_HOST` | Optional | Bind address (defaults to `0.0.0.0`) |
 
-## Configuring the ZKTeco F18 Device
+## Running
 
-Once the proxy says it is running, it will tell you what to do next:
-
-1. Find the local IP address of the computer running the proxy (e.g., `192.168.1.55`).
-2. Go to your F18 Device Menu: **Comm. -> Cloud Server Setting**
-3. **Enable Domain Name:** OFF
-4. **Server Address:** `192.168.1.55` (The IP of the proxy computer).
-
-The device will now connect to the proxy, which will securely route the data to your cloud dashboard!
+```bash
+export UPSTREAM_URL="https://attendance.school.example.com"
+export DEVICE_TOKENS_JSON='{"SNA0001":"replace-with-device-token"}'
+sudo -E node server.js
+```

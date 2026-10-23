@@ -39,6 +39,10 @@ export default function ManualAttendancePage() {
   const [teacher, setTeacher] = useState<{ id: string; full_name: string } | null>(null);
   
   useEffect(() => {
+    if (typeof window !== 'undefined' && window.location.search.includes('token=')) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
+
     async function loadTeachers() {
       try {
         const res = await getTeachersForClass(classId);
@@ -69,11 +73,15 @@ export default function ManualAttendancePage() {
   const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'info' | 'error'; message: string } | null>(null);
 
-  const fetchStudents = useCallback(async (isInitial = false) => {
+  const fetchStudents = useCallback(async (isInitial = false, overrideTeacherId?: string, overridePin?: string) => {
     if (!classId) return;
     if (!isInitial) setIsRefreshing(true);
     try {
-      const res = await getStudentsForClass(classId);
+      const res = await getStudentsForClass(
+        classId,
+        overrideTeacherId ?? selectedTeacherId,
+        overridePin ?? pin
+      );
       if (res.students) {
         setStudents(res.students);
         setLastRefreshedAt(new Date());
@@ -128,7 +136,7 @@ export default function ManualAttendancePage() {
       const res = await verifyTeacherPin(classId, selectedTeacherId, pin);
       if (res.success && res.teacher) {
         setTeacher(res.teacher);
-        await fetchStudents(true);
+        await fetchStudents(true, selectedTeacherId, pin);
       } else {
         setError(res.error || 'Invalid PIN');
       }

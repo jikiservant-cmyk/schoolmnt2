@@ -1,5 +1,11 @@
+import { cookies } from 'next/headers';
 import { createClient } from '@/utils/supabase/server';
 import { NextResponse, type NextRequest } from 'next/server';
+import {
+  REGISTER_CAPABILITY_COOKIE,
+  REGISTER_PIN_COOKIE,
+  KIOSK_CAPABILITY_COOKIE,
+} from '@/lib/security/register-token';
 
 /**
  * Reject cross-site form posts (login/logout CSRF). Browsers always send
@@ -29,11 +35,22 @@ export async function POST(request: NextRequest) {
   // Revoke the refresh token server-side, then the cookie store clears sb-* cookies.
   await supabase.auth.signOut();
 
+  // Also clear any classroom register or gate kiosk capability cookies in this browser.
+  const cookieStore = await cookies();
+  for (const name of [REGISTER_CAPABILITY_COOKIE, REGISTER_PIN_COOKIE, KIOSK_CAPABILITY_COOKIE]) {
+    cookieStore.set(name, '', { maxAge: 0, path: '/', httpOnly: true, sameSite: 'lax' });
+  }
+
   // Relative Location: request.url carries the server's bind address
   // (e.g. http://0.0.0.0:3000) behind a proxy, which sent users to a dead page.
+  // Clear-Site-Data purges shared browser HTTP/SW caches, cookies, and storage immediately on logout.
   return new NextResponse(null, {
     status: 303,
-    headers: { Location: '/login', 'Cache-Control': 'no-store' },
+    headers: {
+      Location: '/login',
+      'Cache-Control': 'no-store',
+      'Clear-Site-Data': '"cache", "cookies", "storage"',
+    },
   });
 }
 

@@ -53,6 +53,7 @@ export default function AttendancePage() {
   const [topUpMessage, setTopUpMessage] = useState('');
   const [initialBalance, setInitialBalance] = useState<number>(0);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [kioskToken, setKioskToken] = useState<string>('');
 
   // Foldable / Collapsible date groups state (empty set means all groups are expanded by default)
   const [collapsedStudentDateKeys, setCollapsedStudentDateKeys] = useState<Set<string>>(() => new Set());
@@ -110,6 +111,7 @@ export default function AttendancePage() {
         setPeople(data.people || []);
         setClasses(data.classes || []);
         setSchool(data.school || null);
+        if ((data as any).kioskToken) setKioskToken((data as any).kioskToken);
         setError(null);
       }
     } catch (err: any) {
@@ -161,7 +163,9 @@ export default function AttendancePage() {
 
   const copyTeacherLink = async () => {
     const origin = window.location.origin;
-    const url = `${origin}/mark-attendance`;
+    const url = kioskToken
+      ? `${origin}/mark-attendance?token=${encodeURIComponent(kioskToken)}`
+      : `${origin}/mark-attendance`;
     try {
       await navigator.clipboard.writeText(url);
       setCopiedLink(true);

@@ -3,7 +3,30 @@ import { parseDeviceMetadata } from '@/lib/devices/metadata';
 import { getDeviceAdapter } from '@/lib/devices/registry';
 import { zktecoDeleteUserCommand } from '@/lib/devices/adapters/zkteco';
 import { EnrollPersonInput } from '@/lib/devices/types';
-import { UUID_RE, normalizeSerial } from '@/lib/tenant';
+import { UUID_RE, normalizeSerial, extractMissingColumn } from '@/lib/tenant';
+
+async function insertWithMissingColumnFallback(
+  admin: ReturnType<typeof createAdminClient>,
+  table: string,
+  initialRow: Record<string, unknown>,
+  selectCols?: string
+): Promise<{ data: any; error: any }> {
+  const row: Record<string, unknown> = { ...initialRow };
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const query = admin.from(table).insert(row);
+    const res = selectCols ? await query.select(selectCols).maybeSingle() : await query;
+    if (!res.error) return res;
+    const missing = extractMissingColumn(res.error);
+    if (missing && Object.prototype.hasOwnProperty.call(row, missing)) {
+      console.warn(`[Device Command Queue] ${table}.${missing} missing; retrying without ${missing}`);
+      delete row[missing];
+      continue;
+    }
+    return res;
+  }
+  const query = admin.from(table).insert(row);
+  return selectCols ? query.select(selectCols).maybeSingle() : query;
+}
 
 /**
  * Resolves all active device records registered to a given school.
@@ -98,9 +121,10 @@ export async function enqueueDeviceCommand(
       if (dev.device_type) vendorProtocol = dev.device_type;
     }
 
-    const { data: cmdRow, error: cmdErr } = await admin
-      .from('device_commands')
-      .insert({
+    const { data: cmdRow, error: cmdErr } = await insertWithMissingColumnFallback(
+      admin,
+      'device_commands',
+      {
         school_id: schoolId,
         device_id: deviceId,
         target_serial: cleanSn,
@@ -109,9 +133,9 @@ export async function enqueueDeviceCommand(
         payload: options?.payload || { raw_command: command, commandId },
         raw_command: command,
         status: 'pending'
-      })
-      .select('id')
-      .maybeSingle();
+      },
+      'id'
+    );
 
     if (!cmdErr && cmdRow?.id) {
       return { success: true, commandId: cmdRow.id };
@@ -119,17 +143,15 @@ export async function enqueueDeviceCommand(
     console.warn('[Device Command Queue] device_commands insert failed, trying scoped device_logs fallback:', cmdErr?.message);
 
     // Legacy fallback queue read by /iclock/getrequest — always tagged with the owning school.
-    const { error: logErr } = await admin
-      .from('device_logs')
-      .insert({
-        school_id: schoolId,
-        device_id: deviceId,
-        raw_serial_number: cleanSn,
-        device_user_id: 'COMMAND',
-        event_timestamp: new Date().toISOString(),
-        payload: { cmd: command, commandId, ...(options?.payload || {}) },
-        processed: false,
-      });
+    const { error: logErr } = await insertWithMissingColumnFallback(admin, 'device_logs', {
+      school_id: schoolId,
+      device_id: deviceId,
+      raw_serial_number: cleanSn,
+      device_user_id: 'COMMAND',
+      event_timestamp: new Date().toISOString(),
+      payload: { cmd: command, commandId, ...(options?.payload || {}) },
+      processed: false,
+    });
     if (logErr) {
       console.warn('[Device Command Queue] device_logs fallback failed:', logErr.message);
       return { success: false, commandId };

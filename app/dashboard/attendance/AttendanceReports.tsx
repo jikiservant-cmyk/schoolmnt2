@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useMemo } from 'react';
-import * as XLSX from 'xlsx';
+import { downloadSafeXlsx, downloadSafeCsv } from '@/lib/security/safe-spreadsheet';
 import { 
   FileText, 
   Download, 
@@ -317,10 +317,10 @@ export default function AttendanceReports({
     }
   }, [reportMode, selectedClassId, selectedPersonId, selectedGroup, people, classMap]);
 
-  // EXCEL (.XLSX) Export Handler
+  // EXCEL (.XLSX) Export Handler (Zero-dependency native OpenXML with formula-injection neutralization)
   const handleExportExcel = () => {
     try {
-      const wb = XLSX.utils.book_new();
+      const sheets = [];
 
       if (reportMode === 'class_daily_sheet') {
         const headerInfo = [
@@ -349,9 +349,10 @@ export default function AttendanceReports({
           '' // Empty for remarks
         ]);
 
-        const wsData = [...headerInfo, tableHeaders, ...tableRows];
-        const ws = XLSX.utils.aoa_to_sheet(wsData);
-        XLSX.utils.book_append_sheet(wb, ws, 'Class_Daily_Register');
+        sheets.push({
+          name: 'Class_Daily_Register',
+          rows: [...headerInfo, tableHeaders, ...tableRows],
+        });
       } else {
         const headerInfo = [
           ['NA\'JIKI TECH ATTENDANCE AUDIT REPORT'],
@@ -380,13 +381,14 @@ export default function AttendanceReports({
           ];
         });
 
-        const wsData = [...headerInfo, tableHeaders, ...tableRows];
-        const ws = XLSX.utils.aoa_to_sheet(wsData);
-        XLSX.utils.book_append_sheet(wb, ws, 'Attendance_Audit');
+        sheets.push({
+          name: 'Attendance_Audit',
+          rows: [...headerInfo, tableHeaders, ...tableRows],
+        });
       }
 
       const fileName = `NajikiTech_${targetLabel.replace(/[^a-zA-Z0-9]/g, '_')}_${reportMode === 'class_daily_sheet' ? selectedDayDate : datePreset}.xlsx`;
-      XLSX.writeFile(wb, fileName);
+      downloadSafeXlsx(fileName, sheets);
     } catch (err) {
       console.error('Failed to export Excel file:', err);
       alert('Could not generate Excel export. Falling back to CSV export.');
@@ -394,7 +396,7 @@ export default function AttendanceReports({
     }
   };
 
-  // CSV Export Handler
+  // CSV Export Handler (Blob URL + formula-injection neutralization, never truncated by `#`)
   const handleExportCSV = () => {
     if (reportMode === 'class_daily_sheet') {
       if (classDailyRoster.length === 0) {
@@ -404,23 +406,19 @@ export default function AttendanceReports({
       const headers = ['Roll Number', 'Student Name', 'Admission / Device UID', 'Class', 'Arrival Time', 'Status', 'Channel', 'Parent Phone'];
       const rows = classDailyRoster.map(r => [
         r.rollNumber,
-        `"${r.fullName.replace(/"/g, '""')}"`,
-        `"${r.deviceUserId}"`,
-        `"${r.className}"`,
-        `"${r.checkInTime}"`,
-        `"${r.status.toUpperCase()}"`,
-        `"${r.checkInType}"`,
-        `"${r.phone}"`
-      ].join(','));
+        r.fullName,
+        r.deviceUserId,
+        r.className,
+        r.checkInTime,
+        r.status.toUpperCase(),
+        r.checkInType,
+        r.phone,
+      ]);
 
-      const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows].join('\n');
-      const encodedUri = encodeURI(csvContent);
-      const link = document.createElement('a');
-      link.setAttribute('href', encodedUri);
-      link.setAttribute('download', `Class_Register_${classMap.get(selectedClassId) || 'Class'}_${selectedDayDate}.csv`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      downloadSafeCsv(
+        `Class_Register_${classMap.get(selectedClassId) || 'Class'}_${selectedDayDate}.csv`,
+        [headers, ...rows]
+      );
     } else {
       if (filteredReportLogs.length === 0) {
         alert('No attendance logs to export for this report.');
@@ -438,25 +436,21 @@ export default function AttendanceReports({
         const uid = log.people?.device_user_id || 'N/A';
 
         return [
-          `"${dateStr}"`,
-          `"${timeStr}"`,
-          `"${name.replace(/"/g, '""')}"`,
-          `"${role}"`,
-          `"${className}"`,
-          `"${status.toUpperCase()}"`,
-          `"${type}"`,
-          `"${uid}"`
-        ].join(',');
+          dateStr,
+          timeStr,
+          name,
+          role,
+          className,
+          status.toUpperCase(),
+          type,
+          uid,
+        ];
       });
 
-      const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows].join('\n');
-      const encodedUri = encodeURI(csvContent);
-      const link = document.createElement('a');
-      link.setAttribute('href', encodedUri);
-      link.setAttribute('download', `Attendance_Report_${targetLabel.replace(/[^a-zA-Z0-9]/g, '_')}_${datePreset}.csv`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      downloadSafeCsv(
+        `Attendance_Report_${targetLabel.replace(/[^a-zA-Z0-9]/g, '_')}_${datePreset}.csv`,
+        [headers, ...rows]
+      );
     }
   };
 

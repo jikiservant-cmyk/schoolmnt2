@@ -1,5 +1,6 @@
 node_modules/
 .next/
+node-compile-cache/
 coverage/
 .DS_Store
 *.log

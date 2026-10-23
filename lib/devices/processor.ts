@@ -2,7 +2,18 @@ import { AttendanceEvent, DeviceRecord } from './types';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { isWithinAttendanceSmsWindow } from '@/lib/attendance-window';
 import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
-import { isMissingColumnError } from '@/lib/tenant';
+import { isMissingColumnError, extractMissingColumn } from '@/lib/tenant';
+
+const AMBIGUOUS_PIN = Symbol('AMBIGUOUS_PIN');
+type PinCandidate = any | typeof AMBIGUOUS_PIN;
+
+function canonicalDevicePin(raw: string): string {
+  const clean = raw.trim().toLowerCase();
+  if (/^\d+$/.test(clean)) {
+    return clean.replace(/^0+/, '') || '0';
+  }
+  return clean;
+}
 
 export interface ProcessEventsResult {
   totalReceived: number;
@@ -85,26 +96,49 @@ export async function processAttendanceEvents(
   }
 
   const people = peopleData || [];
-  const personMap = new Map<string, any>();
-  for (const p of people) {
-    const pUid = (p.device_user_id || '').trim().toLowerCase();
-    if (!pUid) continue;
-    const pNum = pUid.replace(/^0+/, '');
-    const pPadded = pUid.padStart(4, '0');
+  const exactMap = new Map<string, PinCandidate>();
+  const canonicalMap = new Map<string, PinCandidate>();
 
-    if (!personMap.has(pUid)) personMap.set(pUid, p);
-    if (!personMap.has(pNum)) personMap.set(pNum, p);
-    if (!personMap.has(pPadded)) personMap.set(pPadded, p);
+  const registerPin = (rawUid: string | null | undefined, personObj: any) => {
+    const clean = (rawUid || '').trim().toLowerCase();
+    if (!clean) return;
+
+    const prevExact = exactMap.get(clean);
+    if (prevExact === undefined) {
+      exactMap.set(clean, personObj);
+    } else if (prevExact !== AMBIGUOUS_PIN && prevExact.id !== personObj.id) {
+      exactMap.set(clean, AMBIGUOUS_PIN);
+    }
+
+    const canon = canonicalDevicePin(clean);
+    const prevCanon = canonicalMap.get(canon);
+    if (prevCanon === undefined) {
+      canonicalMap.set(canon, personObj);
+    } else if (prevCanon !== AMBIGUOUS_PIN && prevCanon.id !== personObj.id) {
+      canonicalMap.set(canon, AMBIGUOUS_PIN);
+    }
+  };
+
+  for (const p of people) {
+    registerPin(p.device_user_id, p);
   }
 
-  // Also resolve from school.person_credentials (multi-vendor credentials)
+  // Also resolve from school.person_credentials (multi-vendor credentials), tolerating older schemas without `is_active`
   try {
-    const { data: credsData } = await supabase
+    let credsQuery = await supabase
       .from('person_credentials')
       .select('identifier_value, person:person_id(id, school_id, full_name, role, class_id, is_active, device_user_id, classes:class_id(id, name))')
       .eq('school_id', device.school_id)
       .eq('is_active', true);
 
+    if (credsQuery.error && extractMissingColumn(credsQuery.error) === 'is_active') {
+      credsQuery = await supabase
+        .from('person_credentials')
+        .select('identifier_value, person:person_id(id, school_id, full_name, role, class_id, is_active, device_user_id, classes:class_id(id, name))')
+        .eq('school_id', device.school_id);
+    }
+
+    const credsData = credsQuery.data;
     if (credsData) {
       for (const c of credsData) {
         if (!c.identifier_value || !c.person) continue;
@@ -117,20 +151,14 @@ export async function processAttendanceEvents(
           continue;
         }
 
-        const cVal = c.identifier_value.trim().toLowerCase();
-        const cNum = cVal.replace(/^0+/, '');
-        const cPadded = cVal.padStart(4, '0');
-
-        if (!personMap.has(cVal)) personMap.set(cVal, pObj);
-        if (!personMap.has(cNum)) personMap.set(cNum, pObj);
-        if (!personMap.has(cPadded)) personMap.set(cPadded, pObj);
+        registerPin(c.identifier_value, pObj);
       }
     }
-  } catch (credErr) {
+  } catch {
     // Non-blocking fallback if person_credentials query fails
   }
 
-  // 2. Filter and match events
+  // 2. Filter and match events (exact-match-first + ambiguity guard on canonical fallback)
   const matchedList: {
     event: AttendanceEvent;
     person: any;
@@ -140,9 +168,18 @@ export async function processAttendanceEvents(
 
   for (const ev of events) {
     const cleanPin = ev.person_external_id.trim().toLowerCase();
-    const person = personMap.get(cleanPin) || 
-                   personMap.get(cleanPin.replace(/^0+/, '')) || 
-                   personMap.get(cleanPin.padStart(4, '0'));
+    let candidate: PinCandidate | undefined = exactMap.get(cleanPin);
+    if (candidate === undefined) {
+      candidate = canonicalMap.get(canonicalDevicePin(cleanPin));
+    }
+
+    if (candidate === AMBIGUOUS_PIN) {
+      console.warn(`[Device Processor] Ambiguous normalized PIN "${cleanPin}" matches multiple people on device ${device.serial_number}; skipping`);
+      result.unrecognizedCount++;
+      continue;
+    }
+
+    const person = candidate;
 
     if (person && person.is_active === false) {
       // Deactivated (left / expelled / suspended) people must not be recorded or trigger SMS.
@@ -285,7 +322,7 @@ export async function processAttendanceEvents(
     if (attendanceType === 'check_in') {
       try {
         const parts = localTimeFormatter.formatToParts(item.logDate);
-        const localH = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10);
+        const localH = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10) % 24;
         const localM = parseInt(parts.find(p => p.type === 'minute')?.value || '0', 10);
         isLate = (localH > lateCutoffHour) || (localH === lateCutoffHour && localM > lateCutoffMinute);
       } catch {
@@ -323,14 +360,29 @@ export async function processAttendanceEvents(
     }
   }
 
-  // 5. Batch Inserts
+  // 5. Batch Inserts (with automatic missing-column fallback for pre-migration-10 schemas)
   if (deviceLogsToInsert.length > 0) {
-    let { error: dlErr } = await supabase.from('device_logs').insert(deviceLogsToInsert);
-    if (dlErr && isMissingColumnError(dlErr, 'school_id')) {
-      // Older databases without device_logs.school_id: write without it.
-      ({ error: dlErr } = await supabase
-        .from('device_logs')
-        .insert(deviceLogsToInsert.map(({ school_id: _omit, ...row }) => row)));
+    let rowsToWrite: Record<string, unknown>[] = deviceLogsToInsert.map((r) => ({ ...r }));
+    let dlErr: { code?: string; message?: string } | null = null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const ins = await supabase.from('device_logs').insert(rowsToWrite);
+      dlErr = ins.error;
+      if (!dlErr) break;
+      const missing = extractMissingColumn(dlErr);
+      if (missing && rowsToWrite.some((r) => Object.prototype.hasOwnProperty.call(r, missing))) {
+        console.warn(`[Device Processor] device_logs.${missing} missing; retrying without ${missing}`);
+        rowsToWrite = rowsToWrite.map((r) => {
+          const copy = { ...r };
+          delete copy[missing];
+          return copy;
+        });
+        continue;
+      }
+      if (isMissingColumnError(dlErr, 'school_id')) {
+        rowsToWrite = rowsToWrite.map(({ school_id: _omit, ...row }) => row);
+        continue;
+      }
+      break;
     }
     if (dlErr) {
       // Audit trail only: don't block the attendance record, but don't hide the failure either.

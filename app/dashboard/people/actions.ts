@@ -6,7 +6,134 @@ import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 import bcrypt from 'bcryptjs';
 import { generateTeacherPin, PIN_BCRYPT_ROUNDS } from '@/lib/security/pin';
-import { allClassesOwned, getOwnedClass, isUuid } from '@/lib/tenant';
+import { allClassesOwned, getOwnedClass, isUuid, extractMissingColumn } from '@/lib/tenant';
+
+/**
+ * Strips leading formula-injection prefixes (`=`, `+`, `-`, `@`, `\t`, `\r`)
+ * and ASCII control characters from names at write time.
+ */
+function sanitizePersonName(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  let clean = raw.replace(/[\u0000-\u001F\u007F]/g, ' ').trim();
+  while (/^[=+\-@\t\r]/.test(clean)) {
+    clean = clean.replace(/^[=+\-@\t\r]+/, '').trim();
+  }
+  return clean;
+}
+
+/**
+ * Canonical enrollment ID comparison key: strips leading zeros from purely
+ * numeric PINs so `'0555'`, `'555'`, and `'00555'` resolve to `'555'`.
+ */
+function canonicalPin(raw: string): string {
+  const trimmed = raw.trim().toLowerCase();
+  if (/^\d+$/.test(trimmed)) {
+    return trimmed.replace(/^0+/, '') || '0';
+  }
+  return trimmed;
+}
+
+/**
+ * Enforces canonical numeric PIN uniqueness (`'0555'` vs `'555'`) across both
+ * `people` and `person_credentials` strictly inside `schoolId`.
+ */
+async function findConflictingEnrollmentPin(
+  adminClient: ReturnType<typeof createAdminClient>,
+  schoolId: string,
+  candidatePin: string,
+  excludePersonId?: string
+): Promise<{ full_name: string; role: string; existingPin: string } | null> {
+  const targetCanon = canonicalPin(candidatePin);
+  const targetExact = candidatePin.trim().toLowerCase();
+
+  const { data: peopleRows } = await adminClient
+    .from('people')
+    .select('id, full_name, role, device_user_id')
+    .eq('school_id', schoolId)
+    .not('device_user_id', 'is', null);
+
+  for (const row of peopleRows || []) {
+    if (excludePersonId && row.id === excludePersonId) continue;
+    const uid = (row.device_user_id || '').trim();
+    if (!uid) continue;
+    if (uid.toLowerCase() === targetExact || canonicalPin(uid) === targetCanon) {
+      return { full_name: row.full_name, role: row.role, existingPin: uid };
+    }
+  }
+
+  try {
+    const { data: credRows } = await adminClient
+      .from('person_credentials')
+      .select('person_id, identifier_value')
+      .eq('school_id', schoolId);
+
+    for (const c of credRows || []) {
+      if (excludePersonId && c.person_id === excludePersonId) continue;
+      const val = (c.identifier_value || '').trim();
+      if (!val) continue;
+      if (val.toLowerCase() === targetExact || canonicalPin(val) === targetCanon) {
+        return { full_name: 'another member', role: 'member', existingPin: val };
+      }
+    }
+  } catch {
+    // Non-blocking if person_credentials is absent on older DBs
+  }
+
+  return null;
+}
+
+async function syncPersonCredentialsSafe(
+  adminClient: ReturnType<typeof createAdminClient>,
+  schoolId: string,
+  personId: string,
+  cleanUid: string | null
+) {
+  try {
+    await adminClient
+      .from('person_credentials')
+      .delete()
+      .eq('school_id', schoolId)
+      .eq('person_id', personId);
+  } catch {
+    // Ignore on older schemas
+  }
+
+  if (!cleanUid) return;
+
+  const row: Record<string, unknown> = {
+    school_id: schoolId,
+    person_id: personId,
+    credential_type: 'pin',
+    identifier_value: cleanUid,
+    is_active: true,
+  };
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const { error } = await adminClient
+      .from('person_credentials')
+      .upsert(row, { onConflict: 'school_id,credential_type,identifier_value' });
+    if (!error) return;
+    const missing = extractMissingColumn(error);
+    if (missing && Object.prototype.hasOwnProperty.call(row, missing)) {
+      if (missing === 'credential_type') row.identifier_type = 'pin';
+      delete row[missing];
+      // Without credential_type, fall back to plain insert after delete above
+      const ins = await adminClient.from('person_credentials').insert(row);
+      if (!ins.error) return;
+      const missingIns = extractMissingColumn(ins.error);
+      if (missingIns && Object.prototype.hasOwnProperty.call(row, missingIns)) {
+        delete row[missingIns];
+        continue;
+      }
+      return;
+    }
+    // If unique index for ON CONFLICT does not exist yet on MIG10=0, fall back to plain insert
+    if (error.code === '42P10') {
+      await adminClient.from('person_credentials').insert(row);
+    }
+    return;
+  }
+}
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
   // 1. Try auth_school_id RPC
@@ -42,8 +169,7 @@ async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<str
 }
 
 export async function addPersonAction(formData: FormData) {
-  const supabase = await createClient();
-  const fullName = formData.get('fullName') as string;
+  const fullName = sanitizePersonName(formData.get('fullName'));
   const role = formData.get('role') as 'student' | 'teacher' | 'support_staff';
   
   if (!fullName || !role) {
@@ -63,18 +189,12 @@ export async function addPersonAction(formData: FormData) {
       return { error: 'Biometric Enrollment ID may only contain letters, digits, "_" or "-" (max 32).' };
     }
 
-    // Check for duplicate biometric device user ID in this school
+    // Check for duplicate or canonically equivalent ('0555' vs '555') biometric device user ID in this school
     if (cleanDeviceId) {
-      const { data: existingPerson } = await adminClient
-        .from('people')
-        .select('id, full_name, role')
-        .eq('school_id', schoolId)
-        .eq('device_user_id', cleanDeviceId)
-        .maybeSingle();
-
-      if (existingPerson) {
+      const conflict = await findConflictingEnrollmentPin(adminClient, schoolId, cleanDeviceId);
+      if (conflict) {
         return {
-          error: `The biometric Enrollment ID "${cleanDeviceId}" is already registered to ${existingPerson.full_name} (${existingPerson.role}) in your school.`
+          error: `The biometric Enrollment ID "${cleanDeviceId}" conflicts with ID "${conflict.existingPin}" already registered to ${conflict.full_name} (${conflict.role}) in your school.`
         };
       }
     }
@@ -163,12 +283,12 @@ export async function addPersonAction(formData: FormData) {
       studentClassId = ownedClass.id;
       params.p_class_id = classId;
 
-      const guardianName = formData.get('guardianName') as string;
+      const guardianName = sanitizePersonName(formData.get('guardianName'));
       const guardianPhone = formData.get('guardianPhone') as string;
       const guardianRelationship = formData.get('guardianRelationship') as string || 'guardian';
 
-      if (guardianName && guardianName.trim()) {
-        params.p_guardian_full_name = guardianName.trim();
+      if (guardianName) {
+        params.p_guardian_full_name = guardianName;
       }
       if (guardianPhone && guardianPhone.trim()) {
         params.p_guardian_phone = guardianPhone.trim();
@@ -245,36 +365,73 @@ export async function addPersonAction(formData: FormData) {
           return { error: pInsertErr.message || 'Failed to register student.' };
         }
 
-        const guardianName = formData.get('guardianName') as string;
+        const guardianName = sanitizePersonName(formData.get('guardianName'));
         const guardianPhone = formData.get('guardianPhone') as string;
         let guardianLinked = false;
 
         if (guardianPhone && guardianPhone.trim()) {
-          try {
-            const { data: parentRec } = await adminClient
+          const cleanGuardianPhone = guardianPhone.trim();
+          let parentIdToLink: string | null = null;
+          let insertedNewParent = false;
+
+          // Reuse existing parent in this school if phone matches, otherwise insert
+          const { data: existingParent, error: parentLookupErr } = await adminClient
+            .from('parents')
+            .select('id')
+            .eq('school_id', schoolId)
+            .eq('phone', cleanGuardianPhone)
+            .maybeSingle();
+
+          if (parentLookupErr) {
+            await adminClient.from('people').delete().eq('id', newPerson.id).eq('school_id', schoolId);
+            return { error: `Failed to verify guardian record: ${parentLookupErr.message}` };
+          }
+
+          if (existingParent?.id) {
+            parentIdToLink = existingParent.id;
+          } else {
+            const { data: parentRec, error: parentInsertErr } = await adminClient
               .from('parents')
               .insert({
                 school_id: schoolId,
-                full_name: guardianName && guardianName.trim() ? guardianName.trim() : 'Guardian',
-                phone: guardianPhone.trim()
+                full_name: guardianName || 'Guardian',
+                phone: cleanGuardianPhone
               })
               .select('id')
               .single();
 
-            if (parentRec?.id) {
-              await adminClient
-                .from('student_parents')
-                .insert({
-                  student_id: newPerson.id,
-                  parent_id: parentRec.id,
-                  relationship: (formData.get('guardianRelationship') as string) || 'guardian',
-                  is_primary: true
-                });
-              guardianLinked = true;
+            if (parentInsertErr || !parentRec?.id) {
+              await adminClient.from('people').delete().eq('id', newPerson.id).eq('school_id', schoolId);
+              return {
+                error: `Failed to save guardian contact: ${parentInsertErr?.message || 'Unknown error'}`
+              };
             }
-          } catch (gErr) {
-            console.warn('Non-blocking: Failed to link parent in fallback:', gErr);
+            parentIdToLink = parentRec.id;
+            insertedNewParent = true;
           }
+
+          const { error: linkErr } = await adminClient
+            .from('student_parents')
+            .insert({
+              student_id: newPerson.id,
+              parent_id: parentIdToLink,
+              relationship: ((formData.get('guardianRelationship') as string) || 'guardian').trim(),
+              is_primary_contact: true
+            });
+
+          if (linkErr) {
+            await adminClient.from('people').delete().eq('id', newPerson.id).eq('school_id', schoolId);
+            if (insertedNewParent && parentIdToLink) {
+              await adminClient.from('parents').delete().eq('id', parentIdToLink).eq('school_id', schoolId);
+            }
+            return { error: `Failed to link guardian to student: ${linkErr.message}` };
+          }
+
+          guardianLinked = true;
+        }
+
+        if (cleanDeviceId) {
+          await syncPersonCredentialsSafe(adminClient, schoolId, newPerson.id, cleanDeviceId);
         }
 
         rpcData = { ...newPerson, guardian_linked: guardianLinked };
@@ -494,19 +651,12 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
       return { error: 'Person record not found or access denied.' };
     }
 
-    // 2. If UID is being set, ensure it's not already used by another person in the same school
+    // 2. If UID is being set, ensure it's not already used (including canonical '0555' vs '555') in the same school
     if (cleanUid) {
-      const { data: existingPerson } = await adminClient
-        .from('people')
-        .select('id, full_name, role')
-        .eq('school_id', person.school_id)
-        .eq('device_user_id', cleanUid)
-        .neq('id', personId)
-        .maybeSingle();
-
-      if (existingPerson) {
+      const conflict = await findConflictingEnrollmentPin(adminClient, person.school_id, cleanUid, personId);
+      if (conflict) {
         return { 
-          error: `Biometric UID ${cleanUid} is already assigned to ${existingPerson.full_name} (${existingPerson.role}).` 
+          error: `Biometric UID ${cleanUid} conflicts with ${conflict.existingPin} already assigned to ${conflict.full_name} (${conflict.role}).` 
         };
       }
     }
@@ -535,25 +685,10 @@ export async function updatePersonDeviceUserIdAction(personId: string, deviceUse
       }
     }
 
-    // 4. Sync into school.person_credentials table if cleanUid is present
-    if (cleanUid) {
-      try {
-        await adminClient
-          .from('person_credentials')
-          .upsert(
-            {
-              school_id: schoolId,
-              person_id: personId,
-              credential_type: 'pin',
-              identifier_value: cleanUid,
-              is_active: true
-            },
-            { onConflict: 'school_id,credential_type,identifier_value' }
-          );
-      } catch (credErr) {
-        console.warn('Non-blocking: person_credentials sync skipped:', credErr);
-      }
+    // 4. Sync school.person_credentials cleanly (removing stale credentials when changed/cleared)
+    await syncPersonCredentialsSafe(adminClient, schoolId, personId, cleanUid);
 
+    if (cleanUid) {
       try {
         const { enqueuePersonEnrollmentForSchool } = await import('@/utils/zkteco/commandQueue');
         await enqueuePersonEnrollmentForSchool(

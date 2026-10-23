@@ -9,6 +9,7 @@ import { createAdminClient } from '@/utils/supabase/admin';
 import { getOwnedPerson } from '@/lib/tenant';
 import { loadSchoolWallet, isMissingTable, legacyBalanceUsable } from '@/lib/payments/wallet';
 import { consumeRateLimit } from '@/lib/security/rate-limit';
+import { createKioskCapabilityToken } from '@/lib/security/register-token';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
   // 1. Try auth_school_id RPC
@@ -145,11 +146,14 @@ export async function getAttendanceData(dateFilterStr?: string) {
     }
   }
 
+    const kioskToken = await createKioskCapabilityToken({ schoolId });
+
     return {
       logs: logs || [],
       school,
       classes: classes || [],
       people: people || [],
+      kioskToken,
       error: undefined as string | undefined
     };
   } catch (err: any) {

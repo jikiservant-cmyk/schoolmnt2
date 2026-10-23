@@ -1,26 +1,48 @@
 'use server';
 
+import { cookies, headers } from 'next/headers';
 import { checkSchoolAdmin } from '@/lib/auth-guard';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
-import { isMissingColumnError } from '@/lib/tenant';
+import { isMissingColumnError, extractMissingColumn } from '@/lib/tenant';
 import { isWithinAttendanceSmsWindow, getEatTodayRange, getAttendanceStatusForCheckIn } from '@/lib/attendance-window';
+import {
+  KIOSK_CAPABILITY_COOKIE,
+  verifyKioskCapabilityToken,
+} from '@/lib/security/register-token';
 
 async function getAuthenticatedSchoolId() {
-  // SECURITY: previously any authenticated Supabase user (including accounts
-  // created directly against GoTrue with the public anon key, without an
-  // admin profile) could drive the kiosk. Require a verified school admin.
+  // 1. Verified `school_admin` session (100% preserved).
   const result = await checkSchoolAdmin();
-  if (!result.ok) {
-    return {
-      user: null,
-      schoolId: null,
-      error: result.reason === 'unauthenticated'
-        ? 'Unauthorized. Please sign in to your school account.'
-        : 'Access denied. School admin session required.',
-    };
+  if (result.ok) {
+    return { user: result.user, schoolId: result.schoolId, error: null };
   }
-  return { user: result.user, schoolId: result.schoolId, error: null };
+
+  // 2. Scoped Web-Crypto HMAC-SHA256 Gate Kiosk capability token (`?token=...` / HttpOnly cookie)
+  //    so gate tablets can clock students in without holding a full `school_admin` session.
+  const cookieStore = await cookies();
+  let rawToken = cookieStore.get(KIOSK_CAPABILITY_COOKIE)?.value || null;
+  if (!rawToken) {
+    try {
+      const ref = (await headers()).get('referer');
+      if (ref) rawToken = new URL(ref, 'http://localhost').searchParams.get('token');
+    } catch {
+      rawToken = null;
+    }
+  }
+
+  const verifiedKiosk = await verifyKioskCapabilityToken(rawToken);
+  if (verifiedKiosk) {
+    return { user: null, schoolId: verifiedKiosk.schoolId, error: null };
+  }
+
+  return {
+    user: null,
+    schoolId: null,
+    error: result.reason === 'unauthenticated'
+      ? 'Unauthorized. Please sign in to your school account.'
+      : 'Access denied. School admin session required.',
+  };
 }
 
 export async function submitClockInAction(deviceUserId: string) {
@@ -91,19 +113,28 @@ export async function submitClockInAction(deviceUserId: string) {
         processed_at: person ? new Date().toISOString() : null,
         processing_error: person ? null : 'Enrollment ID not registered in this school'
       };
-    let { data: rawLog, error: rawLogErr } = await adminClient
-      .from('device_logs')
-      .insert(rawLogRow)
-      .select('id')
-      .single();
-    if (rawLogErr && isMissingColumnError(rawLogErr, 'school_id')) {
-      // Older databases without device_logs.school_id: write without it.
-      const { school_id: _omit, ...legacyRow } = rawLogRow;
-      ({ data: rawLog, error: rawLogErr } = await adminClient
+    let rawLog: { id: string } | null = null;
+    let rawLogErr: { code?: string; message?: string } | null = null;
+    const rowCandidate: Record<string, unknown> = { ...rawLogRow };
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const ins = await adminClient
         .from('device_logs')
-        .insert(legacyRow)
+        .insert(rowCandidate)
         .select('id')
-        .single());
+        .single();
+      rawLog = ins.data;
+      rawLogErr = ins.error;
+      if (!rawLogErr) break;
+      const missing = extractMissingColumn(rawLogErr);
+      if (missing && Object.prototype.hasOwnProperty.call(rowCandidate, missing)) {
+        delete rowCandidate[missing];
+        continue;
+      }
+      if (isMissingColumnError(rawLogErr, 'school_id') && Object.prototype.hasOwnProperty.call(rowCandidate, 'school_id')) {
+        delete rowCandidate.school_id;
+        continue;
+      }
+      break;
     }
 
     if (rawLogErr) {
