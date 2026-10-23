@@ -11,7 +11,11 @@ import { loadSchoolWallet, isMissingFunction, isMissingTable, legacyBalanceUsabl
 import { consumeRateLimit } from '@/lib/security/rate-limit';
 import { createKioskCapabilityToken } from '@/lib/security/register-token';
 import { getEATDayRange } from '@/lib/eat-time';
-import { getAttendanceStatusForCheckIn } from '@/lib/attendance-window';
+import {
+  getEatTodayRange,
+  getAttendanceStatusForCheckIn,
+  getCurrentAttendanceWindowMode,
+} from '@/lib/attendance-window';
 import { getSchoolSettings } from '@/lib/school-settings';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
@@ -196,25 +200,60 @@ export async function recordTeacherAttendance(personId: string, status?: 'presen
 
     const schoolSettings = await getSchoolSettings(adminClient, schoolId);
     const now = new Date();
-    const computedStatus = getAttendanceStatusForCheckIn(now, {
+    const { startIso, endIso } = getEatTodayRange(now, schoolSettings.timeZone);
+    const sessionType = getCurrentAttendanceWindowMode(now, {
       timeZone: schoolSettings.timeZone,
-      role: person.role,
-      staffLateCutoff: schoolSettings.staffLateCutoff,
+      afternoonSwitchoverTime: schoolSettings.afternoonSwitchoverTime,
     });
+    const computedStatus = sessionType === 'check_in'
+      ? getAttendanceStatusForCheckIn(now, {
+          timeZone: schoolSettings.timeZone,
+          role: person.role,
+          staffLateCutoff: schoolSettings.staffLateCutoff,
+        })
+      : 'present';
     const finalStatus = status || computedStatus;
 
-    const { data, error } = await supabase
+    // Update existing session record in-place if already marked this morning/evening so max 2 rows/day holds
+    const { data: existingRow } = await adminClient
       .from('attendance_logs')
-      .insert({
-        school_id: schoolId,
-        person_id: personId,
-        status: finalStatus,
-        attendance_type: 'check_in',
-        source: 'manual',
-        occurred_at: now.toISOString()
-      })
-      .select()
+      .select('id')
+      .eq('school_id', schoolId)
+      .eq('person_id', personId)
+      .eq('attendance_type', sessionType)
+      .gte('occurred_at', startIso)
+      .lte('occurred_at', endIso)
+      .limit(1)
       .maybeSingle();
+
+    let data: any = null;
+    let error: any = null;
+
+    if (existingRow?.id) {
+      const upd = await supabase
+        .from('attendance_logs')
+        .update({ status: finalStatus, occurred_at: now.toISOString() })
+        .eq('id', existingRow.id)
+        .select()
+        .maybeSingle();
+      data = upd.data;
+      error = upd.error;
+    } else {
+      const ins = await supabase
+        .from('attendance_logs')
+        .insert({
+          school_id: schoolId,
+          person_id: personId,
+          status: finalStatus,
+          attendance_type: sessionType,
+          source: 'manual',
+          occurred_at: now.toISOString()
+        })
+        .select()
+        .maybeSingle();
+      data = ins.data;
+      error = ins.error;
+    }
 
     if (error) {
       return { error: error.message };

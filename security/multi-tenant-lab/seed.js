@@ -71,6 +71,9 @@ if (require.main === module) (async () => {
   if (process.env.RLS === '1' && process.env.MIG06 !== '0' && process.env.MIG12 !== '0' && fs.existsSync(mig + '12_school_settings.sql')) {
     await c.query(fs.readFileSync(mig + '12_school_settings.sql', 'utf8'));
   }
+  if (process.env.MIG09 !== '0' && process.env.MIG13 !== '0' && fs.existsSync(mig + '13_two_daily_punches_guard.sql')) {
+    await c.query(fs.readFileSync(mig + '13_two_daily_punches_guard.sql', 'utf8'));
+  }
   console.log('seeded');
   await c.end();
 })().catch((e) => { console.error(e); process.exit(1); });

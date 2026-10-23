@@ -451,10 +451,17 @@ export default function SettingsForm({ initialSettings }: SettingsFormProps) {
       {activeSection === 'attendance' && (
         <div className="bg-white border border-[#e7e7ea] rounded-[16px] p-6 shadow-[0_1px_2px_rgba(0,0,0,0.02)] space-y-5">
           <div>
-            <h2 className="text-sm font-bold text-[#171719]">Arrival Cutoffs, Grace Period & Scan Deduplication</h2>
+            <h2 className="text-sm font-bold text-[#171719]">Arrival Cutoffs, Grace Period & Daily 2-Write Guard</h2>
             <p className="text-xs text-[#85858a] mt-0.5">
               Applied consistently across ADMS biometric terminals, the Gate Kiosk, classroom manual registers, and staff check-ins.
             </p>
+          </div>
+
+          <div className="p-3.5 bg-[#edf9f0] border border-[#d2f4d9] rounded-[11px] text-xs text-[#171719]">
+            <strong>Strict 2-Write Daily Attendance Rule:</strong> Every student and staff member gets at most{' '}
+            <strong>2 database writes per day</strong> — <strong>1 Morning Check-In</strong> (before{' '}
+            {formatHhMm12Hour(afternoonSwitchoverTime)}) and <strong>1 Evening Check-Out</strong> (at or after{' '}
+            {formatHhMm12Hour(afternoonSwitchoverTime)}). Any extra thumbs in the morning or evening produce zero extra database records.
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -519,7 +526,7 @@ export default function SettingsForm({ initialSettings }: SettingsFormProps) {
                 className="w-full h-9 px-3 text-xs font-mono border border-[#e1e1e5] rounded-[9px] bg-white text-[#171719] focus:outline-none focus:border-[#007aff]"
               />
               <p className="text-[11px] text-[#85858a]">
-                Classroom registers default to Morning Check-In before this hour and Evening Check-Out after.
+                Biometric terminals, Gate Kiosk, and classroom registers record 1 Morning Check-In before this hour and 1 Evening Check-Out at/after.
               </p>
             </div>
 
@@ -537,7 +544,7 @@ export default function SettingsForm({ initialSettings }: SettingsFormProps) {
                 className="w-full h-9 px-3 text-xs font-mono border border-[#e1e1e5] rounded-[9px] bg-white text-[#171719] focus:outline-none focus:border-[#007aff]"
               />
               <p className="text-[11px] text-[#85858a]">
-                Prevents a student holding their finger twice at the gate from logging a Check-In followed immediately by Check-Out.
+                Hardware burst guard alongside the database-enforced max 2 daily writes (1 Morning Check-In + 1 Evening Check-Out).
               </p>
             </div>
           </div>

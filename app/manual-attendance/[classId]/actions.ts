@@ -506,27 +506,30 @@ export async function submitClassAttendance(
   const now = new Date();
   const { startIso, endIso } = getEatTodayRange(now, schoolSettings.timeZone);
 
-  // Check today's existing attendance logs for these students (ensure strictly ONE mark per time frame)
-  let eligibleStudentIds = presentStudentIds;
-  if (presentStudentIds.length > 0) {
+  // Check today's existing attendance logs across BOTH present and absent lists
+  // so no student ever gets >1 row for Morning Check-In or >1 row for Evening Check-Out.
+  const allSubmittedIds = [...presentStudentIds, ...absentStudentIds];
+  const alreadyRecordedSet = new Set<string>();
+  if (allSubmittedIds.length > 0) {
     const { data: existingLogs } = await adminClient
       .from('attendance_logs')
       .select('person_id, attendance_type')
       .eq('school_id', schoolId)
-      .in('person_id', presentStudentIds)
+      .in('person_id', allSubmittedIds)
       .gte('occurred_at', startIso)
       .lte('occurred_at', endIso);
 
-    const alreadyRecordedSet = new Set(
-      (existingLogs || [])
-        .filter(l => l.attendance_type === attendanceType)
-        .map(l => l.person_id)
-    );
-
-    eligibleStudentIds = presentStudentIds.filter(id => !alreadyRecordedSet.has(id));
+    for (const l of existingLogs || []) {
+      if (l.attendance_type === attendanceType) {
+        alreadyRecordedSet.add(l.person_id);
+      }
+    }
   }
 
-  if (presentStudentIds.length > 0 && eligibleStudentIds.length === 0) {
+  let eligibleStudentIds = presentStudentIds.filter((id) => !alreadyRecordedSet.has(id));
+  const eligibleAbsentIds = absentStudentIds.filter((id) => !alreadyRecordedSet.has(id));
+
+  if (allSubmittedIds.length > 0 && eligibleStudentIds.length === 0 && eligibleAbsentIds.length === 0) {
     return {
       success: true,
       skipped: true,
@@ -550,7 +553,7 @@ export async function submitClassAttendance(
     person_id: studentId,
     class_id_at_time: cls.id,
     class_name_at_time: cls.name,
-    status: attendanceStatus,
+    status: attendanceStatus as 'present' | 'late' | 'absent',
     attendance_type: attendanceType,
     marked_by: markedByStaffUserId,
     occurred_at: now.toISOString(),
@@ -558,13 +561,13 @@ export async function submitClassAttendance(
     created_at: now.toISOString(),
   }));
 
-  const absentLogs = absentStudentIds.map(studentId => ({
+  const absentLogs = eligibleAbsentIds.map(studentId => ({
     id: crypto.randomUUID(),
     school_id: cls.school_id,
     person_id: studentId,
     class_id_at_time: cls.id,
     class_name_at_time: cls.name,
-    status: 'absent' as const,
+    status: 'absent' as 'present' | 'late' | 'absent',
     attendance_type: attendanceType,
     marked_by: markedByStaffUserId,
     occurred_at: now.toISOString(),
@@ -573,15 +576,29 @@ export async function submitClassAttendance(
   }));
 
   const allLogs = [...presentLogs, ...absentLogs];
+  const storedPresentIds: string[] = [];
 
   if (allLogs.length > 0) {
     const { error: insertError } = await adminClient
       .from('attendance_logs')
       .insert(allLogs);
-      
+
     if (insertError) {
-      console.error("Error inserting manual attendance", insertError);
-      return { success: false, error: 'Failed to save attendance records.' };
+      if (insertError.code !== '23505') {
+        console.error("Error inserting manual attendance", insertError);
+        return { success: false, error: 'Failed to save attendance records.' };
+      }
+      // Race-safe row-by-row insert when simultaneous submissions collide on `23505`
+      for (const row of allLogs) {
+        const { error: rowErr } = await adminClient.from('attendance_logs').insert(row);
+        if (!rowErr) {
+          if (row.status !== 'absent') storedPresentIds.push(row.person_id);
+        } else if (rowErr.code !== '23505') {
+          console.error("Error inserting manual attendance row", rowErr);
+          return { success: false, error: 'Failed to save attendance records.' };
+        }
+      }
+      eligibleStudentIds = storedPresentIds;
     }
   }
 

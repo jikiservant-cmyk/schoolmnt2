@@ -644,7 +644,12 @@ if (kigaliMins >= 5) {
   const pastMins = kigaliMins - 5;
   const pastCutoff = `${String(Math.floor(pastMins / 60)).padStart(2, '0')}:${String(pastMins % 60).padStart(2, '0')}`;
   await callAction(cookieA, 'saveSchoolSettingsAction', [
-    { studentLateCutoff: pastCutoff, studentGraceMinutes: 0, timeZone: 'Africa/Kigali' },
+    {
+      studentLateCutoff: pastCutoff,
+      studentGraceMinutes: 0,
+      timeZone: 'Africa/Kigali',
+      afternoonSwitchoverTime: '23:59',
+    },
   ]);
   const kioskRes = await callAction(cookieA, 'submitClockInAction', ['102'], '/mark-attendance');
   const kioskLog = await q(`SELECT status FROM school.attendance_logs WHERE person_id = $1`, [A.student]);

@@ -5,7 +5,12 @@ import { checkSchoolAdmin } from '@/lib/auth-guard';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
 import { isMissingColumnError, extractMissingColumn } from '@/lib/tenant';
-import { isWithinAttendanceSmsWindow, getEatTodayRange, getAttendanceStatusForCheckIn } from '@/lib/attendance-window';
+import {
+  isWithinAttendanceSmsWindow,
+  getEatTodayRange,
+  getAttendanceStatusForCheckIn,
+  getCurrentAttendanceWindowMode,
+} from '@/lib/attendance-window';
 import {
   getSchoolSettings,
   isParentSmsEnabledForEvent,
@@ -83,9 +88,53 @@ export async function submitClockInAction(deviceUserId: string) {
       return { error: 'Hardware database query failed.' };
     }
 
+    // If no person matches in this school, reject
+    if (!person) {
+      return { error: 'ID not registered for this school. Check enrollment.' };
+    }
+
+    // -------------------------------------------------------------
+    // Step B — Enforce Strict 2-Write Daily Rule BEFORE ANY DB WRITES:
+    //   1 Morning Check-In (`< afternoonSwitchoverTime`) +
+    //   1 Evening Check-Out (`>= afternoonSwitchoverTime`) MAX per day.
+    // -------------------------------------------------------------
+    const schoolSettings = await getSchoolSettings(adminClient, schoolId);
+    const now = new Date();
+    const { startIso, endIso } = getEatTodayRange(now, schoolSettings.timeZone);
+    const attendanceType: 'check_in' | 'check_out' = getCurrentAttendanceWindowMode(now, {
+      timeZone: schoolSettings.timeZone,
+      afternoonSwitchoverTime: schoolSettings.afternoonSwitchoverTime,
+    });
+
+    const { data: todayLogs } = await adminClient
+      .from('attendance_logs')
+      .select('id, attendance_type, status')
+      .eq('person_id', person.id)
+      .eq('school_id', schoolId)
+      .gte('occurred_at', startIso)
+      .lte('occurred_at', endIso);
+
+    const existingSameSession = (todayLogs || []).find(
+      (l) => l.attendance_type === attendanceType && l.status !== 'absent'
+    );
+    const existingAbsentRow = (todayLogs || []).find(
+      (l) => l.attendance_type === attendanceType && l.status === 'absent'
+    );
+
+    if (existingSameSession) {
+      // Strictly ZERO extra database writes to `device_logs`, `attendance_logs`, or `notifications`!
+      return {
+        success: true,
+        duplicateSkipped: true,
+        fullName: person.full_name,
+        role: person.role.toUpperCase(),
+        msg: `${person.full_name} is already checked ${attendanceType === 'check_in' ? 'IN this morning' : 'OUT this evening'}.`,
+      };
+    }
+
     let deviceId: string | null = null;
     let serialNumber = 'ZK-EMULATOR-101';
-    
+
     const { data: dev } = await adminClient
       .from('devices')
       .select('id, serial_number')
@@ -98,26 +147,25 @@ export async function submitClockInAction(deviceUserId: string) {
       serialNumber = dev.serial_number;
     }
 
-    // -------------------------------------------------------------
-    // Step A — Log raw device event (audit trail) scoped to school
-    // -------------------------------------------------------------
+    // Write raw device audit trail ONLY when a new daily session slot is actually being recorded
     const rawLogRow: Record<string, unknown> = {
-        school_id: schoolId,
-        device_id: deviceId,
-        raw_serial_number: serialNumber,
-        device_user_id: cleanUserId,
-        event_timestamp: new Date().toISOString(),
-        payload: {
-          UserID: cleanUserId,
-          SerialNumber: serialNumber,
-          Timestamp: new Date().toISOString(),
-          SimulationMode: 'terminal_emulator',
-          OperatorUserId: user?.id
-        },
-        processed: person ? true : false,
-        processed_at: person ? new Date().toISOString() : null,
-        processing_error: person ? null : 'Enrollment ID not registered in this school'
-      };
+      school_id: schoolId,
+      device_id: deviceId,
+      raw_serial_number: serialNumber,
+      device_user_id: cleanUserId,
+      event_timestamp: now.toISOString(),
+      payload: {
+        UserID: cleanUserId,
+        SerialNumber: serialNumber,
+        Timestamp: now.toISOString(),
+        AttendanceType: attendanceType,
+        SimulationMode: 'terminal_emulator',
+        OperatorUserId: user?.id,
+      },
+      processed: true,
+      processed_at: now.toISOString(),
+      processing_error: null,
+    };
     let rawLog: { id: string } | null = null;
     let rawLogErr: { code?: string; message?: string } | null = null;
     const rowCandidate: Record<string, unknown> = { ...rawLogRow };
@@ -146,38 +194,6 @@ export async function submitClockInAction(deviceUserId: string) {
       console.error('Failed to write raw device log audit trail:', rawLogErr);
     }
 
-    // If no person matches in this school, reject
-    if (!person) {
-      return { error: 'ID not registered for this school. Check enrollment.' };
-    }
-
-    // -------------------------------------------------------------
-    // Step B2 — Check today's existing attendance logs in school timezone & apply per-school cutoffs
-    // -------------------------------------------------------------
-    const schoolSettings = await getSchoolSettings(adminClient, schoolId);
-    const now = new Date();
-    const { startIso, endIso } = getEatTodayRange(now, schoolSettings.timeZone);
-
-    const { data: todayLogs } = await adminClient
-      .from('attendance_logs')
-      .select('id, attendance_type')
-      .eq('person_id', person.id)
-      .eq('school_id', schoolId)
-      .gte('occurred_at', startIso)
-      .lte('occurred_at', endIso);
-
-    const hasCheckIn = todayLogs?.some(l => l.attendance_type === 'check_in');
-    const hasCheckOut = todayLogs?.some(l => l.attendance_type === 'check_out');
-
-    if (hasCheckIn && hasCheckOut) {
-      return { error: `${person.full_name} has already checked IN and checked OUT for today.` };
-    }
-
-    let attendanceType: 'check_in' | 'check_out' = 'check_in';
-    if (hasCheckIn && !hasCheckOut) {
-      attendanceType = 'check_out';
-    }
-
     const calculatedStatus = attendanceType === 'check_in'
       ? getAttendanceStatusForCheckIn(now, {
           timeZone: schoolSettings.timeZone,
@@ -203,26 +219,59 @@ export async function submitClockInAction(deviceUserId: string) {
     }
 
     // -------------------------------------------------------------
-    // Step C — Create the attendance row with log snapshots
+    // Step C — Commit the single session attendance row (or upgrade `absent` in place)
     // -------------------------------------------------------------
-    const { data: attendanceLog, error: logErr } = await adminClient
-      .from('attendance_logs')
-      .insert({
-        school_id: schoolId,
-        person_id: person.id,
-        source: 'device',
-        device_id: deviceId,
-        device_log_id: rawLog?.id || null,
-        status: calculatedStatus,
-        attendance_type: attendanceType,
-        class_id_at_time: person.class_id,
-        class_name_at_time: classNameAtTime,
-        occurred_at: now.toISOString()
-      })
-      .select('id')
-      .single();
+    let attendanceLog: { id: string } | null = null;
+    let logErr: { code?: string; message?: string } | null = null;
+    if (existingAbsentRow) {
+      const upd = await adminClient
+        .from('attendance_logs')
+        .update({
+          source: 'device',
+          device_id: deviceId,
+          device_log_id: rawLog?.id || null,
+          status: calculatedStatus,
+          occurred_at: now.toISOString(),
+        })
+        .eq('id', existingAbsentRow.id)
+        .select('id')
+        .single();
+      attendanceLog = upd.data;
+      logErr = upd.error;
+    } else {
+      const ins = await adminClient
+        .from('attendance_logs')
+        .insert({
+          school_id: schoolId,
+          person_id: person.id,
+          source: 'device',
+          device_id: deviceId,
+          device_log_id: rawLog?.id || null,
+          status: calculatedStatus,
+          attendance_type: attendanceType,
+          class_id_at_time: person.class_id,
+          class_name_at_time: classNameAtTime,
+          occurred_at: now.toISOString()
+        })
+        .select('id')
+        .single();
+      attendanceLog = ins.data;
+      logErr = ins.error;
+    }
 
     if (logErr) {
+      if (logErr.code === '23505') {
+        if (rawLog?.id) {
+          await adminClient.from('device_logs').delete().eq('id', rawLog.id);
+        }
+        return {
+          success: true,
+          duplicateSkipped: true,
+          fullName: person.full_name,
+          role: person.role.toUpperCase(),
+          msg: `${person.full_name} is already checked ${attendanceType === 'check_in' ? 'IN this morning' : 'OUT this evening'}.`,
+        };
+      }
       console.error('Failed to commit attendance fact:', logErr);
       return { error: 'Transmission failed. Please try again.' };
     }
@@ -312,7 +361,7 @@ export async function submitClockInAction(deviceUserId: string) {
                 channel: 'sms',
                 notification_type: 'attendance',
                 related_table: 'attendance_logs',
-                related_id: attendanceLog.id,
+                related_id: attendanceLog?.id ?? null,
                 message: smsMessageText,
                 status: 'pending'
               }]);
