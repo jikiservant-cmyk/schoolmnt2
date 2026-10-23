@@ -11,6 +11,29 @@
 
 BEGIN;
 
+-- Ensure school.auth_school_id() exists even if 04_rls_tenant_isolation.sql
+-- has not been run yet on this Supabase project.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'school' AND p.proname = 'auth_school_id' AND p.pronargs = 0
+  ) THEN
+    EXECUTE $f$
+      CREATE FUNCTION school.auth_school_id() RETURNS uuid
+      LANGUAGE sql STABLE SECURITY DEFINER
+      SET search_path = pg_catalog, school, public
+      AS 'SELECT su.school_id FROM school.staff_users su WHERE su.auth_user_id = auth.uid() LIMIT 1'
+    $f$;
+  END IF;
+END $$;
+
+GRANT USAGE ON SCHEMA school TO authenticated, service_role;
+REVOKE ALL ON FUNCTION school.auth_school_id() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION school.auth_school_id() TO authenticated, service_role;
+
 CREATE TABLE IF NOT EXISTS school.school_settings (
   school_id                       uuid PRIMARY KEY REFERENCES school.schools(id) ON DELETE CASCADE,
   academic_term_label             text NOT NULL DEFAULT '',
@@ -244,5 +267,9 @@ $$;
 
 REVOKE ALL ON FUNCTION school.save_school_settings(uuid, text, jsonb, uuid) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION school.save_school_settings(uuid, text, jsonb, uuid) TO service_role;
+
+-- Reload Supabase PostgREST schema cache immediately so `school_settings`
+-- and `save_school_settings` are live the instant this query finishes.
+NOTIFY pgrst, 'reload schema';
 
 COMMIT;
