@@ -34,6 +34,10 @@ import AttendanceReports from './AttendanceReports';
 import { formatEATTime, formatEATDate, getEATDateKey } from '@/lib/eat-time';
 import { DEFAULT_SCHOOL_POLICY_SETTINGS, type ResolvedSchoolConfiguration } from '@/lib/school-settings';
 
+const PLATFORM_TOP_UP_PRESETS_UGX = [10000, 20000, 50000, 100000, 200000, 500000] as const;
+const PLATFORM_DEFAULT_TOP_UP_UGX = '50000';
+const PLATFORM_SMS_UNIT_COST_UGX = 50;
+
 export default function AttendancePage() {
   const [logs, setLogs] = useState<any[]>([]);
   const [people, setPeople] = useState<any[]>([]);
@@ -49,7 +53,7 @@ export default function AttendancePage() {
   // Wallet / Top Up state
   const [showTopUpModal, setShowTopUpModal] = useState(false);
   const [topUpStep, setTopUpStep] = useState<'form' | 'waiting' | 'success'>('form');
-  const [topUpAmount, setTopUpAmount] = useState<string>(String(DEFAULT_SCHOOL_POLICY_SETTINGS.defaultTopUpAmount));
+  const [topUpAmount, setTopUpAmount] = useState<string>(PLATFORM_DEFAULT_TOP_UP_UGX);
   const [phoneNumber, setPhoneNumber] = useState<string>('');
   const [isToppingUp, setIsToppingUp] = useState(false);
   const [topUpMessage, setTopUpMessage] = useState('');
@@ -115,7 +119,6 @@ export default function AttendancePage() {
         setSchool(data.school || null);
         if ((data as any).schoolSettings) {
           setSchoolConfig((data as any).schoolSettings);
-          setTopUpAmount(String((data as any).schoolSettings.defaultTopUpAmount));
         }
         if ((data as any).kioskToken) setKioskToken((data as any).kioskToken);
         setError(null);
@@ -216,9 +219,6 @@ export default function AttendancePage() {
   }, [studentLogs, searchTerm, statusFilter, classFilter]);
 
   const schoolTimeZone = schoolConfig?.timeZone || DEFAULT_SCHOOL_POLICY_SETTINGS.timeZone;
-  const smsUnitCostUgx = schoolConfig?.platformSmsUnitCostUgx || 50;
-  const topUpPresets = schoolConfig?.topUpPresets || DEFAULT_SCHOOL_POLICY_SETTINGS.topUpPresets;
-  const lowBalanceThresholdUgx = schoolConfig?.lowBalanceThresholdUgx ?? DEFAULT_SCHOOL_POLICY_SETTINGS.lowBalanceThresholdUgx;
 
   // Group student logs by date in the school's configured timezone (YYYY-MM-DD)
   const groupedStudentLogs = useMemo(() => {
@@ -299,8 +299,7 @@ export default function AttendancePage() {
   };
 
   const currentBalance = school?.settings?.balance || 0;
-  const approxSMSCount = Math.floor(currentBalance / smsUnitCostUgx);
-  const isLowBalance = lowBalanceThresholdUgx > 0 && currentBalance < lowBalanceThresholdUgx;
+  const approxSMSCount = Math.floor(currentBalance / PLATFORM_SMS_UNIT_COST_UGX);
 
   if (loading && logs.length === 0) {
     return (
@@ -373,9 +372,9 @@ export default function AttendancePage() {
                 <span>{currentBalance.toLocaleString()}</span>
                 <span className="text-xs font-semibold text-[#85858a]">UGX</span>
               </div>
-              <div className={`text-[11px] font-medium flex items-center gap-1 mt-0.5 ${isLowBalance ? 'text-[#f5a30a]' : 'text-[#30b357]'}`}>
+              <div className="text-[11px] font-medium flex items-center gap-1 mt-0.5 text-[#30b357]">
                 <MessageSquare className="w-3 h-3" />
-                <span>~{approxSMSCount.toLocaleString()} SMS credits{isLowBalance ? ' · Low balance' : ''}</span>
+                <span>~{approxSMSCount.toLocaleString()} SMS credits</span>
               </div>
             </div>
           </div>
@@ -838,7 +837,7 @@ export default function AttendancePage() {
                     Select Quick Amount (UGX)
                   </label>
                   <div className="grid grid-cols-3 gap-2">
-                    {topUpPresets.map((amount) => (
+                    {PLATFORM_TOP_UP_PRESETS_UGX.map((amount) => (
                       <button
                         key={amount}
                         type="button"
@@ -869,12 +868,12 @@ export default function AttendancePage() {
                       value={topUpAmount}
                       onChange={(e) => setTopUpAmount(e.target.value)}
                       className="block w-full px-3 py-2 border border-[#e1e1e5] rounded-[9px] bg-white text-[#171719] text-xs font-mono focus:border-[#007aff] focus:outline-none transition"
-                      placeholder={String(schoolConfig?.defaultTopUpAmount || DEFAULT_SCHOOL_POLICY_SETTINGS.defaultTopUpAmount)}
+                      placeholder={PLATFORM_DEFAULT_TOP_UP_UGX}
                     />
                   </div>
                   <p className="text-[10px] text-[#85858a] mt-1 flex items-center gap-1">
                     <Sparkles className="w-3 h-3 text-[#f5a30a]" />
-                    Provides approx {Math.floor((parseInt(topUpAmount) || 0) / smsUnitCostUgx).toLocaleString()} SMS messages to parents.
+                    Provides approx {Math.floor((parseInt(topUpAmount) || 0) / PLATFORM_SMS_UNIT_COST_UGX).toLocaleString()} SMS messages to parents.
                   </p>
                 </div>
 

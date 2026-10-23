@@ -1,14 +1,62 @@
 /**
- * Centralized Per-School Configurable Policies & Operational Settings.
+ * Centralized Per-School Operational Settings (STRICTLY NON-FINANCIAL).
  *
- * Replaces hardcoded cutoffs, SMS windows, templates, class naming rules,
- * PIN lockout rules, biometric PIN start ranges, LCD prefixes, and top-up
- * defaults across the entire application so each school configures its own
- * rules in PostgreSQL (`school.school_settings` + `school.schools.settings.policy`
- * fallback for pre-migration-12 deployments).
+ * Schools configure ONLY operational parameters in `school.school_settings`:
+ *   - School display identity, academic term label, support phone & IANA timezone
+ *   - Student/staff arrival cutoffs, grace minutes, afternoon switchover & scan cooldown
+ *   - Parent SMS toggles, delivery hours & single-segment ASCII message templates
+ *   - Class naming convention, Teacher PIN lockout thresholds, biometric PIN start & LCD labels
+ *
+ * SECURITY INVARIANT — ZERO FINANCIAL AUTHORITY FOR TENANTS:
+ *   - Schools NEVER have authority to view-as-editable or modify SMS pricing,
+ *     carrier rates, wallet balances, top-up amounts/presets, or billing flags.
+ *   - Any request containing financial/pricing/wallet keys is explicitly rejected.
+ *   - `getSchoolSettings` and `persistSchoolSettings` NEVER read or write
+ *     `school.schools.settings` (where legacy financial balance mirrors live).
  */
 
 export const HHMM_RE = /^([01][0-9]|2[0-3]):([0-5][0-9])$/;
+export const MAX_SMS_TEMPLATE_LENGTH = 160;
+export const PRINTABLE_ASCII_RE = /^[\x20-\x7E]+$/;
+
+/**
+ * Explicit allowlist of non-financial operational keys a school admin may submit.
+ * Any key outside this set — especially any financial/pricing/wallet field — is rejected.
+ */
+export const ALLOWED_SCHOOL_SETTING_KEYS = new Set<string>([
+  'schoolName',
+  'academicTermLabel',
+  'supportPhone',
+  'timeZone',
+  'studentLateCutoff',
+  'studentGraceMinutes',
+  'staffLateCutoff',
+  'afternoonSwitchoverTime',
+  'duplicatePunchWindowSeconds',
+  'smsEnabled',
+  'sendCheckInSms',
+  'sendLateSms',
+  'sendCheckOutSms',
+  'restrictSmsWindows',
+  'checkInSmsStart',
+  'checkInSmsEnd',
+  'checkOutSmsStart',
+  'checkOutSmsEnd',
+  'smsTemplateCheckIn',
+  'smsTemplateLate',
+  'smsTemplateCheckOut',
+  'enforceStandardClassPrefix',
+  'maxPinFailures',
+  'pinLockoutMinutes',
+  'startingBiometricPin',
+  'lcdPrefixTeacher',
+  'lcdPrefixAdmin',
+  'lcdPrefixSupport',
+  'lcdShowStudentClass',
+]);
+
+const FORBIDDEN_FINANCIAL_KEY_RE =
+  /(price|pricing|rate|tariff|fee|cost|balance|wallet|credit|debit|topup|top_up|currency|ugx|ledger|payment|threshold)/i;
 
 export const COMMON_SCHOOL_TIMEZONES = [
   { value: 'Africa/Kampala', label: 'East Africa Time — Kampala (UTC+3)' },
@@ -56,15 +104,11 @@ export interface SchoolPolicySettings {
   lcdPrefixAdmin: string;
   lcdPrefixSupport: string;
   lcdShowStudentClass: boolean;
-  defaultTopUpAmount: number;
-  topUpPresets: number[];
-  lowBalanceThresholdUgx: number;
 }
 
 export interface ResolvedSchoolConfiguration extends SchoolPolicySettings {
   schoolId: string;
   schoolName: string;
-  platformSmsUnitCostUgx: number;
 }
 
 export const DEFAULT_SCHOOL_POLICY_SETTINGS: SchoolPolicySettings = {
@@ -99,25 +143,7 @@ export const DEFAULT_SCHOOL_POLICY_SETTINGS: SchoolPolicySettings = {
   lcdPrefixAdmin: 'Adm. ',
   lcdPrefixSupport: 'Stf. ',
   lcdShowStudentClass: true,
-  defaultTopUpAmount: 50000,
-  topUpPresets: [10000, 20000, 50000, 100000, 200000, 500000],
-  lowBalanceThresholdUgx: 5000,
 };
-
-/**
- * Server-controlled SMS unit price in UGX (`SMS_UNIT_COST_UGX` env var, default 50).
- * Never client-writable so tenants cannot lower their own per-SMS charge.
- */
-export function getPlatformSmsUnitCostUgx(): number {
-  const raw = process.env.SMS_UNIT_COST_UGX;
-  if (raw !== undefined && raw.trim() !== '') {
-    const n = Number(raw.trim());
-    if (Number.isFinite(n) && Number.isInteger(n) && n >= 1 && n <= 100_000) {
-      return n;
-    }
-  }
-  return 50;
-}
 
 export function isValidIanaTimeZone(tz: unknown): tz is string {
   if (typeof tz !== 'string' || !tz.trim() || tz.length > 64) return false;
@@ -145,11 +171,34 @@ export function formatHhMm12Hour(hhmm: string): string {
   return `${String(h12).padStart(2, '0')}:${mins} ${suffix}`;
 }
 
+/**
+ * Normalizes smart punctuation copied from Word/WhatsApp to plain GSM-7 ASCII.
+ */
+export function normalizeGsmAsciiPunctuation(raw: string): string {
+  return raw
+    .replace(/[\u2018\u2019\u201B`]/g, "'")
+    .replace(/[\u201C\u201D\u201F]/g, '"')
+    .replace(/[\u2013\u2014]/g, '-')
+    .replace(/\u2026/g, '...')
+    .replace(/[\u00A0\r\n\t]+/g, ' ')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ');
+}
+
 function cleanText(raw: unknown, maxLen: number, fallback: string, trimTrailing = true): string {
   if (typeof raw !== 'string') return fallback;
   const stripped = raw.replace(/[\u0000-\u001F\u007F]/g, ' ');
   const cleaned = trimTrailing ? stripped.trim() : stripped;
   return cleaned.slice(0, maxLen);
+}
+
+function cleanSmsTemplate(raw: unknown, fallback: string): string {
+  if (typeof raw !== 'string') return fallback;
+  const normalized = normalizeGsmAsciiPunctuation(raw)
+    .replace(/[^\x20-\x7E]/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .slice(0, MAX_SMS_TEMPLATE_LENGTH);
+  return normalized.length >= 10 ? normalized : fallback;
 }
 
 function cleanHhMm(raw: unknown, fallback: string): string {
@@ -173,27 +222,9 @@ function cleanBool(raw: unknown, fallback: boolean): boolean {
   return fallback;
 }
 
-function cleanTopUpPresets(raw: unknown): number[] {
-  let list: unknown[] | null = null;
-  if (Array.isArray(raw)) {
-    list = raw;
-  } else if (typeof raw === 'string' && raw.trim()) {
-    list = raw.split(',').map((s) => s.trim()).filter(Boolean);
-  }
-  if (!list) return [...DEFAULT_SCHOOL_POLICY_SETTINGS.topUpPresets];
-  const nums = Array.from(
-    new Set(
-      list
-        .map((v) => (typeof v === 'number' ? Math.trunc(v) : parseInt(String(v).replace(/[^0-9-]/g, ''), 10)))
-        .filter((n) => Number.isFinite(n) && n >= 500 && n <= 10_000_000)
-    )
-  ).sort((a, b) => a - b);
-  return nums.length >= 1 ? nums.slice(0, 6) : [...DEFAULT_SCHOOL_POLICY_SETTINGS.topUpPresets];
-}
-
 /**
- * Normalizes a database row from `school.school_settings` OR JSONB `policy` object
- * into a fully typed, bounds-checked `SchoolPolicySettings` object.
+ * Normalizes a database row from `school.school_settings` into a strictly typed,
+ * bounds-checked `SchoolPolicySettings` object (100% non-financial).
  */
 export function normalizeSchoolPolicySettings(
   raw?: Record<string, unknown> | null
@@ -229,12 +260,18 @@ export function normalizeSchoolPolicySettings(
     checkInSmsEnd: cleanHhMm(s.checkInSmsEnd ?? s.check_in_sms_end, d.checkInSmsEnd),
     checkOutSmsStart: cleanHhMm(s.checkOutSmsStart ?? s.check_out_sms_start, d.checkOutSmsStart),
     checkOutSmsEnd: cleanHhMm(s.checkOutSmsEnd ?? s.check_out_sms_end, d.checkOutSmsEnd),
-    smsTemplateCheckIn:
-      cleanText(s.smsTemplateCheckIn ?? s.sms_template_check_in, 320, '') || d.smsTemplateCheckIn,
-    smsTemplateLate:
-      cleanText(s.smsTemplateLate ?? s.sms_template_late, 320, '') || d.smsTemplateLate,
-    smsTemplateCheckOut:
-      cleanText(s.smsTemplateCheckOut ?? s.sms_template_check_out, 320, '') || d.smsTemplateCheckOut,
+    smsTemplateCheckIn: cleanSmsTemplate(
+      s.smsTemplateCheckIn ?? s.sms_template_check_in,
+      d.smsTemplateCheckIn
+    ),
+    smsTemplateLate: cleanSmsTemplate(
+      s.smsTemplateLate ?? s.sms_template_late,
+      d.smsTemplateLate
+    ),
+    smsTemplateCheckOut: cleanSmsTemplate(
+      s.smsTemplateCheckOut ?? s.sms_template_check_out,
+      d.smsTemplateCheckOut
+    ),
     enforceStandardClassPrefix: cleanBool(
       s.enforceStandardClassPrefix ?? s.enforce_standard_class_prefix,
       d.enforceStandardClassPrefix
@@ -263,29 +300,37 @@ export function normalizeSchoolPolicySettings(
       s.lcdShowStudentClass ?? s.lcd_show_student_class,
       d.lcdShowStudentClass
     ),
-    defaultTopUpAmount: cleanInt(
-      s.defaultTopUpAmount ?? s.default_topup_amount,
-      1000,
-      10_000_000,
-      d.defaultTopUpAmount
-    ),
-    topUpPresets: cleanTopUpPresets(s.topUpPresets ?? s.topup_presets),
-    lowBalanceThresholdUgx: cleanInt(
-      s.lowBalanceThresholdUgx ?? s.low_balance_threshold_ugx,
-      0,
-      1_000_000,
-      d.lowBalanceThresholdUgx
-    ),
   };
 }
 
 /**
- * Strictly validates user-submitted settings so invalid times or out-of-range
- * numbers return clear human-friendly errors instead of silently ignoring typos.
+ * Strictly validates user-submitted settings:
+ *   1. Explicitly blocks any financial, SMS pricing, rate, or wallet parameter.
+ *   2. Rejects any unknown field outside the non-financial operational allowlist.
+ *   3. Enforces valid 24h HH:MM times, safe integer ranges, and single-segment
+ *      10–160 ASCII SMS templates (preventing multi-segment carrier billing abuse).
  */
 export function validateSchoolSettingsInput(
   input: Record<string, unknown>
 ): { ok: true; schoolName?: string; policy: SchoolPolicySettings } | { ok: false; error: string } {
+  for (const key of Object.keys(input)) {
+    if (FORBIDDEN_FINANCIAL_KEY_RE.test(key)) {
+      return {
+        ok: false,
+        error: 'Security error: Financial, SMS pricing, and wallet parameters cannot be modified by schools.',
+      };
+    }
+    if (key === 'schoolId' || key === 'school_id') {
+      continue;
+    }
+    if (!ALLOWED_SCHOOL_SETTING_KEYS.has(key)) {
+      return {
+        ok: false,
+        error: `Unsupported settings parameter "${key}". Only operational school policies can be edited.`,
+      };
+    }
+  }
+
   let schoolName: string | undefined;
   if (input.schoolName !== undefined) {
     if (typeof input.schoolName !== 'string') {
@@ -323,14 +368,41 @@ export function validateSchoolSettingsInput(
     ['maxPinFailures', 'Maximum Teacher PIN attempts', 3, 15],
     ['pinLockoutMinutes', 'Teacher PIN lockout duration (minutes)', 1, 120],
     ['startingBiometricPin', 'Starting Biometric PIN', 1, 999_999],
-    ['defaultTopUpAmount', 'Default Top-Up amount', 1000, 10_000_000],
-    ['lowBalanceThresholdUgx', 'Low balance alert threshold', 0, 1_000_000],
   ];
   for (const [key, label, min, max] of rangeChecks) {
     if (input[key] !== undefined && input[key] !== '') {
       const n = Number(input[key]);
       if (!Number.isFinite(n) || !Number.isInteger(n) || n < min || n > max) {
-        return { ok: false, error: `${label} must be a whole number between ${min.toLocaleString()} and ${max.toLocaleString()}.` };
+        return {
+          ok: false,
+          error: `${label} must be a whole number between ${min.toLocaleString()} and ${max.toLocaleString()}.`,
+        };
+      }
+    }
+  }
+
+  const templateFields: [string, string][] = [
+    ['smsTemplateCheckIn', 'On-Time Check-In SMS Template'],
+    ['smsTemplateLate', 'Late Arrival SMS Template'],
+    ['smsTemplateCheckOut', 'Dismissal Check-Out SMS Template'],
+  ];
+  for (const [key, label] of templateFields) {
+    if (input[key] !== undefined) {
+      if (typeof input[key] !== 'string') {
+        return { ok: false, error: `${label} must be plain text.` };
+      }
+      const norm = normalizeGsmAsciiPunctuation(input[key]).replace(/\s{2,}/g, ' ').trim();
+      if (norm.length < 10 || norm.length > MAX_SMS_TEMPLATE_LENGTH) {
+        return {
+          ok: false,
+          error: `${label} must be between 10 and ${MAX_SMS_TEMPLATE_LENGTH} characters (single SMS limit).`,
+        };
+      }
+      if (!PRINTABLE_ASCII_RE.test(norm)) {
+        return {
+          ok: false,
+          error: `${label} must contain standard ASCII text only (no emojis or special symbols) so every message stays 1 single SMS.`,
+        };
       }
     }
   }
@@ -358,17 +430,25 @@ export interface AttendanceSmsTemplateVars {
 }
 
 /**
- * Renders a school's custom SMS template safely with clean variable substitution.
+ * Renders a school's custom SMS template safely into a single-segment GSM-7 ASCII
+ * message (`<= 160` characters, zero UCS-2 emojis/control characters) so a school
+ * can never trigger multi-part carrier charges while paying for a single SMS.
  */
 export function renderAttendanceSmsMessage(
   settings: SchoolPolicySettings,
   attendanceType: 'check_in' | 'check_out',
   vars: AttendanceSmsTemplateVars
 ): string {
-  const safeStudent = (vars.studentName || 'Student').replace(/[\u0000-\u001F\u007F]/g, ' ').trim();
-  const firstName = safeStudent.split(/\s+/)[0] || safeStudent;
-  const safeSchool = (vars.schoolName || 'school').replace(/[\u0000-\u001F\u007F]/g, ' ').trim();
-  const safeClass = (vars.className || '').replace(/[\u0000-\u001F\u007F]/g, ' ').trim();
+  const safeStudent = normalizeGsmAsciiPunctuation(vars.studentName || 'Student')
+    .replace(/[^\x20-\x7E]/g, '')
+    .trim();
+  const firstName = safeStudent.split(/\s+/)[0] || safeStudent || 'Student';
+  const safeSchool = normalizeGsmAsciiPunctuation(vars.schoolName || 'school')
+    .replace(/[^\x20-\x7E]/g, '')
+    .trim();
+  const safeClass = normalizeGsmAsciiPunctuation(vars.className || '')
+    .replace(/[^\x20-\x7E]/g, '')
+    .trim();
   const statusLabel = vars.status === 'late' ? 'late' : 'on time';
 
   const template =
@@ -378,16 +458,17 @@ export function renderAttendanceSmsMessage(
         ? settings.smsTemplateLate
         : settings.smsTemplateCheckIn;
 
-  return template
-    .replace(/\{student_name\}/gi, safeStudent)
+  return normalizeGsmAsciiPunctuation(template)
+    .replace(/\{student_name\}/gi, safeStudent || 'Student')
     .replace(/\{first_name\}/gi, firstName)
-    .replace(/\{school_name\}/gi, safeSchool)
+    .replace(/\{school_name\}/gi, safeSchool || 'school')
     .replace(/\{time\}/gi, vars.time)
     .replace(/\{class_name\}/gi, safeClass || 'school')
     .replace(/\{status\}/gi, statusLabel)
+    .replace(/[^\x20-\x7E]/g, '')
     .replace(/\s{2,}/g, ' ')
     .trim()
-    .slice(0, 320);
+    .slice(0, MAX_SMS_TEMPLATE_LENGTH);
 }
 
 /**
@@ -416,39 +497,34 @@ function isMissingSchoolSettingsRelation(err: { code?: string; message?: string 
 }
 
 /**
- * Loads the complete resolved configuration for a school from `school.school_settings`
- * with automatic fallback to `school.schools.settings.policy` when migration 12
- * has not yet been applied.
+ * Loads the resolved operational settings for a school strictly from
+ * `school.school_settings` + `school.schools(id, name)`.
+ * NEVER reads `school.schools.settings` (which holds legacy financial state).
  */
 export async function getSchoolSettings(
   adminClient: any,
   schoolId: string
 ): Promise<ResolvedSchoolConfiguration> {
   const [{ data: schoolRow }, settingsRes] = await Promise.all([
-    adminClient.from('schools').select('id, name, settings').eq('id', schoolId).maybeSingle(),
+    adminClient.from('schools').select('id, name').eq('id', schoolId).maybeSingle(),
     adminClient.from('school_settings').select('*').eq('school_id', schoolId).maybeSingle(),
   ]);
 
   const schoolName = schoolRow?.name || 'School';
-  let rawPolicy: Record<string, unknown> | null = null;
-
-  if (!settingsRes.error && settingsRes.data) {
-    rawPolicy = settingsRes.data;
-  } else if (schoolRow?.settings && typeof schoolRow.settings.policy === 'object') {
-    rawPolicy = schoolRow.settings.policy;
-  }
+  const rawPolicy: Record<string, unknown> | null =
+    !settingsRes.error && settingsRes.data ? settingsRes.data : null;
 
   return {
     schoolId,
     schoolName,
-    platformSmsUnitCostUgx: getPlatformSmsUnitCostUgx(),
     ...normalizeSchoolPolicySettings(rawPolicy),
   };
 }
 
 /**
- * Persists validated per-school settings via `school.save_school_settings(...)`
- * with safe `MIG12=0` fallback that preserves `settings.balance` and `settings.wallet_migrated`.
+ * Persists validated non-financial settings exclusively via `school.save_school_settings(...)`.
+ * NEVER writes to `school.schools.settings` JSONB under any circumstance so financial
+ * state (`balance`, `wallet_migrated`, platform billing metadata) can never be touched.
  */
 export async function persistSchoolSettings(
   adminClient: any,
@@ -467,43 +543,14 @@ export async function persistSchoolSettings(
     return { ok: true };
   }
 
-  if (!isMissingSchoolSettingsRelation(rpcRes.error)) {
-    console.error('[School Settings] save_school_settings RPC error:', rpcRes.error);
-    return { ok: false, error: 'Failed to save school settings.' };
+  if (isMissingSchoolSettingsRelation(rpcRes.error)) {
+    return {
+      ok: false,
+      error:
+        'Database migration 12_school_settings.sql has not been applied in Supabase yet. Run supabase_migrations/12_school_settings.sql in Supabase SQL Editor first.',
+    };
   }
 
-  // Graceful fallback when migration 12 has not been applied yet (`MIG12=0`).
-  const { data: currentSchool, error: readErr } = await adminClient
-    .from('schools')
-    .select('name, settings')
-    .eq('id', schoolId)
-    .maybeSingle();
-
-  if (readErr || !currentSchool) {
-    return { ok: false, error: 'School record not found.' };
-  }
-
-  const nextSettings = {
-    ...(typeof currentSchool.settings === 'object' && currentSchool.settings !== null
-      ? currentSchool.settings
-      : {}),
-    policy,
-  };
-
-  const updatePayload: Record<string, unknown> = { settings: nextSettings };
-  if (options?.schoolName && options.schoolName.trim().length >= 2) {
-    updatePayload.name = options.schoolName.trim();
-  }
-
-  const { error: updErr } = await adminClient
-    .from('schools')
-    .update(updatePayload)
-    .eq('id', schoolId);
-
-  if (updErr) {
-    console.error('[School Settings] Fallback update error:', updErr);
-    return { ok: false, error: 'Failed to save school settings.' };
-  }
-
-  return { ok: true };
+  console.error('[School Settings] save_school_settings RPC error:', rpcRes.error);
+  return { ok: false, error: 'Failed to save school settings.' };
 }

@@ -6,18 +6,17 @@ import {
   Clock,
   MessageSquare,
   Cpu,
-  Wallet,
   CheckCircle2,
   AlertCircle,
   RotateCcw,
   Save,
-  ShieldCheck,
   Sparkles,
   RefreshCw,
 } from 'lucide-react';
 import {
   COMMON_SCHOOL_TIMEZONES,
   DEFAULT_SCHOOL_POLICY_SETTINGS,
+  MAX_SMS_TEMPLATE_LENGTH,
   formatHhMm12Hour,
   parseHhMmToMinutes,
   renderAttendanceSmsMessage,
@@ -26,7 +25,7 @@ import {
 import { formatZKTecoDisplayName } from '@/utils/zkteco/formatter';
 import { saveSchoolSettingsAction, resetSchoolSettingsAction } from './actions';
 
-type SettingsSectionId = 'general' | 'attendance' | 'sms' | 'hardware' | 'wallet';
+type SettingsSectionId = 'general' | 'attendance' | 'sms' | 'hardware';
 
 interface SettingsFormProps {
   initialSettings: ResolvedSchoolConfiguration;
@@ -78,14 +77,6 @@ export default function SettingsForm({ initialSettings }: SettingsFormProps) {
   const [lcdPrefixSupport, setLcdPrefixSupport] = useState(initialSettings.lcdPrefixSupport);
   const [lcdShowStudentClass, setLcdShowStudentClass] = useState(initialSettings.lcdShowStudentClass);
 
-  const [defaultTopUpAmount, setDefaultTopUpAmount] = useState(String(initialSettings.defaultTopUpAmount));
-  const [topUpPresetsText, setTopUpPresetsText] = useState(initialSettings.topUpPresets.join(', '));
-  const [lowBalanceThresholdUgx, setLowBalanceThresholdUgx] = useState(
-    String(initialSettings.lowBalanceThresholdUgx)
-  );
-
-  const platformSmsRate = initialSettings.platformSmsUnitCostUgx;
-
   const hydrateStateFromConfig = (cfg: ResolvedSchoolConfiguration) => {
     setSchoolName(cfg.schoolName);
     setAcademicTermLabel(cfg.academicTermLabel);
@@ -116,9 +107,6 @@ export default function SettingsForm({ initialSettings }: SettingsFormProps) {
     setLcdPrefixAdmin(cfg.lcdPrefixAdmin);
     setLcdPrefixSupport(cfg.lcdPrefixSupport);
     setLcdShowStudentClass(cfg.lcdShowStudentClass);
-    setDefaultTopUpAmount(String(cfg.defaultTopUpAmount));
-    setTopUpPresetsText(cfg.topUpPresets.join(', '));
-    setLowBalanceThresholdUgx(String(cfg.lowBalanceThresholdUgx));
   };
 
   // Effective student cutoff display (cutoff + grace minutes)
@@ -244,9 +232,6 @@ export default function SettingsForm({ initialSettings }: SettingsFormProps) {
         lcdPrefixAdmin,
         lcdPrefixSupport,
         lcdShowStudentClass,
-        defaultTopUpAmount: Number(defaultTopUpAmount),
-        topUpPresets: topUpPresetsText,
-        lowBalanceThresholdUgx: Number(lowBalanceThresholdUgx),
       });
 
       if ('error' in res) {
@@ -276,7 +261,6 @@ export default function SettingsForm({ initialSettings }: SettingsFormProps) {
     { id: 'attendance', label: 'Cutoffs & Sessions', icon: Clock },
     { id: 'sms', label: 'Parent SMS & Templates', icon: MessageSquare },
     { id: 'hardware', label: 'Classes, PINs & Hardware', icon: Cpu },
-    { id: 'wallet', label: 'Wallet & Top-Up Defaults', icon: Wallet },
   ];
 
   const isCustomTimezone = !COMMON_SCHOOL_TIMEZONES.some((t) => t.value === timeZone);
@@ -700,46 +684,61 @@ export default function SettingsForm({ initialSettings }: SettingsFormProps) {
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
               <div className="space-y-1.5">
-                <label className="block text-xs font-semibold text-[#171719]">On-Time Check-In Template</label>
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-semibold text-[#171719]">On-Time Check-In Template</label>
+                  <span className="font-mono text-[10px] text-[#85858a]">
+                    {smsTemplateCheckIn.length}/{MAX_SMS_TEMPLATE_LENGTH}
+                  </span>
+                </div>
                 <textarea
                   rows={3}
-                  maxLength={320}
+                  maxLength={MAX_SMS_TEMPLATE_LENGTH}
                   value={smsTemplateCheckIn}
                   onChange={(e) => setSmsTemplateCheckIn(e.target.value)}
                   className="w-full p-2.5 text-xs border border-[#e1e1e5] rounded-[9px] bg-white text-[#171719] focus:outline-none focus:border-[#007aff]"
                 />
                 <div className="p-2.5 rounded-[8px] bg-[#edf9f0] border border-[#d2f4d9] text-[11px] text-[#171719]">
-                  <strong className="block text-[10px] uppercase text-[#2da94f] mb-0.5">Live SMS Preview</strong>
+                  <strong className="block text-[10px] uppercase text-[#2da94f] mb-0.5">Live SMS Preview (1 SMS max)</strong>
                   {sampleCheckInSms}
                 </div>
               </div>
 
               <div className="space-y-1.5">
-                <label className="block text-xs font-semibold text-[#171719]">Late Arrival Template</label>
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-semibold text-[#171719]">Late Arrival Template</label>
+                  <span className="font-mono text-[10px] text-[#85858a]">
+                    {smsTemplateLate.length}/{MAX_SMS_TEMPLATE_LENGTH}
+                  </span>
+                </div>
                 <textarea
                   rows={3}
-                  maxLength={320}
+                  maxLength={MAX_SMS_TEMPLATE_LENGTH}
                   value={smsTemplateLate}
                   onChange={(e) => setSmsTemplateLate(e.target.value)}
                   className="w-full p-2.5 text-xs border border-[#e1e1e5] rounded-[9px] bg-white text-[#171719] focus:outline-none focus:border-[#007aff]"
                 />
                 <div className="p-2.5 rounded-[8px] bg-[#fff5e7] border border-[#ffe0b2] text-[11px] text-[#171719]">
-                  <strong className="block text-[10px] uppercase text-[#f5a30a] mb-0.5">Live SMS Preview</strong>
+                  <strong className="block text-[10px] uppercase text-[#f5a30a] mb-0.5">Live SMS Preview (1 SMS max)</strong>
                   {sampleLateSms}
                 </div>
               </div>
 
               <div className="space-y-1.5">
-                <label className="block text-xs font-semibold text-[#171719]">Dismissal Check-Out Template</label>
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-semibold text-[#171719]">Dismissal Check-Out Template</label>
+                  <span className="font-mono text-[10px] text-[#85858a]">
+                    {smsTemplateCheckOut.length}/{MAX_SMS_TEMPLATE_LENGTH}
+                  </span>
+                </div>
                 <textarea
                   rows={3}
-                  maxLength={320}
+                  maxLength={MAX_SMS_TEMPLATE_LENGTH}
                   value={smsTemplateCheckOut}
                   onChange={(e) => setSmsTemplateCheckOut(e.target.value)}
                   className="w-full p-2.5 text-xs border border-[#e1e1e5] rounded-[9px] bg-white text-[#171719] focus:outline-none focus:border-[#007aff]"
                 />
                 <div className="p-2.5 rounded-[8px] bg-[#edf5ff] border border-[#d6e7ff] text-[11px] text-[#171719]">
-                  <strong className="block text-[10px] uppercase text-[#007aff] mb-0.5">Live SMS Preview</strong>
+                  <strong className="block text-[10px] uppercase text-[#007aff] mb-0.5">Live SMS Preview (1 SMS max)</strong>
                   {sampleCheckOutSms}
                 </div>
               </div>
@@ -876,64 +875,6 @@ export default function SettingsForm({ initialSettings }: SettingsFormProps) {
                   <div className="font-mono text-xs text-[#6ee7b7] mt-0.5">{item.lcd}</div>
                 </div>
               ))}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* SECTION 5: WALLET & TOP-UP DEFAULTS */}
-      {activeSection === 'wallet' && (
-        <div className="bg-white border border-[#e7e7ea] rounded-[16px] p-6 shadow-[0_1px_2px_rgba(0,0,0,0.02)] space-y-5">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div>
-              <h2 className="text-sm font-bold text-[#171719]">SMS Wallet Presets & Low-Balance Alert Threshold</h2>
-              <p className="text-xs text-[#85858a] mt-0.5">
-                Customize quick Mobile Money top-up buttons and low-balance warning thresholds for your bursar.
-              </p>
-            </div>
-            <div className="px-3.5 py-2 rounded-[10px] bg-[#f7f7f9] border border-[#e7e7ea] text-xs flex items-center gap-2">
-              <ShieldCheck className="w-4 h-4 text-[#30b357]" />
-              <span className="text-[#5e5e63]">Platform SMS Rate:</span>
-              <strong className="font-mono text-[#171719]">{platformSmsRate.toLocaleString()} UGX / SMS</strong>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="space-y-1.5">
-              <label className="block text-xs font-semibold text-[#171719]">Default Top-Up Amount (UGX)</label>
-              <input
-                type="number"
-                min={1000}
-                max={10000000}
-                step={500}
-                value={defaultTopUpAmount}
-                onChange={(e) => setDefaultTopUpAmount(e.target.value)}
-                className="w-full h-9 px-3 text-xs font-mono border border-[#e1e1e5] rounded-[9px]"
-              />
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="block text-xs font-semibold text-[#171719]">Quick Top-Up Buttons (Comma-Separated UGX)</label>
-              <input
-                type="text"
-                value={topUpPresetsText}
-                onChange={(e) => setTopUpPresetsText(e.target.value)}
-                placeholder="10000, 20000, 50000, 100000, 200000, 500000"
-                className="w-full h-9 px-3 text-xs font-mono border border-[#e1e1e5] rounded-[9px]"
-              />
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="block text-xs font-semibold text-[#171719]">Low-Balance Warning Threshold (UGX)</label>
-              <input
-                type="number"
-                min={0}
-                max={1000000}
-                step={500}
-                value={lowBalanceThresholdUgx}
-                onChange={(e) => setLowBalanceThresholdUgx(e.target.value)}
-                className="w-full h-9 px-3 text-xs font-mono border border-[#e1e1e5] rounded-[9px]"
-              />
             </div>
           </div>
         </div>

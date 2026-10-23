@@ -191,16 +191,109 @@ const startBalRows = await q(
 );
 const startWalletA = Number(startBalRows[0].wbal);
 
+// Verify zero financial columns exist in `school.school_settings`
+const schemaCols = await q(
+  `SELECT column_name FROM information_schema.columns
+   WHERE table_schema = 'school' AND table_name = 'school_settings'`
+);
+const badSchemaCols = schemaCols
+  .map((r) => r.column_name)
+  .filter((c) => /(price|pricing|rate|tariff|fee|cost|balance|wallet|credit|debit|topup|top_up|currency|ugx|ledger|payment|threshold)/i.test(c));
+check(
+  'PostgreSQL schema check: school.school_settings contains ZERO financial, price, or wallet columns',
+  schemaCols.length >= 25 && badSchemaCols.length === 0,
+  `cols=${schemaCols.length}, bad=${badSchemaCols.join(',')}`
+);
+
+// Explicit financial tamper attacks via Server Action (every single one MUST fail hard)
+for (const [label, payload] of [
+  ['SMS price override (smsPrice: 1)', { smsPrice: 1 }],
+  ['SMS unit rate override (smsRate: 0, platformSmsUnitCostUgx: 1)', { smsRate: 0, platformSmsUnitCostUgx: 1 }],
+  ['Wallet balance injection (balance: 999999999)', { balance: 999_999_999 }],
+  ['Top-up preset/threshold tampering (defaultTopUpAmount / topUpPresets / lowBalanceThresholdUgx)', {
+    defaultTopUpAmount: 1000,
+    topUpPresets: [500, 1000],
+    lowBalanceThresholdUgx: 0,
+  }],
+]) {
+  const tamperRes = await callAction(cookieA, 'saveSchoolSettingsAction', [payload]);
+  check(
+    `Financial tamper attack blocked: ${label}`,
+    Boolean(tamperRes.value?.error) && tamperRes.value?.success !== true,
+    tamperRes.value?.error || JSON.stringify(tamperRes.value)
+  );
+}
+
+// Multi-segment UCS-2 emoji & >160 char carrier SMS billing inflation attacks MUST fail hard
+const emojiSmsAttack = await callAction(cookieA, 'saveSchoolSettingsAction', [
+  { smsTemplateCheckIn: '🎓🏫 Hello Parent {student_name} checked in 🎉✨🚀' },
+]);
+check(
+  'UCS-2 emoji SMS multi-segment carrier inflation attack blocked',
+  Boolean(emojiSmsAttack.value?.error) && emojiSmsAttack.value?.success !== true,
+  emojiSmsAttack.value?.error
+);
+
+const oversizedSmsAttack = await callAction(cookieA, 'saveSchoolSettingsAction', [
+  { smsTemplateCheckIn: 'A'.repeat(220) },
+]);
+check(
+  'Oversized >160-char multi-segment SMS template attack blocked',
+  Boolean(oversizedSmsAttack.value?.error) && oversizedSmsAttack.value?.success !== true,
+  oversizedSmsAttack.value?.error
+);
+
+// Direct PostgreSQL RPC guard: even raw SQL `school.save_school_settings` rejects financial keys
+let dbRpcBlocked = false;
+try {
+  await q(`SELECT school.save_school_settings($1, NULL, '{"smsPrice": 1}'::jsonb, NULL)`, [A.school]);
+} catch (err) {
+  dbRpcBlocked = /Forbidden financial parameter/i.test(err.message);
+}
+check('PostgreSQL RPC school.save_school_settings rejects financial JSON keys inside PL/pgSQL', dbRpcBlocked);
+
+// Direct PostgREST client tamper attacks as authenticated School Admin on financial tables/RPCs
+const patchSchoolsRes = await fetch(`${SHIM}/rest/v1/schools?id=eq.${A.school}`, {
+  method: 'PATCH',
+  headers: {
+    apikey: 'lab-anon-key',
+    Authorization: `Bearer ${sessJsonA.access_token}`,
+    'Content-Profile': 'school',
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({ settings: { balance: 99_999_999, sms_rate: 1 } }),
+});
+const patchWalletsRes = await fetch(`${SHIM}/rest/v1/wallets?tenant_id=eq.${A.school}`, {
+  method: 'PATCH',
+  headers: {
+    apikey: 'lab-anon-key',
+    Authorization: `Bearer ${sessJsonA.access_token}`,
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({ balance: 99_999_999 }),
+});
+const rpcCreditRes = await fetch(`${SHIM}/rest/v1/rpc/credit_wallet`, {
+  method: 'POST',
+  headers: {
+    apikey: 'lab-anon-key',
+    Authorization: `Bearer ${sessJsonA.access_token}`,
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({ p_school_id: A.school, p_amount: 500000, p_tx_ref: 'hack-ref' }),
+});
+check(
+  'Direct PostgREST writes to school.schools, public.wallets & RPC credit_wallet denied to School Admin',
+  patchSchoolsRes.status >= 400 && patchWalletsRes.status >= 400 && rpcCreditRes.status >= 400,
+  `schools=${patchSchoolsRes.status}, wallets=${patchWalletsRes.status}, credit_wallet=${rpcCreditRes.status}`
+);
+
+// Legitimate operational save with cross-tenant schoolId smuggling attempt -> applies ONLY to School A
 const smuggleSave = await callAction(cookieA, 'saveSchoolSettingsAction', [
   {
     schoolId: B.school,
     school_id: B.school,
-    balance: 999_999_999,
-    wallet_migrated: false,
-    platformSmsUnitCostUgx: 1,
-    smsUnitCostUgx: 1,
     schoolName: 'Alpha STEM Academy',
-    academicTermLabel: 'Term 3 · 2026',
+    academicTermLabel: 'Term 3 - 2026',
     timeZone: 'Africa/Kigali',
     studentLateCutoff: '07:30',
     studentGraceMinutes: 10,
@@ -223,21 +316,14 @@ const smuggleSave = await callAction(cookieA, 'saveSchoolSettingsAction', [
     lcdPrefixAdmin: 'Head. ',
     lcdPrefixSupport: 'Ops. ',
     lcdShowStudentClass: false,
-    defaultTopUpAmount: 25000,
-    topUpPresets: '15000, 25000, 75000, 150000',
-    lowBalanceThresholdUgx: 10000,
   },
 ]);
 
-check('School A settings saved cleanly via Server Action', smuggleSave.value?.success === true);
-check(
-  'Platform SMS unit rate cannot be overridden by tenant input (remains 50 UGX)',
-  smuggleSave.value?.settings?.platformSmsUnitCostUgx === 50
-);
+check('School A non-financial operational settings saved cleanly via Server Action', smuggleSave.value?.success === true);
 
 const readB = await callAction(cookieB, 'getSchoolSettingsAction', []);
 check(
-  'School B name & policies remain 100% untouched by School A smuggled payload',
+  'School B name & policies remain 100% untouched by School A smuggled schoolId payload',
   readB.value?.settings?.schoolName === 'Bravo College' &&
     readB.value?.settings?.timeZone === 'Africa/Kampala' &&
     readB.value?.settings?.studentLateCutoff === '08:00' &&
@@ -292,7 +378,7 @@ for (let i = 1; i <= 4; i++) {
     callAction(cookieA, 'saveSchoolSettingsAction', [
       {
         schoolName: 'Alpha STEM Academy',
-        academicTermLabel: `Term 3 · Rev ${i}`,
+        academicTermLabel: `Term 3 - Rev ${i}`,
         timeZone: 'Africa/Kigali',
         studentLateCutoff: '07:30',
         studentGraceMinutes: 10,
@@ -315,9 +401,6 @@ for (let i = 1; i <= 4; i++) {
         lcdPrefixAdmin: 'Head. ',
         lcdPrefixSupport: 'Ops. ',
         lcdShowStudentClass: false,
-        defaultTopUpAmount: 25000,
-        topUpPresets: '15000, 25000, 75000, 150000',
-        lowBalanceThresholdUgx: 10000,
       },
     ])
   );
@@ -329,20 +412,23 @@ const afterRace = await q(
   `SELECT w.balance::numeric AS wbal,
           (s.settings->>'balance')::numeric AS sbal,
           (s.settings->>'wallet_migrated')::boolean AS migrated,
-          s.settings->'policy'->>'timeZone' AS policy_tz
+          (s.settings ? 'policy') AS has_policy_in_schools_json,
+          ss.time_zone AS settings_tz
    FROM public.wallets w
    JOIN school.schools s ON s.id = w.tenant_id
+   JOIN school.school_settings ss ON ss.school_id = s.id
    WHERE s.id = $1`,
   [A.school]
 );
 const expectedBal = startWalletA + 20_000;
 check(
-  'Concurrent 4x payment webhooks + 4x settings saves preserve exact UGX parity AND policy JSON',
+  'Concurrent 4x payment webhooks + 4x settings saves preserve exact UGX parity & never touch schools.settings',
   Number(afterRace[0].wbal) === expectedBal &&
     Number(afterRace[0].sbal) === expectedBal &&
     afterRace[0].migrated === true &&
-    afterRace[0].policy_tz === 'Africa/Kigali',
-  `wallet=${afterRace[0].wbal}, mirror=${afterRace[0].sbal}, expected=${expectedBal}`
+    afterRace[0].has_policy_in_schools_json === false &&
+    afterRace[0].settings_tz === 'Africa/Kigali',
+  `wallet=${afterRace[0].wbal}, mirror=${afterRace[0].sbal}, has_policy=${afterRace[0].has_policy_in_schools_json}`
 );
 
 // ---------------------------------------------------------------------------
@@ -580,9 +666,9 @@ check(
 );
 
 // ---------------------------------------------------------------------------
-// 6. MIG12=0 Pre-Migration Fallback Verification + Final Clean Re-Seed
+// 6. MIG12=0 Pre-Migration Financial Isolation Verification + Final Clean Re-Seed
 // ---------------------------------------------------------------------------
-console.log('\n--- [6] Pre-Migration Fallback (MIG12=0) Verification ---');
+console.log('\n--- [6] Pre-Migration Financial Isolation (MIG12=0) Verification ---');
 
 await seedLab({ MIG12: '0' });
 const cookieAMig0 = await sessionCookie('adminA@lab.io');
@@ -591,11 +677,14 @@ const mig0Save = await callAction(cookieAMig0, 'saveSchoolSettingsAction', [
   { schoolName: 'Fallback Mode School', studentLateCutoff: '07:15', timeZone: 'Africa/Nairobi' },
 ]);
 const mig0Load = await callAction(cookieAMig0, 'getSchoolSettingsAction', []);
+const mig0SchoolJson = await q(`SELECT settings FROM school.schools WHERE id = $1`, [A.school]);
 check(
-  'MIG12=0 fallback saves and reloads school policies cleanly via school.schools.settings.policy',
-  mig0Save.value?.success === true &&
-    mig0Load.value?.settings?.studentLateCutoff === '07:15' &&
-    mig0Load.value?.settings?.timeZone === 'Africa/Nairobi'
+  'MIG12=0 safely serves defaults on read and NEVER writes policy JSON into school.schools.settings',
+  Boolean(mig0Save.value?.error) &&
+    mig0Load.value?.settings?.studentLateCutoff === '08:00' &&
+    mig0Load.value?.settings?.timeZone === 'Africa/Kampala' &&
+    JSON.stringify(mig0SchoolJson[0].settings) === JSON.stringify({ balance: 1000 }),
+  `schoolJson=${JSON.stringify(mig0SchoolJson[0].settings)}`
 );
 
 // Restore clean default lab database for subsequent test suites

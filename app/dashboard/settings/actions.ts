@@ -40,23 +40,17 @@ export async function saveSchoolSettingsAction(
   | { error: string }
 > {
   try {
-    // SECURITY: Always authenticate & bind strictly to caller's tenant BEFORE inspecting payload.
+    // SECURITY: Always authenticate & bind strictly to caller's own schoolId BEFORE inspecting payload.
     const { schoolId, user } = await requireSchoolAdmin();
 
     if (!rawInput || typeof rawInput !== 'object' || Array.isArray(rawInput)) {
       return { error: 'Invalid settings payload.' };
     }
 
-    // Never trust client-supplied school_id, balance, wallet flags, or platform SMS rate.
-    const sanitizedInput: Record<string, unknown> = { ...rawInput };
-    delete sanitizedInput.schoolId;
-    delete sanitizedInput.school_id;
-    delete sanitizedInput.balance;
-    delete sanitizedInput.wallet_migrated;
-    delete sanitizedInput.platformSmsUnitCostUgx;
-    delete sanitizedInput.smsUnitCostUgx;
-
-    const validated = validateSchoolSettingsInput(sanitizedInput);
+    // Validate BEFORE stripping keys so any attempt to pass financial/pricing/wallet
+    // parameters (`smsPrice`, `smsCost`, `balance`, `wallet`, `defaultTopUpAmount`, etc.)
+    // is hard-rejected immediately. `schoolId` / `school_id` are ignored in favor of `requireSchoolAdmin().schoolId`.
+    const validated = validateSchoolSettingsInput(rawInput);
     if (!validated.ok) {
       return { error: validated.error };
     }
