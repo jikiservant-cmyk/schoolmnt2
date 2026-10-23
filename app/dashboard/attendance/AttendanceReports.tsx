@@ -210,33 +210,51 @@ export default function AttendanceReports({
     });
   }, [logs, startDate, endDate, reportMode, selectedPersonId, selectedGroup, selectedClassId]);
 
-  // DAILY CLASS REGISTER ROSTER (All students in the class with their status on the selected day)
+  // DAILY CLASS REGISTER ROSTER (All students in the class with BOTH Morning Check-In & Evening Check-Out)
   const classDailyRoster = useMemo(() => {
     if (reportMode !== 'class_daily_sheet') return [];
 
-    // Map logs by person_id for the selected day
-    const logByPerson = new Map<string, any>();
+    // Collect BOTH `check_in` and `check_out` per person on the selected day
+    const slotsByPerson = new Map<string, { checkIn?: any; checkOut?: any }>();
     filteredReportLogs.forEach(log => {
-      if (log.person_id) {
-        logByPerson.set(log.person_id, log);
+      if (!log.person_id) return;
+      const cur = slotsByPerson.get(log.person_id) || {};
+      if (log.attendance_type === 'check_out') {
+        cur.checkOut = log;
+      } else {
+        cur.checkIn = log;
       }
+      slotsByPerson.set(log.person_id, cur);
     });
 
     return classStudents.map((student, index) => {
-      const matchLog = logByPerson.get(student.id);
+      const slots = slotsByPerson.get(student.id);
+      const inLog = slots?.checkIn;
+      const outLog = slots?.checkOut;
       let status: 'present' | 'late' | 'absent' = 'absent';
-      let checkInTime: string = '—';
-      let checkInType: string = '—';
+      let checkInTime = '—';
+      let checkOutTime = '—';
+      let checkInType = '—';
 
-      if (matchLog) {
-        status = matchLog.status === 'late' ? 'late' : 'present';
-        if (matchLog.occurred_at) {
-          checkInTime = formatEATTime(matchLog.occurred_at, {
-            hour: '2-digit',
-            minute: '2-digit'
-          });
+      if (inLog && inLog.status !== 'absent') {
+        status = inLog.status === 'late' ? 'late' : 'present';
+        if (inLog.occurred_at) {
+          checkInTime = formatEATTime(inLog.occurred_at, { hour: '2-digit', minute: '2-digit' });
         }
-        checkInType = (matchLog.attendance_type || 'check_in').replace(/_/g, ' ');
+      } else if (outLog && outLog.status !== 'absent') {
+        status = 'present';
+      }
+
+      if (outLog && outLog.status !== 'absent' && outLog.occurred_at) {
+        checkOutTime = formatEATTime(outLog.occurred_at, { hour: '2-digit', minute: '2-digit' });
+      }
+
+      if (inLog && inLog.status !== 'absent' && outLog && outLog.status !== 'absent') {
+        checkInType = 'check in + out';
+      } else if (inLog && inLog.status !== 'absent') {
+        checkInType = 'check in';
+      } else if (outLog && outLog.status !== 'absent') {
+        checkInType = 'check out';
       }
 
       return {
@@ -247,6 +265,7 @@ export default function AttendanceReports({
         phone: student.phone || '—',
         status,
         checkInTime,
+        checkOutTime,
         checkInType,
         className: classMap.get(student.class_id || '') || 'General'
       };
@@ -336,13 +355,14 @@ export default function AttendanceReports({
           [] // empty separator
         ];
 
-        const tableHeaders = ['Roll #', 'Student Full Name', 'Admission / Device UID', 'Class', 'Arrival Time', 'Status', 'Check-In Type', 'Parent Phone', 'Teacher Remarks'];
+        const tableHeaders = ['Roll #', 'Student Full Name', 'Admission / Device UID', 'Class', 'Time In', 'Time Out', 'Status', 'Daily Sessions', 'Parent Phone', 'Teacher Remarks'];
         const tableRows = classDailyRoster.map(row => [
           row.rollNumber,
           row.fullName,
           row.deviceUserId,
           row.className,
           row.checkInTime,
+          row.checkOutTime,
           row.status.toUpperCase(),
           row.checkInType,
           row.phone,
@@ -403,13 +423,14 @@ export default function AttendanceReports({
         alert('No class roster data available to export.');
         return;
       }
-      const headers = ['Roll Number', 'Student Name', 'Admission / Device UID', 'Class', 'Arrival Time', 'Status', 'Channel', 'Parent Phone'];
+      const headers = ['Roll Number', 'Student Name', 'Admission / Device UID', 'Class', 'Time In', 'Time Out', 'Status', 'Daily Sessions', 'Parent Phone'];
       const rows = classDailyRoster.map(r => [
         r.rollNumber,
         r.fullName,
         r.deviceUserId,
         r.className,
         r.checkInTime,
+        r.checkOutTime,
         r.status.toUpperCase(),
         r.checkInType,
         r.phone,
@@ -923,7 +944,8 @@ export default function AttendanceReports({
                   <th className="py-3 px-4 w-12 text-center">#</th>
                   <th className="py-3 px-4 whitespace-nowrap">Student Name</th>
                   <th className="py-3 px-4 whitespace-nowrap">Class / Stream</th>
-                  <th className="py-3 px-4 whitespace-nowrap">Arrival Time</th>
+                  <th className="py-3 px-4 whitespace-nowrap">Time In</th>
+                  <th className="py-3 px-4 whitespace-nowrap">Time Out</th>
                   <th className="py-3 px-4 whitespace-nowrap">Status</th>
                   <th className="py-3 px-4 whitespace-nowrap">Parent Phone</th>
                   <th className="py-3 px-4 whitespace-nowrap">UID</th>
@@ -933,7 +955,7 @@ export default function AttendanceReports({
               <tbody className="divide-y divide-[#f7f7f9]">
                 {classDailyRoster.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="py-16 text-center text-xs text-[#929297]">
+                    <td colSpan={9} className="py-16 text-center text-xs text-[#929297]">
                       <div className="flex flex-col items-center justify-center gap-2">
                         <GraduationCap className="w-10 h-10 text-[#929297]" />
                         <p className="font-semibold text-[#171719]">No students registered in this class</p>
@@ -964,6 +986,10 @@ export default function AttendanceReports({
 
                       <td className="py-3 px-4 whitespace-nowrap font-mono text-[11px] text-[#171719]">
                         {row.checkInTime}
+                      </td>
+
+                      <td className="py-3 px-4 whitespace-nowrap font-mono text-[11px] text-[#5e5e63]">
+                        {row.checkOutTime}
                       </td>
 
                       <td className="py-3 px-4 whitespace-nowrap">

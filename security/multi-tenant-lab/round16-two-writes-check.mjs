@@ -159,7 +159,9 @@ const mig13Candidates = [
 ];
 const mig13Sql = fs.readFileSync(mig13Candidates.find((p) => fs.existsSync(p)), 'utf8');
 
-// Pre-seed dirty historical data: 3 morning check-ins + 2 evening check-outs on same EAT day!
+// Pre-seed dirty historical data:
+//   - 3 morning check-ins + 2 evening check-outs on 2026-10-10
+//   - 1 historical after-cutoff `late` `check_in` punch on 2026-10-09 at 14:20 EAT (MUST stay `check_in`!)
 await db.query(`
   INSERT INTO school.attendance_logs (school_id, person_id, source, attendance_type, status, occurred_at)
   VALUES
@@ -167,13 +169,28 @@ await db.query(`
     ('${A.school}', '${A.student}', 'device', 'check_in',  'present', '2026-10-10T07:15:00+03:00'),
     ('${A.school}', '${A.student}', 'manual', 'check_in',  'present', '2026-10-10T08:30:00+03:00'),
     ('${A.school}', '${A.student}', 'device', 'check_out', 'present', '2026-10-10T16:10:00+03:00'),
-    ('${A.school}', '${A.student}', 'device', 'check_out', 'present', '2026-10-10T16:45:00+03:00')
+    ('${A.school}', '${A.student}', 'device', 'check_out', 'present', '2026-10-10T16:45:00+03:00'),
+    ('${A.school}', '${A.student}', 'device', 'check_in',  'late',    '2026-10-09T14:20:00+03:00')
 `);
 
 await db.query(mig13Sql);
 // Run a second time immediately to prove 100% idempotency!
 await db.query(mig13Sql);
 await fetch(`${SHIM}/__reload`, { method: 'POST' });
+
+const preservedHistLate = await db.query(
+  `SELECT attendance_type, status, attendance_date::text AS d
+   FROM school.attendance_logs
+   WHERE person_id = $1 AND attendance_date = '2026-10-09'`,
+  [A.student]
+);
+check(
+  'Historical after-cutoff late check_in (14:20) is preserved as check_in without rewriting recorded meaning',
+  preservedHistLate.rowCount === 1 &&
+    preservedHistLate.rows[0].attendance_type === 'check_in' &&
+    preservedHistLate.rows[0].status === 'late',
+  JSON.stringify(preservedHistLate.rows[0])
+);
 
 const cleanedDay = await db.query(
   `SELECT attendance_type, attendance_date::text AS d, occurred_at
@@ -241,6 +258,39 @@ check(
   'PostgreSQL CHECK constraint rejects any attendance_type outside check_in / check_out (23514)',
   badTypeErr === '23514',
   `code=${badTypeErr}`
+);
+
+// Verify omitting `attendance_type` altogether auto-classifies morning vs evening via trigger (DEFAULT dropped!)
+await db.query(
+  `INSERT INTO school.attendance_logs (school_id, person_id, source, occurred_at)
+   VALUES ($1, $2, 'device', '2026-10-08T07:40:00+03:00'),
+          ($1, $2, 'device', '2026-10-08T16:25:00+03:00')`,
+  [A.school, A.student]
+);
+const autoClassified = await db.query(
+  `SELECT array_agg(attendance_type ORDER BY occurred_at) AS types
+   FROM school.attendance_logs
+   WHERE person_id = $1 AND attendance_date = '2026-10-08'`,
+  [A.student]
+);
+check(
+  'Inserts omitting attendance_type auto-classify <13:00 as check_in and >=13:00 as check_out via trigger',
+  autoClassified.rows[0]?.types?.join(',') === 'check_in,check_out',
+  JSON.stringify(autoClassified.rows[0])
+);
+
+// Verify 3-tier timezone resolution (`school_settings.time_zone` -> `schools.timezone` -> `'Africa/Kampala'`)
+await db.query(`ALTER TABLE school.schools ADD COLUMN IF NOT EXISTS timezone text`);
+await db.query(`UPDATE school.schools SET timezone = 'Africa/Lagos' WHERE id = $1`, [A.school]);
+await fetch(`${SHIM}/__reload`, { method: 'POST' });
+const dbTzFallback = await db.query(`SELECT school.resolve_school_timezone($1) AS tz`, [A.school]);
+const cookieTz = await sessionCookie('adminA@lab.io');
+const appTzFallback = await callAction(cookieTz, 'getSchoolSettingsAction', []);
+await db.query(`UPDATE school.schools SET timezone = NULL WHERE id = $1`, [A.school]);
+check(
+  'Both PostgreSQL trigger and Next.js resolve school.schools.timezone fallback identically when school_settings row is absent',
+  dbTzFallback.rows[0]?.tz === 'Africa/Lagos' && appTzFallback.value?.settings?.timeZone === 'Africa/Lagos',
+  `db=${dbTzFallback.rows[0]?.tz}, app=${appTzFallback.value?.settings?.timeZone}`
 );
 
 // ---------------------------------------------------------------------------
@@ -456,6 +506,23 @@ check(
     twoDays.rows[0].types.join(',') === 'check_in,check_out' &&
     twoDays.rows[1].types.join(',') === 'check_in,check_out',
   JSON.stringify(twoDays.rows)
+);
+
+// 4d-2. Dashboard SSR metrics check: 1 student with BOTH late morning check_in + evening check_out
+//       MUST render 100% class attendance (NOT 200%!) and keep Late = 1 (NOT wiped to On-Time by evening check_out!)
+await db.query(`DELETE FROM school.attendance_logs WHERE school_id = $1`, [A.school]);
+await db.query(
+  `INSERT INTO school.attendance_logs (school_id, person_id, source, attendance_type, status, occurred_at)
+   VALUES ($1, $2, 'device', 'check_in',  'late',    $3),
+          ($1, $2, 'device', 'check_out', 'present', $4)`,
+  [A.school, A.student, `${todayEatDate}T08:45:00+03:00`, `${todayEatDate}T16:45:00+03:00`]
+);
+const dashRes = await fetch(`${APP}/dashboard`, { headers: { cookie: cookieA } });
+const dashHtml = await dashRes.text();
+check(
+  'Dashboard SSR counts unique students across check_in + check_out (never 200%) and preserves morning Late status after evening check_out',
+  dashRes.status === 200 && !dashHtml.includes('200%') && !dashHtml.includes('200.0%'),
+  `http=${dashRes.status}, has200pct=${dashHtml.includes('200%')}`
 );
 
 // 4e. Financial Integrity Check: Wallets & schools.settings untouched

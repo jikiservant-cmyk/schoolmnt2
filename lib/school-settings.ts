@@ -498,21 +498,33 @@ function isMissingSchoolSettingsRelation(err: { code?: string; message?: string 
 
 /**
  * Loads the resolved operational settings for a school strictly from
- * `school.school_settings` + `school.schools(id, name)`.
- * NEVER reads `school.schools.settings` (which holds legacy financial state).
+ * `school.school_settings` + `school.schools(id, name[, timezone])`.
+ * Matches PostgreSQL timezone fallback order (`school.school_settings.time_zone`
+ * -> `school.schools.timezone` -> `'Africa/Kampala'`) while NEVER reading or
+ * touching `school.schools.settings` (which holds legacy financial state).
  */
 export async function getSchoolSettings(
   adminClient: any,
   schoolId: string
 ): Promise<ResolvedSchoolConfiguration> {
-  const [{ data: schoolRow }, settingsRes] = await Promise.all([
-    adminClient.from('schools').select('id, name').eq('id', schoolId).maybeSingle(),
+  const [schoolRes, settingsRes] = await Promise.all([
+    adminClient.from('schools').select('id, name, timezone').eq('id', schoolId).maybeSingle(),
     adminClient.from('school_settings').select('*').eq('school_id', schoolId).maybeSingle(),
   ]);
 
+  let schoolRow = schoolRes.data;
+  if (schoolRes.error) {
+    const fallbackSchool = await adminClient.from('schools').select('id, name').eq('id', schoolId).maybeSingle();
+    schoolRow = fallbackSchool.data;
+  }
+
   const schoolName = schoolRow?.name || 'School';
   const rawPolicy: Record<string, unknown> | null =
-    !settingsRes.error && settingsRes.data ? settingsRes.data : null;
+    !settingsRes.error && settingsRes.data
+      ? settingsRes.data
+      : schoolRow?.timezone
+        ? { time_zone: schoolRow.timezone }
+        : null;
 
   return {
     schoolId,

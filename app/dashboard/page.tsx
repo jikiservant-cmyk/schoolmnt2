@@ -161,25 +161,46 @@ export default async function DashboardPage() {
     todayLogs = todayLogsData || [];
     recentMessages = messagesData || [];
 
-    // Calculate unique student & teacher attendance for TODAY
-    const studentLogsMap = new Map<string, any>();
-    const teacherLogsMap = new Map<string, any>();
+    // Calculate unique student & teacher daily attendance across 2 daily slots
+    // (`1 check_in` + `1 check_out` MAX per person per day):
+    //   - Morning `check_in` establishes daily punctuality (`present` vs `late`)
+    //   - Evening `check_out` NEVER overwrites a morning `late` arrival to `present`
+    //   - Manual `absent` is NEVER counted as attended
+    const buildDailyPersonMap = (rows: any[], matchStudent: boolean) => {
+      const byPerson = new Map<string, { checkIn?: any; checkOut?: any; fallback?: any }>();
+      for (const log of rows) {
+        const personId = log.person_id || log.people?.id;
+        if (!personId) continue;
+        const role = log.people?.role || 'student';
+        const isStudent = role === 'student';
+        if (isStudent !== matchStudent) continue;
 
-    todayLogs.forEach(log => {
-      const personId = log.person_id || log.people?.id;
-      const role = log.people?.role || 'student';
-      if (personId) {
-        if (role === 'student') {
-          if (!studentLogsMap.has(personId) || log.status === 'present') {
-            studentLogsMap.set(personId, log);
-          }
+        const entry = byPerson.get(personId) || {};
+        if (log.attendance_type === 'check_in') {
+          entry.checkIn = log;
+        } else if (log.attendance_type === 'check_out') {
+          entry.checkOut = log;
         } else {
-          if (!teacherLogsMap.has(personId) || log.status === 'present') {
-            teacherLogsMap.set(personId, log);
-          }
+          entry.fallback = log;
+        }
+        byPerson.set(personId, entry);
+      }
+
+      const resolved = new Map<string, 'present' | 'late'>();
+      for (const [personId, entry] of byPerson.entries()) {
+        if (entry.checkIn && entry.checkIn.status !== 'absent') {
+          resolved.set(personId, entry.checkIn.status === 'late' ? 'late' : 'present');
+        } else if (entry.checkOut && entry.checkOut.status !== 'absent') {
+          resolved.set(personId, 'present');
+        } else if (entry.fallback && entry.fallback.status !== 'absent') {
+          resolved.set(personId, entry.fallback.status === 'late' ? 'late' : 'present');
         }
       }
-    });
+      return resolved;
+    };
+
+    const studentLogsMap = buildDailyPersonMap(todayLogs, true);
+    const teacherLogsMap = buildDailyPersonMap(todayLogs, false);
 
     // Class by class breakdown for TODAY
     if (classesData && classesData.length > 0 && studentsList) {
@@ -199,12 +220,9 @@ export default async function DashboardPage() {
         let lateToday = 0;
 
         enrolledIds.forEach(id => {
-          const stLog = studentLogsMap.get(id);
-          if (stLog) {
-            if (stLog.status === 'present') presentToday++;
-            else if (stLog.status === 'late') lateToday++;
-            else presentToday++;
-          }
+          const stStatus = studentLogsMap.get(id);
+          if (stStatus === 'present') presentToday++;
+          else if (stStatus === 'late') lateToday++;
         });
 
         const rate = enrolled > 0 ? Math.round(((presentToday + lateToday) / enrolled) * 100) : 0;
@@ -221,10 +239,10 @@ export default async function DashboardPage() {
       });
     }
 
-    // Calculate 7-Day Week Trend from weekLogsData
+    // Calculate 7-Day Week Trend from weekLogsData (unique students with non-absent attendance)
     const logsByDateKey = new Map<string, Set<string>>();
     (weekLogsData || []).forEach((l: any) => {
-      if ((l.people?.role || 'student') === 'student' && l.person_id) {
+      if ((l.people?.role || 'student') === 'student' && l.person_id && l.status !== 'absent') {
         const key = getEATDateKey(l.occurred_at, schoolTimeZone);
         const set = logsByDateKey.get(key) || new Set<string>();
         set.add(l.person_id);
@@ -254,34 +272,40 @@ export default async function DashboardPage() {
     teacherCount = 0;
   }
 
-  // Student metrics for TODAY
+  // Unique student & staff daily counts (never double-counted across check_in + check_out!)
   let presentCount = 0;
   let lateCount = 0;
+  let teacherPresentCount = 0;
+  let teacherLateCount = 0;
 
-  todayLogs.forEach(l => {
-    const role = l.people?.role || 'student';
-    if (role === 'student') {
-      if (l.status === 'present') presentCount++;
-      else if (l.status === 'late') lateCount++;
+  {
+    const seenStudent = new Map<string, 'present' | 'late'>();
+    const seenTeacher = new Map<string, 'present' | 'late'>();
+    for (const l of todayLogs) {
+      const pid = l.person_id || l.people?.id;
+      if (!pid || l.status === 'absent') continue;
+      const role = l.people?.role || 'student';
+      const target = role === 'student' ? seenStudent : seenTeacher;
+      if (l.attendance_type === 'check_in') {
+        target.set(pid, l.status === 'late' ? 'late' : 'present');
+      } else if (!target.has(pid)) {
+        target.set(pid, l.status === 'late' ? 'late' : 'present');
+      }
     }
-  });
+    for (const st of seenStudent.values()) {
+      if (st === 'late') lateCount++;
+      else presentCount++;
+    }
+    for (const st of seenTeacher.values()) {
+      if (st === 'late') teacherLateCount++;
+      else teacherPresentCount++;
+    }
+  }
 
   const absentCount = Math.max(0, studentCount - (presentCount + lateCount));
   const presentPct = studentCount > 0 ? Number(((presentCount / studentCount) * 100).toFixed(1)) : 0;
   const latePct = studentCount > 0 ? Number(((lateCount / studentCount) * 100).toFixed(1)) : 0;
   const absentPct = studentCount > 0 ? Number(((absentCount / studentCount) * 100).toFixed(1)) : 0;
-
-  // Teacher metrics for TODAY
-  let teacherPresentCount = 0;
-  let teacherLateCount = 0;
-
-  todayLogs.forEach(l => {
-    const role = l.people?.role;
-    if (role === 'teacher' || role === 'admin' || role === 'support_staff') {
-      if (l.status === 'present') teacherPresentCount++;
-      else if (l.status === 'late') teacherLateCount++;
-    }
-  });
 
   const teacherAbsentCount = Math.max(0, teacherCount - (teacherPresentCount + teacherLateCount));
   const teacherPresentPct = teacherCount > 0 ? Number(((teacherPresentCount / teacherCount) * 100).toFixed(1)) : 0;
