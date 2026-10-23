@@ -74,6 +74,9 @@ if (require.main === module) (async () => {
   if (process.env.MIG09 !== '0' && process.env.MIG13 !== '0' && fs.existsSync(mig + '13_two_daily_punches_guard.sql')) {
     await c.query(fs.readFileSync(mig + '13_two_daily_punches_guard.sql', 'utf8'));
   }
+  if (process.env.RLS === '1' && process.env.MIG14 !== '0' && fs.existsSync(mig + '14_rbac_audit_immutability_hardening.sql')) {
+    await c.query(fs.readFileSync(mig + '14_rbac_audit_immutability_hardening.sql', 'utf8'));
+  }
   console.log('seeded');
   await c.end();
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -185,7 +185,7 @@ export async function getAttendanceData(dateFilterStr?: string) {
 
 export async function recordTeacherAttendance(personId: string, status?: 'present' | 'late' | 'excused') {
   try {
-    const { supabase, schoolId } = await requireSchoolAdmin();
+    const { schoolId } = await requireSchoolAdmin();
     const adminClient = createAdminClient();
 
     // MULTI-TENANT: the person must belong to this school (previously any
@@ -230,16 +230,17 @@ export async function recordTeacherAttendance(personId: string, status?: 'presen
     let error: any = null;
 
     if (existingRow?.id) {
-      const upd = await supabase
+      const upd = await adminClient
         .from('attendance_logs')
         .update({ status: finalStatus, occurred_at: now.toISOString() })
         .eq('id', existingRow.id)
+        .eq('school_id', schoolId)
         .select()
         .maybeSingle();
       data = upd.data;
       error = upd.error;
     } else {
-      const ins = await supabase
+      const ins = await adminClient
         .from('attendance_logs')
         .insert({
           school_id: schoolId,

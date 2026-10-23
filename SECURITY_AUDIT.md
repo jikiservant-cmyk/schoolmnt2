@@ -862,7 +862,27 @@ All requested existing suites were rerun with migration 09 enabled. Payments, SM
 | Strict `attack.mjs` / `regress.mjs` (10x stress) / `device-attack.mjs` | **40% multipart race in `regress.mjs`** | **0/42 vulnerable** / **10/10 (`170/170` OK)** / **0/15 vulnerable** |
 | `round12-check.mjs` + all device, duplicate, crawl, SSR, orphan & `pentest` suites | — | **100% PASS (35/35, 10/10, 9/9, 15/15 SECURE, 14/14 PASS)** |
 
-**Go-live migration sequence:** run **05 → 06 → 07 → 08 → 09 → 10 → 11** (`supabase_migrations/11_round13_money_integrity.sql` is 100% idempotent).
+**Go-live migration sequence:** run **05 → 06 → 07 → 08 → 09 → 10 → 11 → 12 → 13 → 14** (all migrations are 100% idempotent).
+
+## Rounds 14–17: Per-School Settings Lockdown, Strict 2-Write Daily Attendance & Full-Branch Offensive Penetration Test
+
+### New Migrations & Security Controls Added
+1. **`supabase_migrations/12_school_settings.sql` + `lib/school-settings.ts` + `app/dashboard/settings/*`:**
+   - Dedicated `school.school_settings` table containing strictly **0 financial, pricing, or wallet columns** (`31` operational columns only), completely isolated from `school.schools.settings` JSONB.
+   - Direct PostgREST writes (`INSERT`/`UPDATE`/`DELETE`) and client RPC execution on `school.save_school_settings` revoked from `anon` and `authenticated`; enforced server-side via `validateSchoolSettingsInput()` + PL/pgSQL rejection of all financial keys (`smsPrice`, `balance`, `walletBalance`, etc.) + strict GSM-7 single-segment SMS cap (`<= 160` ASCII chars, zero UCS-2 emojis).
+2. **`supabase_migrations/13_two_daily_punches_guard.sql` + `lib/devices/processor.ts` + Kiosk/Register Actions:**
+   - Enforces at most **2 attendance writes per person per local school day** across both application code and PostgreSQL (`UNIQUE INDEX attendance_logs_one_in_one_out_per_day (person_id, attendance_date, attendance_type)` + automatic timezone slot trigger `trg_attendance_logs_daily_slot`).
+   - Archives pre-existing duplicate punches safely into RLS-locked `school.attendance_logs_duplicates_backup` (`service_role` only; `0` grants to `PUBLIC`/`anon`/`authenticated`) while preserving historical `late` `check_in` rows untouched.
+3. **`supabase_migrations/14_rbac_audit_immutability_hardening.sql` (Discovered & Remediated During Full-Branch Penetration Test):**
+   - **Pre-Patch Red-Team Findings (`full-branch-pentest.mjs before` — `8/27` Exploitable):**
+     - `PT-05..PT-09` (**High — Intra-Tenant Vertical Privilege Escalation**): Non-admin `teacher` accounts blocked from `/dashboard` in Next.js could extract their own GoTrue JWT and call PostgREST directly to read parent phone directories, overwrite guardian SMS phone numbers, inject raw `ZKTeco` hardware commands (`DATA DELETE USERINFO`), wipe `school.attendance_logs`, and read `public.wallets`.
+     - `PT-10..PT-11` (**High — Audit Trail Tampering Under Compromised Token**): A stolen `school_admin` JWT could execute `DELETE` on `school.attendance_logs` and `POST`/`DELETE` on raw biometric `school.device_logs`.
+     - `PT-12` (**Medium — Arbitrary `status` Injection**): Direct PostgREST inserts accepted arbitrary strings (e.g. `<script>alert(1)</script>`) in `school.attendance_logs.status`.
+   - **Remediation Verified (`full-branch-pentest.mjs after` — `27/27 SECURE | 0 VULNERABLE`):**
+     - Added `SECURITY DEFINER` function `school.is_school_admin()` and enforced `RESTRICTIVE` RLS policies (`rbac_school_admin_only`) across every `school.*` table plus `public.wallets`, `public.transactions`, and `public.tenants`.
+     - Revoked `DELETE, TRUNCATE` on `school.attendance_logs` and `INSERT, UPDATE, DELETE, TRUNCATE` on `school.device_logs` from `anon` and `authenticated`.
+     - Enforced `CHECK (status IN ('present', 'late', 'absent', 'excused'))` on `school.attendance_logs`.
+
 
 
 
