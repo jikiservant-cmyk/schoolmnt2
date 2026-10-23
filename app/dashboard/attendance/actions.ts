@@ -388,21 +388,21 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   const idempotencyKey = `sch_topup_${crypto.randomUUID()}`;
 
   // 5. Determine NaJiki API Endpoint
-  let endpointUrl = process.env.NAJIKI_API_URL;
+  let endpointUrl = process.env.NAJIKI_API_URL?.trim();
   if (!endpointUrl && process.env.NAJIKI_DOMAIN) {
-    const domain = process.env.NAJIKI_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    const domain = process.env.NAJIKI_DOMAIN.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
     endpointUrl = `https://${domain}/api/payments`;
   }
   if (!endpointUrl) {
     endpointUrl = 'https://najiki.vercel.app/api/payments';
   }
 
-  const apiKey = process.env.NAJIKI_API_KEY;
+  const apiKey = process.env.NAJIKI_API_KEY?.trim();
   if (!apiKey) {
     console.error('[NaJiki STK Push] NAJIKI_API_KEY is not configured.');
     return { error: 'Mobile Money payments are not configured. Please contact support.' };
   }
-  const appCode = process.env.NAJIKI_APP_CODE || "school";
+  const appCode = (process.env.NAJIKI_APP_CODE || "school").trim();
 
   // Build clean, full-spec STK push payload for NaJiki
   const payload = {

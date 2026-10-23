@@ -8,7 +8,11 @@ import { execFileSync } from 'node:child_process';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCHOOL = 'aaaaaaaa-0000-4000-8000-000000000001';
 const PERSON = 'aaaaaaaa-0000-4000-8000-0000000000f1';
-const migrationPath = path.resolve(__dirname, '../../supabase_migrations/09_attendance_duplicate_guard.sql');
+const migrationCandidates = [
+  path.resolve(__dirname, '../../supabase_migrations/09_attendance_duplicate_guard.sql'),
+  '/home/user/schoolmnt2/supabase_migrations/09_attendance_duplicate_guard.sql',
+];
+const migrationPath = migrationCandidates.find((p) => fs.existsSync(p)) || migrationCandidates[0];
 const migration = fs.readFileSync(migrationPath, 'utf8');
 const env = { ...process.env, RLS: '1', MIG09: '0' };
 execFileSync(process.execPath, [path.join(__dirname, 'seed.js')], { cwd: __dirname, env, stdio: 'inherit' });

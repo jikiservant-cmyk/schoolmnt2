@@ -9,8 +9,10 @@ import { setupUsers, SHIM, sessionCookie, actionIds as loadActionIds, callAction
 import seedMod from './seed.js';
 
 const { IDS: { A, B } } = seedMod;
-const BASE = 'http://127.0.0.1:3000';
-const LABEL = process.argv[2] || 'run';
+const rawArgs = process.argv.slice(2);
+const BASE = rawArgs[0]?.startsWith('http') ? rawArgs[0] : (process.env.BASE || 'http://127.0.0.1:3000');
+const APP_DIR = rawArgs[0]?.startsWith('http') ? (rawArgs[1] || '/home/user/schoolmnt2') : (process.env.APP_DIR || '/home/user/schoolmnt2');
+const LABEL = (rawArgs[0]?.startsWith('http') ? (rawArgs[2] || 'run') : (rawArgs[0] || 'run')).replace(/[^A-Za-z0-9_.-]/g, '_');
 const WEBHOOK_SECRET = process.env.NAJIKI_WEBHOOK_SECRET || 'lab-dedicated-webhook-secret-123';
 
 execSync('node seed.js', { cwd: '/home/user/mt-lab', env: { ...process.env, RLS: '1' } });
@@ -21,7 +23,7 @@ const db = new pg.Client({ host: '127.0.0.1', port: 54329, user: 'postgres', pas
 await db.connect();
 const q = async (s, p) => (await db.query(s, p)).rows;
 
-const acts = loadActionIds('/home/user/schoolmnt2');
+const acts = loadActionIds(APP_DIR);
 const cookieA = await sessionCookie('adminA@lab.io');
 const cookieB = await sessionCookie('adminB@lab.io');
 
@@ -689,6 +691,87 @@ const legit = (name, ok, detail) => {
     sigStatuses.some((s) => s !== 401),
     `statuses=${sigStatuses.join(',')}`
   );
+
+  // R13-19: Static gateway merchant tag (e.g. ext_ref="SMARTSKOOLZ_SMS" length 15) shared across tenants
+  // must NOT drop another school's brand-new pending payment, AND stuffing 2 distinct sch_topup_* intents
+  // into a single webhook payload MUST be refused as 'ambiguous_intent' (HTTP 202)!
+  const aBefore19 = await walletBal(A.school);
+  const bBefore19 = await walletBal(B.school);
+  const initStaticA = await initiateTopUp(cookieA, A.school, 4000);
+  const initStaticB = await initiateTopUp(cookieB, B.school, 11000);
+  await hook({
+    eventType: 'PAYMENT_COMPLETED',
+    data: {
+      status: 'SUCCESS',
+      paymentIntentId: crypto.randomUUID(),
+      ext_ref: 'SMARTSKOOLZ_SMS',
+      amount: 4000,
+      currency: 'UGX',
+      externalEntityId: A.school,
+      metadata: { idempotencyKey: initStaticA.intent.reference, schoolId: A.school },
+    },
+  });
+  const wStaticB = await hook({
+    eventType: 'PAYMENT_COMPLETED',
+    data: {
+      status: 'SUCCESS',
+      paymentIntentId: crypto.randomUUID(),
+      ext_ref: 'SMARTSKOOLZ_SMS',
+      amount: 11000,
+      currency: 'UGX',
+      externalEntityId: B.school,
+      metadata: { idempotencyKey: initStaticB.intent.reference, schoolId: B.school },
+    },
+  });
+  const aAfter19 = await walletBal(A.school);
+  const bAfter19 = await walletBal(B.school);
+  rec(
+    'R13-19 static 15-char gateway tag (ext_ref="SMARTSKOOLZ_SMS") drops other school\'s real paid money',
+    aAfter19 - aBefore19 !== 4000 || bAfter19 - bBefore19 !== 11000,
+    `A delta=${aAfter19 - aBefore19}, B delta=${bAfter19 - bBefore19} status=${wStaticB.status}`
+  );
+
+  // Multi-intent stuffing in one webhook payload
+  const stuff1 = await initiateTopUp(cookieA, A.school, 3000);
+  const stuff2 = await initiateTopUp(cookieA, A.school, 3000);
+  const wStuff = await hook({
+    eventType: 'PAYMENT_COMPLETED',
+    data: {
+      status: 'SUCCESS',
+      paymentIntentId: crypto.randomUUID(),
+      reference: stuff1.intent.reference,
+      tx_ref: stuff2.intent.reference,
+      amount: 3000,
+      currency: 'UGX',
+      externalEntityId: A.school,
+    },
+  });
+  rec(
+    'R13-20 multi-intent reference stuffing in a single webhook accepted instead of 202 ambiguous_intent',
+    wStuff.status !== 202 || wStuff.json?.outcome !== 'ambiguous_intent',
+    `status=${wStuff.status} body=${wStuff.text.slice(0, 90)}`
+  );
+
+  // Top-level JSON array payload rejected cleanly with HTTP 400 (not treated as object)
+  const wArray = await hook([{ status: 'SUCCESS', amount: 5000, reference: stuff1.intent.reference }]);
+  rec(
+    'R13-21 top-level JSON array webhook accepted instead of HTTP 400 Invalid JSON payload',
+    wArray.status !== 400,
+    `status=${wArray.status} body=${wArray.text.slice(0, 80)}`
+  );
+
+  // Exact ledger reconciliation STILL holds to the single shilling after ALL 24 checks!
+  for (const [label, sid] of [['School A final', A.school], ['School B final', B.school]]) {
+    const wBal = await walletBal(sid);
+    const evSum = Number((await q("SELECT coalesce(sum(credited_amount), 0) AS s FROM school.payment_events WHERE school_id = $1 AND outcome = 'credited'", [sid]))[0].s);
+    const txSum = Number((await q('SELECT coalesce(sum(t.amount), 0) AS s FROM public.transactions t JOIN public.wallets w ON w.id = t.wallet_id WHERE w.tenant_id = $1 OR w.school_id = $1', [sid]))[0].s);
+    const mirror = Number((await q("SELECT coalesce((settings->>'balance')::numeric, 0) AS b FROM school.schools WHERE id = $1", [sid]))[0].b);
+    legit(
+      `R13-22 ${label} 4-way reconciliation (wallet == 1000+events == 1000+transactions == settings.balance)`,
+      wBal === 1000 + evSum && evSum === txSum && mirror === wBal,
+      `wallet=${wBal} events=${evSum} txSum=${txSum} settingsMirror=${mirror}`
+    );
+  }
 }
 
 // ============================================================================

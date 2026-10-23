@@ -207,6 +207,7 @@ SET search_path = pg_catalog, school, public
 AS $$
 DECLARE
   v_intent       school.payment_intents%ROWTYPE;
+  v_match_count  integer := 0;
   v_school       uuid;
   v_credit       numeric;
   v_key          text;
@@ -249,18 +250,36 @@ BEGIN
     RETURN jsonb_build_object('outcome', 'duplicate');
   END IF;
 
-  IF cardinality(v_refs) > 0 AND EXISTS (
+  -- 1. Match the payment to a specific top-up started by the app BEFORE checking
+  --    auxiliary `detail.refs`, so even a static template tag like `ext_ref="SMARTSKOOLZ_SMS"`
+  --    cannot black-hole another school's brand-new pending `sch_topup_<uuid>` payment.
+  --    Also refuse multi-intent stuffing if one payload references > 1 distinct intent.
+  SELECT count(DISTINCT id)::integer INTO v_match_count
+    FROM school.payment_intents
+   WHERE reference = ANY (v_refs)
+      OR (provider_ref IS NOT NULL AND (provider_ref = ANY (v_refs) OR provider_ref = v_prov_clean));
+
+  IF v_match_count > 1 THEN
+    PERFORM school.log_payment_event('ambiguous_intent', v_refs[1], v_prov_clean, NULL, p_claimed_school, p_amount, NULL, v_cur, p_detail);
+    RETURN jsonb_build_object('outcome', 'ambiguous_intent');
+  END IF;
+
+  IF v_match_count = 1 THEN
+    SELECT * INTO v_intent FROM school.payment_intents
+     WHERE reference = ANY (v_refs)
+        OR (provider_ref IS NOT NULL AND (provider_ref = ANY (v_refs) OR provider_ref = v_prov_clean))
+     ORDER BY created_at LIMIT 1 FOR UPDATE;
+  END IF;
+
+  -- When NO explicit payment_intent matched by reference/provider_ref (e.g. a
+  -- notification missing our `sch_topup_*` ref, or transition mode), verify none of
+  -- its refs were already credited BEFORE falling back to 48h same-amount matching.
+  IF v_intent.id IS NULL AND cardinality(v_refs) > 0 AND EXISTS (
        SELECT 1 FROM school.payment_events
         WHERE outcome = 'credited' AND (detail -> 'refs') ?| v_refs) THEN
     PERFORM school.log_payment_event('duplicate', v_refs[1], v_prov_clean, NULL, p_claimed_school, p_amount, NULL, v_cur, p_detail);
     RETURN jsonb_build_object('outcome', 'duplicate');
   END IF;
-
-  -- 1. Match the payment to a top-up started by the app
-  SELECT * INTO v_intent FROM school.payment_intents
-   WHERE reference = ANY (v_refs)
-      OR (provider_ref IS NOT NULL AND (provider_ref = ANY (v_refs) OR provider_ref = v_prov_clean))
-   ORDER BY created_at LIMIT 1 FOR UPDATE;
 
   -- Fallback: school's oldest pending top-up of exact amount within 48h
   IF v_intent.id IS NULL AND p_claimed_school IS NOT NULL THEN

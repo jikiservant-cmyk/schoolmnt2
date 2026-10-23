@@ -47,10 +47,10 @@ async function readLimitedBody(req: NextRequest): Promise<string | null> {
 }
 
 function webhookSecret(): { secret: string | null; dedicated: boolean } {
-  const dedicated = process.env.NAJIKI_WEBHOOK_SECRET;
+  const dedicated = process.env.NAJIKI_WEBHOOK_SECRET?.trim();
   if (dedicated) return { secret: dedicated, dedicated: true };
   // Legacy: the same key the app sends to NaJiki on every API call.
-  const legacy = process.env.NAJIKI_API_KEY || process.env.SCHOOL_SECRET_KEY || process.env.NAJIKI_SECRET_KEY || null;
+  const legacy = (process.env.NAJIKI_API_KEY || process.env.SCHOOL_SECRET_KEY || process.env.NAJIKI_SECRET_KEY || '').trim() || null;
   return { secret: legacy, dedicated: false };
 }
 
@@ -220,10 +220,10 @@ export async function handleNajikiWebhook(req: NextRequest) {
     } catch {
       return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
     }
-    if (!payload || typeof payload !== 'object') {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
       return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
     }
-    const eventData: Json = (payload.data && typeof payload.data === 'object') ? payload.data : payload;
+    const eventData: Json = (payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)) ? payload.data : payload;
 
     // Log without personal data.
     const safe = { ...payload, data: payload.data ? { ...payload.data } : undefined };

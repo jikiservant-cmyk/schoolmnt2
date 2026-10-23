@@ -70,32 +70,32 @@ async function resolveSchoolId(supabase: any, userId: string): Promise<string | 
 }
 
 export async function addDeviceAction(formData: FormData) {
-  const serialNumber = formData.get('serialNumber') as string;
-  const label = formData.get('label') as string;
-  const ipAddress = (formData.get('ipAddress') as string) || null;
-  const deviceType = ((formData.get('deviceType') as string) || 'zkteco_adms').trim();
-  const rawSecret = (formData.get('deviceSecret') as string)?.trim() || null;
-  const lateCutoff = (formData.get('lateCutoff') as string)?.trim() || '08:00';
-  const timeZone = (formData.get('timeZone') as string)?.trim() || 'Africa/Kampala';
-
-  if (!serialNumber || !serialNumber.trim()) {
-    return { error: 'Device Serial Number is required.' };
-  }
-  if (!normalizeSerial(serialNumber)) {
-    return { error: 'Serial Number may only contain letters, digits, ".", "_" or "-" (max 64).' };
-  }
-  if (!DEVICE_TYPES.includes(deviceType)) {
-    return { error: 'Unsupported device type.' };
-  }
-  if (rawSecret && rawSecret.length < 16) {
-    return { error: 'Custom device secrets must be at least 16 characters (leave blank to auto-generate).' };
-  }
-  if (!isValidTimeZone(timeZone)) {
-    return { error: 'Invalid time zone.' };
-  }
-
   try {
     const { schoolId } = await requireSchoolAdmin();
+    const serialNumber = formData.get('serialNumber') as string;
+    const label = formData.get('label') as string;
+    const ipAddress = (formData.get('ipAddress') as string) || null;
+    const deviceType = ((formData.get('deviceType') as string) || 'zkteco_adms').trim();
+    const rawSecret = (formData.get('deviceSecret') as string)?.trim() || null;
+    const lateCutoff = (formData.get('lateCutoff') as string)?.trim() || '08:00';
+    const timeZone = (formData.get('timeZone') as string)?.trim() || 'Africa/Kampala';
+
+    if (!serialNumber || !serialNumber.trim()) {
+      return { error: 'Device Serial Number is required.' };
+    }
+    if (!normalizeSerial(serialNumber)) {
+      return { error: 'Serial Number may only contain letters, digits, ".", "_" or "-" (max 64).' };
+    }
+    if (!DEVICE_TYPES.includes(deviceType)) {
+      return { error: 'Unsupported device type.' };
+    }
+    if (rawSecret && rawSecret.length < 16) {
+      return { error: 'Custom device secrets must be at least 16 characters (leave blank to auto-generate).' };
+    }
+    if (!isValidTimeZone(timeZone)) {
+      return { error: 'Invalid time zone.' };
+    }
+
     const ip = await getClientIp();
     const maxAttempts = resolveAddDeviceRateLimit();
     const schoolRl = consumeRateLimit(`add-device:school:${schoolId}`, maxAttempts, ADD_DEVICE_WINDOW_MS);

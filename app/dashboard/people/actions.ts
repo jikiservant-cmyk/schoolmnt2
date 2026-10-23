@@ -169,19 +169,19 @@ async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<str
 }
 
 export async function addPersonAction(formData: FormData) {
-  const fullName = sanitizePersonName(formData.get('fullName'));
-  const role = formData.get('role') as 'student' | 'teacher' | 'support_staff';
-  
-  if (!fullName || !role) {
-    return { error: 'Full Name and Role are required.' };
-  }
-
-  if (role !== 'student' && role !== 'teacher' && role !== 'support_staff') {
-    return { error: 'Role selection must be Student, Teacher, or Support Staff.' };
-  }
-
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
+    const fullName = sanitizePersonName(formData.get('fullName'));
+    const role = formData.get('role') as 'student' | 'teacher' | 'support_staff';
+
+    if (!fullName || !role) {
+      return { error: 'Full Name and Role are required.' };
+    }
+
+    if (role !== 'student' && role !== 'teacher' && role !== 'support_staff') {
+      return { error: 'Role selection must be Student, Teacher, or Support Staff.' };
+    }
+
     const adminClient = createAdminClient();
     const rawDeviceId = formData.get('deviceUserId') as string;
     const cleanDeviceId = rawDeviceId && rawDeviceId.trim() ? rawDeviceId.trim() : null;

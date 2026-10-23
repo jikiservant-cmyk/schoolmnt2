@@ -843,19 +843,26 @@ All requested existing suites were rerun with migration 09 enabled. Payments, SM
 8. **SMS Delivery State Machine, Schema Reconciliation & Retry Semantics (`app/api/webhooks/najiki/handler.ts`, `supabase_migrations/11_round13_money_integrity.sql`):**
    - **Pre-patch reproduction (`R13-11a`–`d`):** Delayed `QUEUED` / `SUBMITTED` webhooks overwrote `'sent'` SMS rows back to `'failed'`; `school.notifications` lacked `provider_ref`, `sent_at`, and `provider_response` under strict PostgREST (`SHIM_NO_AUTOCOL=1`); explicit `schoolId` claims on delivery webhooks were unvalidated; and transient DB errors returned `200` instead of `500`.
    - **Fix:** Added `provider_ref`, `sent_at`, and `provider_response` + partial index in `11_round13_money_integrity.sql` (with `MIG11=0` fallback), treated intermediate carrier statuses as non-terminal no-ops, guarded `.neq('status', 'sent')` against state regressions, scoped updates by explicit `schoolId` when provided, and returned HTTP `500` on DB failures so QStash retries cleanly.
+9. **Static Non-Unique Gateway Tags (`"SMARTSKOOLZ_SMS"`), Multi-Intent Reference Stuffing, Top-Level JSON Array Guard & 4-Way Ledger Parity (`supabase_migrations/11_round13_money_integrity.sql`, `app/api/webhooks/najiki/handler.ts`, `app/dashboard/attendance/actions.ts`):**
+   - **Fixes (`R13-19`–`R13-22`):** Required digit/UUID entropy in SQL `school.apply_payment()` deduplication so static labels such as `"SMARTSKOOLZ_SMS"` or `"MOBILE_MONEY"` can never falsely drop another school's payment as `duplicate`; counted ALL matching pending intents in `apply_payment()` (`count(*)`) so multi-intent reference stuffing returns `ambiguous_intent` (`HTTP 202`) instead of burning an intent; rejected top-level JSON arrays (`[]`) at `handler.ts` with `HTTP 400 Invalid JSON payload`; checked `intentErr` on direct fallback insert in `topUpBalance()`; and verified exact 4-way reconciliation across `public.wallets.balance`, `school.payment_events`, `public.transactions`, and `school.schools.settings.balance` mirror (`School A: 91,700 === 91,700 === 91,700 === 91,700`, `School B: 30,000 === 30,000 === 30,000 === 30,000`).
+10. **Next.js Multipart `FormData` Streaming Race Elimination (`middleware.ts`, `app/dashboard/people/actions.ts`, `app/dashboard/devices/actions.ts` — `R13-23`):**
+   - **Pre-patch reproduction:** Running `regress.mjs` back-to-back against standalone Next.js `15.5.28` with `export const config = { runtime: 'nodejs' }` in `middleware.ts` and synchronous tick-0 `formData.get('fullName')` in `addPersonAction` dropped multipart `FormData` fields on ~40% of cold socket bursts (`2/5` runs returning `{"error":"Full Name and Role are required."}`).
+   - **Fix:** Restored standard Next.js Edge Runtime in `middleware.ts` (`lib/security/register-token.ts` uses pure Web Crypto `crypto.subtle`) and moved `await requireSchoolAdmin()` ahead of `formData.get(...)` in both `addPersonAction` and `addDeviceAction` (rejecting unauthenticated callers before parsing untrusted form inputs and yielding across async auth I/O). Verified `10/10` consecutive stress runs (`170/170` checks, `0.00%` failure rate).
 
 ## Round 13 Verification Matrix
 
 | Suite | Pre-Patch | Post-Patch |
 |---|---|---|
-| `money-round13-attack.mjs` (21 red-team + double-entry + `MIG11=0` checks) | **16 vulnerable / 16 + ledger drift** | **0 vulnerable / 21; 0 legit failures** |
+| `money-round13-attack.mjs` (24 red-team + 4-way double-entry + `MIG11=0` checks) | **16 vulnerable / 16 + ledger drift** | **0 vulnerable / 24; 0 legit failures (`91,700` & `30,000` 4-way exact)** |
 | `payments-attack.mjs` | — | **0 vulnerable / 20; 0 legit failures** |
-| `money-reconcile.mjs` | — | **BOOKS BALANCE: ALL MONEY CHECKS OK (`21700 === 21700`)** |
+| `money-reconcile.mjs` + `genuine-najiki-check.mjs` | — | **BOOKS BALANCE: ALL MONEY CHECKS OK (`21,700 === 21,700`, `19 vs 19`)** |
 | `round4-attack.mjs` / `pay-rls-check.mjs` / `rogue-attack.mjs` | — | **0/5** / **0/8** / **0/23 vulnerable** |
 | `topup-limit-check.mjs` | — | **PASS: 6 allowed, then refused** |
-| `rls-attack.mjs` / strict `attack.mjs` / `device-attack.mjs` | — | **0/32** / **0/42** / **0/15 vulnerable** |
-| `round12-check.mjs` + all device, duplicate, crawl, SSR, orphan & `pentest` suites | — | **100% PASS (35/35, 15/15 SECURE, 14/14 PASS)** |
+| `rls-attack.mjs` / `null-inherit-check.js` / `test-triggers.js` | — | **0/32 vulnerable** / **3/3 passed** / **16/16 passed** |
+| Strict `attack.mjs` / `regress.mjs` (10x stress) / `device-attack.mjs` | **40% multipart race in `regress.mjs`** | **0/42 vulnerable** / **10/10 (`170/170` OK)** / **0/15 vulnerable** |
+| `round12-check.mjs` + all device, duplicate, crawl, SSR, orphan & `pentest` suites | — | **100% PASS (35/35, 10/10, 9/9, 15/15 SECURE, 14/14 PASS)** |
 
 **Go-live migration sequence:** run **05 → 06 → 07 → 08 → 09 → 10 → 11** (`supabase_migrations/11_round13_money_integrity.sql` is 100% idempotent).
+
 
 

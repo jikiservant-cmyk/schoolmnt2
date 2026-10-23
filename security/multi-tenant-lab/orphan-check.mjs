@@ -9,7 +9,8 @@ await fetch(SHIM + '/__users', { method: 'POST', body: JSON.stringify({
 }) });
 const s = await (await fetch(SHIM + '/__session', { method: 'POST', body: JSON.stringify({ email: 'orphan@lab.io' }) })).json();
 const cookie = 'sb-127-auth-token=base64-' + Buffer.from(JSON.stringify(s)).toString('base64url');
-const r = await fetch('http://127.0.0.1:3201/dashboard/people', { headers: { cookie }, redirect: 'manual' });
+const BASE = process.argv[2] || process.env.BASE || 'http://127.0.0.1:3000';
+const r = await fetch(BASE + '/dashboard/people', { headers: { cookie }, redirect: 'manual' });
 const h = await r.text();
 const leak = /Class A|Class B|B-SECRET|A-SECRET/.test(h);
 console.log('status', r.status, r.headers.get('location') || '', 'leaks other schools classes:', leak);
