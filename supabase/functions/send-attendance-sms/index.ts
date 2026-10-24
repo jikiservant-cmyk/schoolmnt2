@@ -27,17 +27,31 @@
  * Scheduling is NOT implied by the function URL: the retry sweep needs a cron
  * job (pg_cron / Supabase Scheduler / QStash) that POSTs {"retry_sweep":true}.
  *
- * Changes from the version pasted by the owner are limited to two things, both
- * additive and both explained inline:
- *   1. an `Idempotency-Key` header on the NaJiki call, so a retry cannot create
- *      a second (billable) SMS;
- *   2. a constant-time comparison of the dispatch secret;
- *   3. a real MSISDN check, so an undeliverable number is failed BEFORE the
- *      wallet is charged (the deployed version only rejected empty numbers and
- *      therefore paid for, and retried, numbers the gateway cannot deliver).
- * Everything else — column names, status values, RPC signature, request body,
- * response handling and return values — is unchanged, because those match the
- * live database and the app's callers.
+ * Everything external is unchanged, because it matches the live database and the
+ * app's callers: column names, status values, RPC signature, request payloads,
+ * auth header and return shapes. The hardening below is additive, and each item
+ * is explained where it lives:
+ *   1. `Idempotency-Key` on the NaJiki call, so a retry cannot create a second
+ *      (billable) SMS;
+ *   2. constant-time comparison of the dispatch secret;
+ *   3. a real MSISDN check and a 1..918-character message guard, both BEFORE the
+ *      wallet is charged (the deployed version only rejected empty numbers, so
+ *      an undeliverable number or an over-long message was paid for and then
+ *      retried five times);
+ *   4. success requires three things, not one: a 2xx, a payload that does not
+ *      say it failed, and an acknowledgement id to match a delivery report on;
+ *   5. a wallet keyed by `school_id` instead of `tenant_id` is still found;
+ *   6. a terminal failure after a successful debit is written as
+ *      `charged_undelivered:<reason>`, so the schools that paid for nothing can
+ *      be found with one query and refunded with
+ *      `public.refund_sms_charge(notification_id)` (migration 16);
+ *   7. backoff honours the gateway's `Retry-After` (seconds or HTTP date, capped
+ *      at an hour) instead of always waiting 3 minutes;
+ *   8. the claim lock is derived from the send timeout, so it can never expire
+ *      while a send is still in flight;
+ *   9. the retry sweep stops after a wall-clock budget
+ *      (`SMS_SWEEP_BUDGET_MS`) instead of running up to 50 x 30 s inside one
+ *      invocation.
  */
 
 import { createClient } from "npm:@supabase/supabase-js@2";
@@ -111,8 +125,44 @@ function toE164(phone: string): string {
   return phone.startsWith("+") ? phone : "+" + digits;
 }
 
-function toIsoAfterMinutes(mins: number) {
-  return new Date(Date.now() + mins * 60 * 1000).toISOString();
+function toIsoAfterSeconds(sec: number) {
+  return new Date(Date.now() + sec * 1000).toISOString();
+}
+
+/** `Retry-After` is either a number of seconds or an HTTP date. Cap it so a
+ * hostile or broken header cannot park a message for a day. */
+function parseRetryAfter(raw: string | null): number | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  const asNumber = Number(trimmed);
+  if (Number.isFinite(asNumber) && asNumber > 0) {
+    return Math.min(Math.ceil(asNumber), 3600);
+  }
+  const asDate = Date.parse(trimmed);
+  if (Number.isFinite(asDate)) {
+    const sec = Math.ceil((asDate - Date.now()) / 1000);
+    if (sec > 0) return Math.min(sec, 3600);
+  }
+  return null;
+}
+
+/** Default backoff when the gateway does not tell us. */
+const DEFAULT_BACKOFF_SEC = 180;
+
+/**
+ * Distinguish "we took the money and never delivered" from "nothing happened".
+ *
+ * A terminal failure on a charged row is prefixed so it can be found with one
+ * query (`error LIKE 'charged_undelivered:%'`) and refunded with
+ * `public.refund_sms_charge(notification_id)`. Without the prefix, a charged
+ * failure and an uncharged one look identical in the table.
+ */
+function failCode(
+  base: string,
+  isFinalAttempt: boolean,
+  charged: boolean,
+): string {
+  return isFinalAttempt && charged ? `charged_undelivered:${base}` : base;
 }
 
 function maxAttemptsReached(nextRetryCount: number) {
@@ -196,7 +246,14 @@ async function dispatchOne(
     }
   }
 
-  const lockUntilIso = toIsoAfterMinutes(1);
+  // The claim lock must outlive the send itself, or a slow gateway would let a
+  // second worker claim the same row while the first is still waiting on it.
+  const sendTimeoutMs = Number(Deno.env.get("NAJIKI_TIMEOUT_MS") || "30000");
+  const lockMs = Math.max(
+    60_000,
+    (Number.isFinite(sendTimeoutMs) ? sendTimeoutMs : 30_000) + 15_000,
+  );
+  const lockUntilIso = toIsoAfterSeconds(Math.ceil(lockMs / 1000));
 
   // Claim only pending rows
   const { data: claimed, error: claimErr } = await supabase
@@ -330,6 +387,8 @@ async function dispatchOne(
     p_description: `notification_dispatch:${notificationId}`,
   });
 
+  let chargedThisRow = false;
+
   if (debitErr) {
     await supabase
       .schema(SCHOOL_SCHEMA)
@@ -338,7 +397,9 @@ async function dispatchOne(
         status: isFinalAttempt ? "failed" : "pending",
         error: "insufficient_balance_or_debit_failed",
         retry_count: nextRetryCount,
-        next_retry_at: isFinalAttempt ? null : toIsoAfterMinutes(3),
+        next_retry_at: isFinalAttempt
+          ? null
+          : toIsoAfterSeconds(DEFAULT_BACKOFF_SEC),
         provider_response: JSON.stringify({ debit: debitErr.message }),
       })
       .eq("id", notificationId);
@@ -346,12 +407,17 @@ async function dispatchOne(
     return jsonResponse({ error: "insufficient balance" }, 200);
   }
 
-  const najikiTimeoutMs = Number(Deno.env.get("NAJIKI_TIMEOUT_MS") || "30000");
+  // The debit succeeded: from here on, a failure means the school paid for
+  // nothing, and the error is marked accordingly.
+  chargedThisRow = true;
+
+  const najikiTimeoutMs = sendTimeoutMs;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), najikiTimeoutMs);
 
   let najikiRes: Response | null = null;
   let najikiData: any = {};
+  let retryAfterSec: number | null = null;
 
   try {
     najikiRes = await fetch(`${NAJIKI_DOMAIN}/api/messaging/send`, {
@@ -373,6 +439,7 @@ async function dispatchOne(
       signal: controller.signal,
     });
 
+    retryAfterSec = parseRetryAfter(najikiRes.headers.get("retry-after"));
     najikiData = await najikiRes.json().catch(() => ({}));
   } catch (e: any) {
     const msg = e?.name === "AbortError"
@@ -386,8 +453,14 @@ async function dispatchOne(
         status: isFinalAttempt ? "failed" : "pending",
         retry_count: nextRetryCount,
         provider_response: JSON.stringify({ error: msg }),
-        error: "provider_timeout_or_fetch_error",
-        next_retry_at: isFinalAttempt ? null : toIsoAfterMinutes(3),
+        error: failCode(
+          "provider_timeout_or_fetch_error",
+          isFinalAttempt,
+          chargedThisRow,
+        ),
+        next_retry_at: isFinalAttempt
+          ? null
+          : toIsoAfterSeconds(DEFAULT_BACKOFF_SEC),
       })
       .eq("id", notificationId);
 
@@ -407,6 +480,7 @@ async function dispatchOne(
       .update({
         status: "sent",
         provider_response: JSON.stringify(najikiData),
+        // A retry that finally succeeds clears the charged-undelivered marker.
         error: null,
         sent_at: new Date().toISOString(),
         next_retry_at: null,
@@ -422,6 +496,10 @@ async function dispatchOne(
     ? (payloadSaysFailed ? "provider_rejected" : "provider_ack_without_id")
     : "provider_failed";
 
+  // Honour the gateway's own backoff when it sends one (429 + Retry-After),
+  // instead of always waiting our default.
+  const backoffSec = retryAfterSec ?? DEFAULT_BACKOFF_SEC;
+
   await supabase
     .schema(SCHOOL_SCHEMA)
     .from(NOTIFS_TABLE)
@@ -429,8 +507,8 @@ async function dispatchOne(
       status: isFinalAttempt ? "failed" : "pending",
       retry_count: nextRetryCount,
       provider_response: JSON.stringify(najikiData),
-      error: reason,
-      next_retry_at: isFinalAttempt ? null : toIsoAfterMinutes(3),
+      error: failCode(reason, isFinalAttempt, chargedThisRow),
+      next_retry_at: isFinalAttempt ? null : toIsoAfterSeconds(backoffSec),
     })
     .eq("id", notificationId);
 
@@ -450,13 +528,28 @@ async function markDispatchFailed(
       status: isFinalAttempt ? "failed" : "pending",
       error: errCode,
       retry_count: nextRetryCount,
-      next_retry_at: isFinalAttempt ? null : toIsoAfterMinutes(3),
+      next_retry_at: isFinalAttempt
+        ? null
+        : toIsoAfterSeconds(DEFAULT_BACKOFF_SEC),
     })
     .eq("id", notificationId);
 }
 
 async function runRetrySweep() {
   const nowIso = new Date().toISOString();
+  // 50 rows x a 30 s gateway timeout can outlive the platform's invocation
+  // limit, which would kill the sweep mid-batch. Stop starting new rows early
+  // and let the next run pick them up.
+  // SMS_SWEEP_BUDGET_MS is the name; SMS_BATCH_BUDGET_MS is the older alias
+  // documented in .env.example, still honoured so an existing secret keeps working.
+  const budgetRaw = Number(
+    Deno.env.get("SMS_SWEEP_BUDGET_MS") ||
+      Deno.env.get("SMS_BATCH_BUDGET_MS") || "45000",
+  );
+  const budgetMs = Number.isFinite(budgetRaw) && budgetRaw > 0
+    ? budgetRaw
+    : 45_000;
+  const startedAt = Date.now();
 
   const { data: stuck, error } = await supabase
     .schema(SCHOOL_SCHEMA)
@@ -473,9 +566,24 @@ async function runRetrySweep() {
 
   if (!stuck || stuck.length === 0) return jsonResponse({ swept: 0 }, 200);
 
+  let dispatched = 0;
+  let stoppedEarly = false;
+
   for (const row of stuck) {
+    if (Date.now() - startedAt > budgetMs) {
+      stoppedEarly = true;
+      console.warn(
+        "[send-attendance-sms] sweep budget exhausted; the rest wait for the next run",
+      );
+      break;
+    }
     await dispatchOne(String((row as any).id), { strictPending: true });
+    dispatched++;
   }
 
-  return jsonResponse({ swept: stuck.length }, 200);
+  return jsonResponse({
+    swept: stuck.length,
+    dispatched,
+    stopped_early: stoppedEarly,
+  }, 200);
 }

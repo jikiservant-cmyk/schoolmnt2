@@ -1462,6 +1462,8 @@ are unchanged and green.
 ```bash
 supabase functions deploy send-attendance-sms     # JWT verification STAYS ON
 supabase secrets set SMS_COST=... DISPATCH_SECRET=...
+# optional: SMS_SWEEP_BUDGET_MS=45000 (default) bounds one sweep invocation
+psql "$DATABASE_URL" -f supabase_migrations/16_refund_sms_charge.sql   # refunds
 # and a scheduler is required — a URL and a body are not a schedule:
 #   POST /functions/v1/send-attendance-sms   {"retry_sweep": true}
 #   cron: */5 * * * *
@@ -1558,3 +1560,147 @@ clean.
   than 60 s (only possible if `NAJIKI_TIMEOUT_MS` is raised above 60 s) would let
   a second worker claim the same row. With the default 30 s it cannot happen, but
   the two values are not linked in code.
+
+# Part 25: Closing the five "still not solid" items (2026-10-24)
+
+Part 24 ended with a list of known gaps. This part closes all five, and changes
+one piece of vocabulary on purpose.
+
+## 25-1 — Charged-but-undelivered is now visible in one column
+
+A terminal failure that happened **after** a successful debit is written as
+
+```
+error = 'charged_undelivered:<reason>'      -- e.g. charged_undelivered:provider_failed
+```
+
+A terminal failure that never took money keeps the bare reason
+(`invalid_message_length`, `insufficient_balance_or_debit_failed`,
+`provider_rejected`, …). So
+
+```sql
+SELECT id, error FROM school.notifications
+ WHERE error LIKE 'charged_undelivered:%' AND sent_at IS NULL;
+```
+
+is now the exact list of schools that paid for nothing. This is a deliberate
+change to the `error` vocabulary: anything parsing `error = 'provider_failed'`
+must accept the prefix. The suffix after the colon is the old value, so a
+tolerant parser (`error LIKE '%provider_failed'`) keeps working.
+
+The flag is **per row** (`chargedThisRow`, reset on every dispatch), not shared
+across a sweep — a batch is not "charged" because an earlier row was. A late
+success clears `error` to `null` while `provider_response` keeps the history.
+
+## 25-2 — A refund path that cannot pay twice
+
+`supabase_migrations/16_refund_sms_charge.sql` adds
+
+```sql
+SELECT public.refund_sms_charge('<notification uuid>');
+-- { outcome: 'refunded' | 'duplicate' | 'no_charge', amount, balance, reference }
+```
+
+It **credits the wallet and writes a ledger row** with reference
+`sms_refund:<id>`, so a second call returns `duplicate` instead of crediting
+again. It refuses (`no_charge`) when `sms:<id>` was never debited. It is
+`SECURITY DEFINER`, revoked from `anon`/`authenticated`, granted to
+`service_role` only — a school cannot refund itself.
+
+**Why manual, not automatic inside the sender.** A message can still be
+delivered after our last attempt: the gateway may have accepted it and we lost
+the response (that is exactly the `provider_timeout_or_fetch_error` case). An
+automatic refund would then both deliver the SMS and return the money. So the
+sender only *marks*; the refund is an explicit, idempotent act after checking
+`public.sms_messages` / `public.sms_delivery_reports` for a provider record.
+
+## 25-3 — The sweep has a wall-clock budget
+
+`SMS_SWEEP_BUDGET_MS` (default **45 000**) is checked **before starting each
+row**. When it is exhausted the loop stops, leaves the remaining rows `pending`
+with their claim expiring, and returns
+
+```json
+{ "swept": 50, "dispatched": 12, "stopped_early": true }
+```
+
+The next run picks up the rest. Previously a 50-row sweep at 30 s each could run
+for 25 minutes into a platform timeout.
+
+## 25-4 — Backoff honours `Retry-After`
+
+`parseRetryAfter()` accepts both forms in the RFC (`Retry-After: 120` seconds and
+`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`), clamps to **3600 s**, and falls
+back to `DEFAULT_BACKOFF_SEC = 180` when the header is absent or unusable. A 429
+no longer waits 3 minutes for nothing.
+
+## 25-5 — The claim lock is derived from the send timeout
+
+```
+sendTimeoutMs = NAJIKI_TIMEOUT_MS (default 30 000)
+lockMs        = max(60 000, sendTimeoutMs + 15 000)
+```
+
+The lock can no longer expire while a send is still running, even if someone
+raises `NAJIKI_TIMEOUT_MS` above 60 s. The timeout is read once and reused by the
+`AbortController`, so the two values cannot drift.
+
+## Test evidence
+
+`sms-edge-stress-check.mjs` grew from 32 to **46 checks** (two new sections):
+
+| Check | Before | After |
+| --- | --- | --- |
+| 11-1 a terminal failure after a charge is marked `charged_undelivered` | red | green |
+| 11-2 an uncharged terminal failure carries **no** marker | — | green |
+| 11-3 the refund credits exactly one price | red (`function does not exist`) | green |
+| 11-4 refunding twice is refused (`duplicate`) and does not credit again | — | green |
+| 11-5 refunding a never-charged row is a no-op (`no_charge`) | — | green |
+| 12-1 `Retry-After: 2` produces a 2.0 s backoff, not 180 s | red | green |
+| 12-2 a 1 ms budget stops the sweep before the first row | red | green |
+| 12-3 the skipped rows stay `pending` for the next run | — | green |
+| 12-4 the next sweep with a normal budget delivers all four | — | green |
+
+One of those checks was **wrong when first written** and passed for the wrong
+reason: it killed `procs[procs.length - 1]` *before* starting the budget-scoped
+instance, so it restarted nothing and the 1 ms process kept serving. It now
+keeps the handle returned by `startFn()` and asserts `stopped_early === false`
+plus all four rows `sent` afterwards. A passing assertion that does not test what
+it claims is worse than a failing one.
+
+## Regression after the fixes
+
+`sms-edge-stress` **46/46**, `sms-edge-e2e` **56/56**, `sms-schema-contract`
+**61/61** (18 new static checks: the marker, the refund RPC and its grants, the
+`Retry-After` parser, the lock/timeout link, the sweep budget and its older
+alias), `provider-contract` **31/31**, `full-branch-pentest` **27/27**,
+`money-round13` **0/24**, `payments-attack` **0/20**, `rogue` **0/21**,
+`round4` **0/5**, `pay-rls` **0/8**, `money-reconcile` **OK**, `flows-check`
+**OK**, `round12` **35/35**, `round14` **40/40**, `round16` **18/18**.
+`deno fmt --check` + `deno check`, `tsc --noEmit`, `lint` (0 errors) and a clean
+`rm -rf .next && npm run build` all pass.
+
+Two process notes, because they cost time:
+
+- **`.next` was stale at the start of this round.** `payments-attack` and
+  `provider-contract` failed with `Failed to find Server Action` — the running
+  server predated the build. Stopping the app, `rm -rf .next && npm run build`,
+  restarting **with the lab env** and re-seeding fixed all of it. Rebuilding
+  under a running app is the same trap as before.
+- **`RLS` must be exported, not passed inline.** `RLS=1 node suite.mjs` leaves
+  the child re-seed without it, so migrations 05–11 are skipped and the DB has
+  no `school.payment_intents`; the suite then crashes on a missing table that
+  looks like a regression. Use `export RLS=1` for the whole sweep.
+
+## Still open (honest list)
+
+- **The refund is manual.** Nothing runs `refund_sms_charge` on a schedule. Until
+  someone does, `charged_undelivered:%` is a report, not a remedy. A cron that
+  refunds rows older than N days *after* confirming no provider record would be
+  the next step; it needs a human decision about the late-delivery window.
+- **The marker describes our last attempt, not the final truth.** A refunded row
+  can still be delivered by the gateway. That is why the refund is not automatic.
+- **`error` vocabulary changed.** A dashboard that does an exact match on
+  `provider_failed` will show blanks for charged rows until it is updated.
+- **Migration 16 must be applied** before the refund is callable. The sender does
+  not depend on it, so deploying the function first is safe.

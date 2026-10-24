@@ -80,6 +80,9 @@ if (require.main === module) (async () => {
   if (process.env.MIG15 !== '0' && fs.existsSync(mig + '15_align_sms_dispatch_schema.sql')) {
     await c.query(fs.readFileSync(mig + '15_align_sms_dispatch_schema.sql', 'utf8'));
   }
+  if (process.env.MIG16 !== '0' && fs.existsSync(mig + '16_refund_sms_charge.sql')) {
+    await c.query(fs.readFileSync(mig + '16_refund_sms_charge.sql', 'utf8'));
+  }
   console.log('seeded');
   await c.end();
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -300,8 +300,8 @@ await q("UPDATE school.notifications SET message=$2 WHERE id=$1", [conflictId, "
 await makeDue(conflictId);
 await callFn({ notification_id: conflictId });              // same key, new body -> 409
 const conflict = await notif(conflictId);
-check("an idempotency conflict is recorded as provider_failed",
-  conflict.status === "failed" && conflict.error === "provider_failed",
+check("an idempotency conflict is recorded as a charged, undelivered failure",
+  conflict.status === "failed" && conflict.error === "charged_undelivered:provider_failed",
   `${conflict.status}/${conflict.error}`);
 check("the conflict did not charge twice", (await debitCount(conflictId)) === 1, String(await debitCount(conflictId)));
 

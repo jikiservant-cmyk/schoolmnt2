@@ -298,6 +298,79 @@ check("a replayed delivery report is accepted (idempotent)", r2.status === 200, 
 check("the row stays sent", delRow.status === "sent", delRow.status);
 check("and is not charged again", (await debits(delId)) === 1, String(await debits(delId)));
 
+console.log("\n--- 11. Money taken but nothing delivered: marked, and refundable ---");
+
+await setBalance(SCHOOL, 1000);
+await resetSmsLog();
+// Charge succeeds, then the gateway keeps failing until the cap.
+const lostId = await queueSms("Never lands [LAB_SMS_503] at all.", { retryCount: 4 });
+await callFn({ notification_id: lostId });
+const lost = await notif(lostId);
+check("a terminal failure after a charge is marked charged_undelivered",
+  lost.status === "failed" && String(lost.error).startsWith("charged_undelivered:"),
+  `${lost.status} / ${lost.error}`);
+check("the charge really happened", (await debits(lostId)) === 1, String(await debits(lostId)));
+
+// An uncharged terminal failure must NOT carry that marker.
+const poorId2 = await queueSms("No money here.", { retryCount: 4, school: SCHOOL_B, recipient: "+256772999555" });
+await q("UPDATE public.wallets SET balance=0 WHERE tenant_id=$1 OR school_id=$1", [SCHOOL_B]);
+await callFn({ notification_id: poorId2 });
+const poor2 = await notif(poorId2);
+check("an uncharged terminal failure carries no charge marker",
+  poor2.status === "failed" && !String(poor2.error).startsWith("charged_undelivered:"),
+  `${poor2.status} / ${poor2.error}`);
+
+// Refund it, exactly once.
+const balBeforeRefund = await balance(SCHOOL);
+const refund1 = (await q("SELECT public.refund_sms_charge($1) AS r", [lostId]))[0].r;
+const refund2 = (await q("SELECT public.refund_sms_charge($1) AS r", [lostId]))[0].r;
+check("the refund credits the school", refund1.outcome === "refunded" && refund1.amount === PRICE,
+  JSON.stringify(refund1));
+check("the money is back on the wallet", (await balance(SCHOOL)) === balBeforeRefund + PRICE,
+  `${balBeforeRefund} -> ${await balance(SCHOOL)}`);
+check("refunding twice is refused", refund2.outcome === "duplicate", JSON.stringify(refund2));
+check("a second refund does not credit again", (await balance(SCHOOL)) === balBeforeRefund + PRICE,
+  String(await balance(SCHOOL)));
+const noCharge = (await q("SELECT public.refund_sms_charge($1) AS r", [poorId2]))[0].r;
+check("refunding a never-charged row is a no-op", noCharge.outcome === "no_charge", JSON.stringify(noCharge));
+
+console.log("\n--- 12. Backoff honours the gateway, and the sweep has a budget ---");
+
+await setBalance(SCHOOL, 1000);
+await resetSmsLog();
+const backoffId = await queueSms("Rate limited [LAB_SMS_429] hard.");
+await callFn({ notification_id: backoffId });
+const backoff = await notif(backoffId);
+const dueInSec = (new Date(backoff.next_retry_at).getTime() - Date.now()) / 1000;
+check("Retry-After (2 s) is honoured instead of a flat 3 minutes",
+  dueInSec > 0 && dueInSec <= 30, `${dueInSec.toFixed(1)}s`);
+
+const beforeBudget = procs[procs.length - 1];
+beforeBudget.kill("SIGKILL");
+await waitPort(FN_PORT, false);
+const budgetFn = await startFn({ SMS_SWEEP_BUDGET_MS: "1" });
+await setBalance(SCHOOL, 1000);
+await resetSmsLog();
+const budgetIds = [];
+for (let i = 0; i < 4; i++) budgetIds.push(await queueSms(`Sweep budget ${i}.`));
+const budgetRes = await (await callFn({ retry_sweep: true })).json();
+check("the sweep stops early instead of running into the platform timeout",
+  budgetRes.stopped_early === true && Number(budgetRes.dispatched) <= 1, JSON.stringify(budgetRes));
+const stillPending = Number((await q(
+  "SELECT count(*) AS c FROM school.notifications WHERE id = ANY($1::uuid[]) AND status='pending'", [budgetIds]))[0].c);
+check("the rows it did not reach are still queued", stillPending >= 3, `${stillPending}/4`);
+budgetFn.p.kill("SIGKILL");
+const reallyClosed = await waitPort(FN_PORT, false);
+check("the budgeted function is really gone before the restart", reallyClosed, String(reallyClosed));
+const fresh = await startFn({ SMS_SWEEP_BUDGET_MS: "45000" });
+const drained = await (await callFn({ retry_sweep: true })).json();
+check("with a normal budget the next sweep runs to completion",
+  drained.stopped_early === false && Number(drained.dispatched) === 4,
+  `${JSON.stringify(drained)} pid=${fresh.p.pid} ${fresh.logs.join("").slice(-300)}`);
+const sentAfter = Number((await q(
+  "SELECT count(*) AS c FROM school.notifications WHERE id = ANY($1::uuid[]) AND status='sent'", [budgetIds]))[0].c);
+check("the rows the budgeted sweep skipped are delivered by the next one", sentAfter === 4, `${sentAfter}/4`);
+
 await db.end();
 stopAll();
 console.log(`\n=== SMS STRESS [${LABEL}]: ${fail === 0 ? "ALL CHECKS PASSED" : fail + " FAILED"} ===`);

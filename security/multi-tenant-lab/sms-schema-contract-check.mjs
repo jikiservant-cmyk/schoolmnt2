@@ -153,6 +153,47 @@ check('and can fall back to matching the notification id', /UUID_RE\.test\(v\)/.
 check('the sender passes our notification id as smsId so that fallback can match',
   /smsId:\s*notif\.id/.test(code));
 
+console.log('\n--- 5b. Charged-but-undelivered is visible and refundable ---');
+
+const mig16 = `${APP_DIR}/supabase_migrations/16_refund_sms_charge.sql`;
+check('migration 16 exists', fs.existsSync(mig16));
+const mig16Sql = fs.existsSync(mig16) ? fs.readFileSync(mig16, 'utf8') : '';
+check('a refund RPC exists and is SECURITY DEFINER',
+  /CREATE OR REPLACE FUNCTION public\.refund_sms_charge/.test(mig16Sql) && /SECURITY DEFINER/.test(mig16Sql));
+check('anon and authenticated cannot call it',
+  /REVOKE ALL ON FUNCTION public\.refund_sms_charge/.test(mig16Sql) &&
+  /'anon', 'authenticated'/.test(mig16Sql));
+check('refunds are idempotent through a ledger reference',
+  /sms_refund:/.test(mig16Sql) && /duplicate/.test(mig16Sql));
+
+check('terminal failures after a successful debit carry a marker',
+  /function failCode\(/.test(code) && /charged_undelivered:/.test(code));
+check('the marker is only added on the final attempt',
+  /isFinalAttempt && charged \?/.test(code));
+check('the flag is reset per row, not shared across the batch',
+  /let chargedThisRow = false/.test(code) && /chargedThisRow = true/.test(code));
+check('a late success clears a stale error', /error:\s*null/.test(code));
+
+console.log('\n--- 5c. Timeouts, backoff and the sweep are bounded ---');
+
+check('the claim lock is derived from the send timeout, not a constant',
+  /sendTimeoutMs/.test(code) && /lockMs\s*=\s*Math\.max\(/.test(code));
+check('the lock always outlives the send', /Math\.max\(\s*60_?000/.test(code) || /Math\.max\(60000/.test(code));
+check('Retry-After is parsed', /function parseRetryAfter\(/.test(code));
+check('both numeric and HTTP-date Retry-After are accepted',
+  /Number\.isFinite\(asNumber\)/.test(code) && /Date\.parse\(trimmed\)/.test(code));
+check('the honoured backoff is clamped to an hour', /Math\.min\([^)]*3600/.test(code));
+check('a missing Retry-After falls back to a sane default',
+  /DEFAULT_BACKOFF_SEC\s*=\s*180/.test(code));
+check('the call site actually prefers the gateway value',
+  /retryAfterSec\s*\?\?\s*DEFAULT_BACKOFF_SEC/.test(code));
+check('the sweep enforces a wall-clock budget',
+  /SMS_SWEEP_BUDGET_MS/.test(code) && /stopped_early/.test(code));
+check('the older SMS_BATCH_BUDGET_MS secret is still honoured',
+  /SMS_BATCH_BUDGET_MS/.test(code));
+check('the budget is checked before starting each row, not after the batch',
+  code.indexOf('Date.now() - startedAt > budgetMs') < code.indexOf('stoppedEarly = true'));
+
 console.log('\n--- 6. Deployment instructions match reality ---');
 
 const docs = fs.readFileSync(`${APP_DIR}/SECURITY_AUDIT.md`, 'utf8');
