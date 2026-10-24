@@ -7,6 +7,7 @@ const { Pool, types } = require('pg');
 const { AsyncLocalStorage } = require('async_hooks');
 const als = new AsyncLocalStorage();
 const NAJIKI = [];
+const SMS_LOG = [];
 const dbq = (sql, p) => (als.getStore() || pool).query(sql, p);
 
 // Match PostgREST's timestamptz JSON representation when requested by tests.
@@ -433,6 +434,44 @@ http.createServer((req, res) => {
         NAJIKI.push({ headers: { authorization: auth }, body: b, response: { paymentId, reference, status: 'pending' } });
         return send(res, 200, { paymentId, reference, status: 'pending' });
       }
+      // Fake NaJiki SMS API: mirrors najiki-finance2 POST /api/messaging/send
+      // (SmsInputSchema, Idempotency-Key dedupe, 202 Accepted).
+      if (url.pathname === '/__najiki/messaging/send') {
+        const b = JSON.parse(body || '{}');
+        const auth = req.headers.authorization || '';
+        const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+        const key = bearer || String(req.headers['x-api-key'] || '').trim() || String(b.apiKey || '').trim();
+        if (!key) return send(res, 401, { error: 'Invalid or missing API key' });
+        const idem = String(req.headers['idempotency-key'] || '').trim() || String(b.idempotencyKey || '').trim();
+        if (idem && (idem.length < 8 || idem.length > 255)) return send(res, 400, { error: 'Invalid SMS payload or idempotency key' });
+        if (!/^\+?[0-9]{9,15}$/.test(String(b.to || ''))) return send(res, 400, { error: 'Invalid SMS payload or idempotency key' });
+        if (typeof b.message !== 'string' || !b.message.length || b.message.length > 918) return send(res, 400, { error: 'Invalid SMS payload or idempotency key' });
+        if (b.senderId !== undefined && !/^[A-Za-z0-9]{3,11}$/.test(String(b.senderId))) return send(res, 400, { error: 'Invalid SMS payload or idempotency key' });
+        if (b.applicationCode !== undefined && String(b.applicationCode).length > 64) return send(res, 400, { error: 'Invalid SMS payload or idempotency key' });
+        // Lab-only failure injection: lets the Edge Function's retry/exhaustion
+        // paths be exercised for real. Nothing in the app emits these markers.
+        if (String(b.message).includes('[LAB_SMS_503]')) {
+          SMS_LOG.push({ injected: '503', idempotencyKey: idem || null, body: b, smsId: null });
+          return send(res, 503, { error: 'Upstream unavailable' }, { 'retry-after': '1' });
+        }
+        if (String(b.message).includes('[LAB_SMS_429]')) {
+          SMS_LOG.push({ injected: '429', idempotencyKey: idem || null, body: b, smsId: null });
+          return send(res, 429, { error: 'Rate limit exceeded' }, { 'retry-after': '2' });
+        }
+        if (idem) {
+          const prior = SMS_LOG.find((m) => m.idempotencyKey === idem);
+          if (prior) {
+            if (prior.body.message !== b.message || prior.body.to !== b.to) return send(res, 409, { error: 'Idempotency key reused with a different payload' });
+            return send(res, 202, { success: true, message: 'Duplicate request', smsId: prior.smsId, reference: prior.reference, status: prior.status, deduplicated: true, createdAt: prior.createdAt });
+          }
+        }
+        const smsId = 'c' + crypto.randomBytes(12).toString('hex');
+        const reference = 'SCH-' + crypto.randomBytes(6).toString('hex').toUpperCase();
+        const rec = { smsId, reference, status: 'queued', createdAt: new Date().toISOString(), idempotencyKey: idem || null, body: b, headers: { authorization: auth } };
+        SMS_LOG.push(rec);
+        return send(res, 202, { success: true, message: 'SMS send job queued successfully', smsId, reference, status: 'queued', deduplicated: false, createdAt: rec.createdAt });
+      }
+      if (url.pathname === '/__najiki/sms-log') { if (req.method === 'DELETE') SMS_LOG.length = 0; return send(res, 200, SMS_LOG); }
       if (url.pathname === '/__najiki/log') { if (req.method === 'DELETE') NAJIKI.length = 0; return send(res, 200, NAJIKI); }
       if (url.pathname === '/__reload') { await loadCatalog(); return send(res, 200, { ok: true }); }
       if (url.pathname.startsWith('/auth/v1/')) return handleAuth(req, res, url, body);

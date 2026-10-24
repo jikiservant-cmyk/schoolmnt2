@@ -388,7 +388,7 @@ Regression after this pass: legit flows 17/17, app attacks 1/42 (known device tr
 
 ### Notes
 
-- **SMS sending happens in a Supabase Edge Function** (confirmed by the owner). It is not in this repo, so it was not reviewed. Things to check there: it should use the service-role key, because migration 04 RLS blocks anon access to `school.notifications`. It should charge the school's wallet atomically, once per SMS. It should mark a row as sent only after NaJiki accepts it. NaJiki delivery reports update `school.notifications.status` to `sent`/`failed`, matched by `provider_ref` (store NaJiki's `smsId` there) or the notification id.
+- **SMS sending happens in a Supabase Edge Function** (confirmed by the owner). *Update: that function now lives in this repo at `supabase/functions/send-sms/` and is reviewed and tested end to end in Part 21 — read that part instead of this note.* The checklist raised here was: use the service-role key (migration 04 RLS blocks anon access to `school.notifications`), charge the wallet atomically once per SMS, mark a row sent only after NaJiki accepts it, and store NaJiki's `smsId` in `provider_ref` so delivery reports can match it. All four are now implemented and verified.
 - **NaJiki side (other repo):** `POST /api/messaging/send` does not check or debit any wallet. Anyone holding the school app's `NAJIKI_API_KEY` can send unlimited SMS billed to NaJiki's SMS account. Keep that key server-side only (it is), and rotate it if it was ever exposed.
 
 # Part 6: Money round 3 ("rogue" pentest): public key, teacher, races
@@ -1088,3 +1088,147 @@ Re-ran after the fix, all green: `money-reconcile` **ALL MONEY CHECKS OK**,
 `school` application in the gateway expects a different platform-fee code. The
 `tenantCode` we send must exist as a tenant of the `school` application in the
 gateway's own `tenants` table — the two systems must agree on tenant codes.
+
+# Part 21: The SMS Edge Function (the only component that spends money)
+
+## The rule this part enforces
+
+A school never sends an SMS itself. The Next.js app only inserts a `queued` row
+into `school.notifications` (`lib/notifications/queue.ts`). Everything after
+that — pricing, charging the wallet, calling NaJiki, recording the provider's
+id — happens in `supabase/functions/send-sms/`, a Deno Edge Function. Two files:
+
+- `sms-sender.ts` — pure helpers (phone normalisation, request building,
+  response classification, retry accounting, price validation). No I/O, so the
+  test harness can import and unit-test them.
+- `index.ts` — the function itself: claim, charge, send, record, release.
+
+SMS purchases continue to use the payment code **`BUY_SMS`** (Part 20). The
+per-message price is **platform-only** (`SMS_UNIT_PRICE_UGX`); no school-facing
+setting, form or policy can reach it. That is the financial-integrity rule from
+Part 13/20 applied to SMS specifically.
+
+## What the function does, and why each step is safe
+
+1. **Authorise** — `x-dispatch-secret` compared in constant time against
+   `SMS_DISPATCH_SECRET`; a missing secret on the platform side fails closed
+   (401), so an unconfigured deployment cannot be driven by anyone. GET → 405.
+2. **Refuse to guess a price** — `resolveUnitPrice` must return a positive
+   integer, otherwise the function returns 503 and sends nothing. An empty
+   `SMS_UNIT_PRICE_UGX` (a very likely misconfiguration) therefore cannot invent
+   a price or send free SMS.
+3. **Claim** — `update({status:'sending'}).eq('status','queued')`. Postgres
+   re-checks the predicate under the row lock, so two concurrent workers can
+   never claim the same row; the loser sees 0 rows and does nothing.
+4. **Charge once** — `school.debit_sms_wallet(school_id, price, 'sms_<id>')`,
+   the `service_role`-only RPC from migration 11. The reference is derived from
+   the notification id, so a retry returns `duplicate` instead of charging
+   twice. `insufficient_funds` fails the row without sending.
+5. **Send** — `POST /api/messaging/send` with
+   `Idempotency-Key: sms_<notificationId>` (the same value as the wallet
+   reference) and NaJiki's own shape: `to`, `message`, `applicationCode`,
+   optional `senderId`. Success is **HTTP 202**, not 200.
+6. **Record** — `provider_ref` is set to NaJiki's `smsId` (never a locally
+   generated id, or the delivery report could not match), plus `sent_at`,
+   plus the raw `provider_response`.
+7. **Release** — a `finally` block returns every row still in `sending` back to
+   `queued`. Without it, a function killed at the platform's wall-clock limit
+   would strand rows as `sending` forever and they would never be retried.
+
+## Findings fixed in this round
+
+| # | Finding | Impact | Fix |
+| --- | --- | --- | --- |
+| 21-1 | The retry branch read `row.attempt_count`, but no such column exists (migration 11 only adds `provider_ref`, `sent_at`, `provider_response`). | `attempt_count` was always `undefined`, so `MAX_ATTEMPTS` was dead code: a permanently failing row was retried forever, on every cron tick. | Counter is persisted in `provider_response` (`{reason, attempts, charged}`) via `readAttempts`/`nextAttempt`. |
+| 21-2 | Retries ignored whether money had already been taken. | A charged SMS that NaJiki kept failing would be marked `failed` after 3 tries: the school paid, got no SMS, and nothing flagged it for refund. There is no automatic refund RPC, so this is silent financial loss. | Two caps: 3 attempts when nothing was charged, 10 when it was; terminal failures of charged rows are labelled `charged_undelivered:` so they are findable and refundable by hand. |
+| 21-3 | The batch loop could outlive the platform timeout (25 rows × 12 s worst case = 300 s vs a 150 s limit), leaving claimed rows in `sending` forever. | Paid-for messages silently stuck; queue leak. | 45 s soft budget (`SMS_BATCH_BUDGET_MS`) plus the `finally` release above. |
+| 21-4 | `Deno.serve(handler)` always bound port 8000. | Harmless in production (one instance per function), but it made multi-instance verification impossible. | `PORT`/`HOSTNAME` read from env, defaulting to 8000/0.0.0.0 exactly as before. |
+| 21-5 | The Deno function was inside the Next.js TypeScript program. | `npm run build` failed on `npm:` imports and Deno globals — the app could not be built at all with the function present. | `supabase/functions` excluded from `tsconfig.json` and ESLint; the function is type-checked with `deno check` instead (0 errors). |
+
+## How it was verified
+
+`security/multi-tenant-lab/sms-edge-e2e-check.mjs` runs the **real function**:
+it spawns `deno run --allow-net --allow-env supabase/functions/send-sms/index.ts`,
+points it at the lab shim (Supabase REST + RPC + the fake NaJiki SMS API that
+mirrors `najiki-finance2`), and asserts against Postgres, never against HTTP
+status alone. **41/41 checks pass**, including:
+
+- 401 without / with a wrong dispatch secret, 405 on GET, 503 when
+  `SMS_UNIT_PRICE_UGX` is unset (and nothing sent or charged in that case);
+- happy path: `queued` → charged exactly 30 UGX once → NaJiki 202 →
+  `sent`, `provider_ref` equal to NaJiki's `smsId`, `sent_at` set,
+  `Idempotency-Key` = wallet reference = `sms_<id>`; a second run sends
+  nothing and charges nothing;
+- an unfunded school: `failed`, zero messages to NaJiki, wallet still 0;
+- 503 from the gateway: row stays `queued` with `attempts:1, charged:true`, the
+  charge is not repeated, the counter increments, and at the charged cap the row
+  fails as `charged_undelivered:` (not silently);
+- 429: retryable, and charging during the attempt moves the row onto the
+  charged cap;
+- invalid phone and over-length message: `failed`, no charge, no gateway call;
+- zero time budget: no row left in `sending`, unreached rows uncharged and
+  delivered by the next run.
+
+`sms-sender-contract-check.mjs` adds **46/46** checks against NaJiki's *own*
+code (`SmsInputSchema`, `MAX_SMS_BODY_BYTES`, `verifyNotificationSignature`):
+every body the sender builds is accepted by their schema, 202-with-`smsId` is
+classified as success, 409 as permanent, 429/5xx as retryable, plus 7 unit
+checks on the retry accounting.
+
+**Negative controls** (to prove the tests can fail):
+
+- reverting the 202 check to `status === 200` → **5 failures**, all on the
+  accept path (every real success would have been treated as a failure);
+- reverting the charged-row cap → **5 failures**, including
+  `retry_exhausted: Upstream unavailable (after 3 attempts)` on a row the school
+  had already paid for — exactly finding 21-2.
+
+`deno check` reports 0 type errors. `npm run lint`, `npx tsc --noEmit` and
+`npm run build` are green with the function in the tree.
+
+## Full regression sweep after these changes
+
+`full-branch-pentest` **27/27 SECURE**, `provider-contract-check` **30/30**,
+`sms-sender-contract-check` **46/46**, `sms-edge-e2e-check` **41/41**,
+`money-round13-attack` **0/24**, `payments-attack` **0/20**, `rogue-attack`
+**0/21**, `round4-attack` **0/5**, `pay-rls-check` **0/8**,
+`money-reconcile` **ALL MONEY CHECKS OK**, `flows-check` **ALL FLOWS OK**,
+`round12` **35/35**, `round14` **40/40**, `round16` **18/18**,
+`double-thumb-check` **11/11**. Zero regressions.
+
+## Deploying it
+
+```bash
+supabase functions deploy send-sms --no-verify-jwt
+supabase secrets set \
+  NAJIKI_API_URL=https://<gateway>/api/messaging/send \
+  NAJIKI_API_KEY=... \
+  NAJIKI_APP_CODE=school \
+  NAJIKI_SENDER_ID=SMARTSKOOLZ \
+  SMS_UNIT_PRICE_UGX=30 \
+  SMS_DISPATCH_SECRET=$(openssl rand -hex 32)
+# then, on a schedule (pg_cron / Supabase Scheduler / QStash):
+#   POST /functions/v1/send-sms   x-dispatch-secret: <SMS_DISPATCH_SECRET>
+```
+
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are injected by the platform.
+The service-role key is mandatory: migration 06 revoked anon/authenticated
+writes to `school.notifications` and to the wallet functions.
+
+Before go-live the migrations must be applied in order (`05` → `14`), because
+this function depends on `school.debit_sms_wallet` (11) and on the delivery
+columns added there.
+
+## Residual risk, stated plainly
+
+- **`sending` rows and no `updated_at`.** The `finally` release covers normal
+  exits and the time budget, but a hard kill (OOM, platform SIGKILL) can still
+  strand a row. `school.notifications` has no `updated_at` to age rows by, so
+  there is no safe reaper yet. Recommended follow-up: add `updated_at` in a
+  future migration and requeue `sending` rows older than ~10 minutes.
+- **NaJiki does not debit its own wallet** for SMS it sends (Part 6 note). Our
+  charge is the only one, so `SMS_UNIT_PRICE_UGX` must be kept in step with what
+  the gateway actually costs; it is not derived from the gateway.
+- **Delivery-report matching** is identifier-based and deliberately generous
+  (Part 20), so an unrelated `reference` collision could flip a status. It
+  cannot move money, and `sent` rows are never downgraded by a `failed` report.
