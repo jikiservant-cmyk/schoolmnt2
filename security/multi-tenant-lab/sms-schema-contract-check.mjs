@@ -1,14 +1,14 @@
-// Schema + source contract for the SMS Edge Function.
+// Schema + source contract for the deployed SMS sender.
 //
-// The function that was deployed in the database could not send a single SMS,
-// because it was written against things that do not exist. This suite locks
-// those assumptions down so they cannot come back:
+// The live project is the source of truth. This suite pins down the facts the
+// deployed function depends on, so the repo cannot drift away from them again:
 //
-//   * it called `public.debit_sms_wallet(p_wallet_id, ...)`  -> 42883
-//   * it wrote `retry_count` / `next_retry_at` / `error`     -> 42703
-//   * it sent no Idempotency-Key, so retries sent duplicate SMS
-//   * it never set `provider_ref`, so delivery reports matched nothing
-//   * it defaulted the platform price to 1 UGX
+//   school.notifications : retry_count, next_retry_at, error,
+//                          status default 'pending', provider_response (text)
+//   wallet RPC           : public.debit_sms_wallet(p_wallet_id text, p_amount
+//                            numeric, p_idempotency_key text, p_tenant_id text,
+//                            p_description text)
+//   function             : send-attendance-sms
 //
 // Part database, part static analysis, no Deno required.
 //
@@ -17,7 +17,7 @@ import fs from 'fs';
 import pg from 'pg';
 
 const [LABEL = 'run'] = process.argv.slice(2);
-const FN_DIR = '/home/user/schoolmnt2/supabase/functions/send-sms';
+const FN_DIR = '/home/user/schoolmnt2/supabase/functions';
 const APP_DIR = '/home/user/schoolmnt2';
 
 let fail = 0;
@@ -30,89 +30,106 @@ const db = new pg.Client({ host: '127.0.0.1', port: 54329, user: 'postgres', pas
 await db.connect();
 const q = async (s, p) => (await db.query(s, p)).rows;
 
-console.log('\n--- 1. The wallet RPC the function must call ---');
+console.log('\n--- 1. public.debit_sms_wallet, exactly as deployed ---');
 
 const fns = await q(`
   SELECT n.nspname AS schema, pg_get_function_identity_arguments(p.oid) AS args,
          p.prosecdef AS security_definer
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
    WHERE p.proname = 'debit_sms_wallet'`);
-check('school.debit_sms_wallet(uuid, numeric, text, text) exists',
-  fns.some((f) => f.schema === 'school' && f.args === 'p_school_id uuid, p_amount numeric, p_reference text, p_description text'),
-  JSON.stringify(fns.map((f) => `${f.schema}(${f.args})`)));
-check('it is SECURITY DEFINER (runs with its own privileges)',
-  fns.filter((f) => f.schema === 'school').every((f) => f.security_definer === true));
-check('there is no public.debit_sms_wallet for the deployed call to reach',
-  !fns.some((f) => f.schema === 'public'),
-  JSON.stringify(fns.map((f) => f.schema)));
+const pub = fns.find((f) => f.schema === 'public');
+check('public.debit_sms_wallet exists with the deployed signature',
+  !!pub && pub.args === 'p_wallet_id text, p_amount numeric, p_idempotency_key text, p_tenant_id text, p_description text',
+  pub ? pub.args : JSON.stringify(fns.map((f) => `${f.schema}(${f.args})`)));
+check('it is SECURITY DEFINER', pub?.security_definer === true);
 
-let legacyError = null;
+const acl = await q(`
+  SELECT r.rolname, has_function_privilege(r.rolname,
+           'public.debit_sms_wallet(text, numeric, text, text, text)', 'EXECUTE') AS can
+    FROM pg_roles r WHERE r.rolname IN ('anon', 'authenticated', 'service_role')`);
+for (const r of acl) {
+  check(`${r.rolname} ${r.rolname === 'service_role' ? 'can' : 'cannot'} execute it`,
+    r.rolname === 'service_role' ? r.can : !r.can);
+}
+
+// Behaviour, not just existence.
+const wallet = (await q('SELECT id, balance FROM public.wallets WHERE tenant_id=$1 LIMIT 1', ['aaaaaaaa-0000-4000-8000-000000000001']))[0];
+const key = 'sms:probe-' + Date.now();
+const d1 = (await q('SELECT public.debit_sms_wallet($1,$2,$3,$4,$5) AS r',
+  [wallet.id, 30, key, 'aaaaaaaa-0000-4000-8000-000000000001', 'probe']))[0].r;
+const d2 = (await q('SELECT public.debit_sms_wallet($1,$2,$3,$4,$5) AS r',
+  [wallet.id, 30, key, 'aaaaaaaa-0000-4000-8000-000000000001', 'probe']))[0].r;
+check('a first call debits', d1.outcome === 'debited', JSON.stringify(d1));
+check('the same idempotency key never charges twice', d2.outcome === 'duplicate', JSON.stringify(d2));
+
+let insufficient = null;
 try {
-  await q(`select public.debit_sms_wallet(p_wallet_id => null::uuid, p_amount => 1,
-            p_idempotency_key => 'x', p_tenant_id => 'y', p_description => 'z')`);
+  await q('SELECT public.debit_sms_wallet($1,$2,$3,$4,$5)',
+    [wallet.id, 10_000_000, 'sms:probe-huge-' + Date.now(), 'aaaaaaaa-0000-4000-8000-000000000001', 'probe']);
 } catch (e) {
-  legacyError = e.code;
+  insufficient = e.message;
 }
-check('the deployed 5-argument call still fails with undefined_function (42883)',
-  legacyError === '42883', String(legacyError));
+check('an unaffordable SMS raises, so the sender does not send', /insufficient/i.test(insufficient || ''), String(insufficient));
 
-const debit = (await q(`select school.debit_sms_wallet('aaaaaaaa-0000-4000-8000-000000000001'::uuid, 0, 'probe-zero', 'probe')`))[0];
-check('a zero/negative amount is refused by the RPC itself', debit.debit_sms_wallet.outcome === 'invalid_amount',
-  JSON.stringify(debit.debit_sms_wallet));
-
-console.log('\n--- 2. The columns the function may and may not touch ---');
-
-const cols = (await q(`
-  SELECT column_name FROM information_schema.columns
-   WHERE table_schema = 'school' AND table_name = 'notifications'`)).map((r) => r.column_name);
-for (const c of ['status', 'provider_ref', 'sent_at', 'provider_response', 'message', 'recipient_phone_snapshot', 'school_id', 'channel']) {
-  check(`school.notifications.${c} exists`, cols.includes(c));
+let crossTenant = null;
+try {
+  await q('SELECT public.debit_sms_wallet($1,$2,$3,$4,$5)',
+    [wallet.id, 1, 'sms:probe-cross-' + Date.now(), 'bbbbbbbb-0000-4000-8000-000000000001', 'probe']);
+} catch (e) {
+  crossTenant = e.message;
 }
-for (const c of ['retry_count', 'next_retry_at', 'error', 'attempt_count']) {
-  check(`school.notifications.${c} does NOT exist (the deployed function wrote it)`, !cols.includes(c));
-}
+check('a wallet id with the wrong tenant is refused', /not found for tenant/i.test(crossTenant || ''), String(crossTenant));
 
-console.log('\n--- 3. The function source must match that reality ---');
+console.log('\n--- 2. school.notifications, exactly as deployed ---');
 
-const indexSrc = fs.readFileSync(`${FN_DIR}/index.ts`, 'utf8');
-const helperSrc = fs.readFileSync(`${FN_DIR}/sms-sender.ts`, 'utf8');
-const allSrc = indexSrc + '\n' + helperSrc;
-// Comments legitimately describe the old bugs; only CODE must be free of them.
-const stripComments = (s) => s
-  .replace(/\/\*[\s\S]*?\*\//g, '')
-  .replace(/^\s*\/\/.*$/gm, '')
-  .replace(/(^|[^:'"`])\/\/[^\n]*$/gm, '$1');
-const codeOnly = stripComments(allSrc);
+const cols = Object.fromEntries((await q(`
+  SELECT column_name, data_type, column_default, is_nullable
+    FROM information_schema.columns
+   WHERE table_schema = 'school' AND table_name = 'notifications'`)).map((r) => [r.column_name, r]));
 
-for (const forbidden of ['retry_count', 'next_retry_at', 'attempt_count', 'p_wallet_id', 'p_idempotency_key']) {
-  check(`code never uses ${forbidden}`, !codeOnly.includes(forbidden));
-}
-check('the debit call passes p_school_id and p_reference',
-  /p_school_id:\s*notif\.school_id/.test(indexSrc) && /p_reference:\s*request\.walletReference/.test(indexSrc));
-check('the debit call is made in the school schema',
-  /db\.schema\(SCHOOL_SCHEMA\)|school\.rpc\(/.test(indexSrc), 'school.rpc');
-check('provider_response is written as an object, never JSON.stringify-ed',
-  !/JSON\.stringify\(\s*najiki|JSON\.stringify\(\s*payload|JSON\.stringify\(\s*debit/.test(indexSrc));
-check('provider_ref is set from NaJiki\'s own id on success',
-  /provider_ref:\s*result\.providerRef/.test(indexSrc));
-check('an Idempotency-Key header is sent', /['"]Idempotency-Key['"]\s*:/.test(indexSrc));
-check('the wallet reference and the idempotency key are the same value',
-  /walletReference:\s*idempotencyKey/.test(helperSrc) || /walletReference/.test(helperSrc));
-check('the HTTP timeout is bounded', /AbortSignal\.timeout\(ctx\.timeoutMs\)/.test(indexSrc));
+check('retry_count exists (integer, default 0, not null)',
+  cols.retry_count?.data_type === 'integer' && /0/.test(cols.retry_count?.column_default || '') && cols.retry_count?.is_nullable === 'NO',
+  JSON.stringify(cols.retry_count));
+check('next_retry_at exists (timestamptz)', cols.next_retry_at?.data_type === 'timestamp with time zone',
+  JSON.stringify(cols.next_retry_at));
+check('error exists (text)', cols.error?.data_type === 'text', JSON.stringify(cols.error));
+check('provider_response is text, not jsonb', cols.provider_response?.data_type === 'text',
+  JSON.stringify(cols.provider_response));
+check("status defaults to 'pending'", /'pending'/.test(cols.status?.column_default || ''),
+  String(cols.status?.column_default));
 
-console.log('\n--- 4. Pricing is platform-only and never defaulted ---');
+console.log('\n--- 3. The deployed function is the one in the repo ---');
 
-const priceCalls = [...indexSrc.matchAll(/SMS_COST[^;\n]*/g)].map((m) => m[0]);
-check('SMS_COST is read but never given a numeric fallback',
-  priceCalls.length > 0 && !priceCalls.some((c) => /\|\|\s*["']?\d/.test(c)),
-  JSON.stringify(priceCalls));
-check('a missing/invalid price returns 503 and sends nothing',
-  /SMS pricing is not configured/.test(indexSrc) && /503/.test(indexSrc));
-check('the price helper rejects 0, negatives and fractions',
-  /resolveUnitPrice/.test(helperSrc));
-check('no school-facing price setting is read', !/school\.settings|settings.*price/i.test(allSrc));
+check('supabase/functions/send-attendance-sms exists', fs.existsSync(`${FN_DIR}/send-attendance-sms/index.ts`));
+check('the never-deployed send-sms function is gone', !fs.existsSync(`${FN_DIR}/send-sms`));
 
-console.log('\n--- 5. The app and the function agree on the vocabulary ---');
+const src = fs.readFileSync(`${FN_DIR}/send-attendance-sms/index.ts`, 'utf8');
+const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+check('it writes retry_count', /retry_count:/.test(code));
+check('it writes next_retry_at', /next_retry_at:/.test(code));
+check('it writes error', /\berror:/.test(code));
+check('it calls the 5-argument wallet RPC', /p_wallet_id:/.test(code) && /p_idempotency_key:/.test(code) &&
+  /p_tenant_id:/.test(code) && /p_amount:/.test(code));
+check('it calls the RPC in the public schema (no .schema() prefix)', /supabase\.rpc\(\s*["']debit_sms_wallet/.test(code));
+check('it does not reference provider_ref', !/provider_ref/.test(code));
+check('it stores JSON text in provider_response', /JSON\.stringify\(/.test(code));
+check('it charges before sending', code.indexOf('debit_sms_wallet') < code.indexOf('/api/messaging/send'));
+check("it only dispatches status='pending'", /status !== "pending"/.test(code));
+check('the retry sweep filters retry_count < 5', /\.lt\("retry_count",\s*MAX_ATTEMPTS\)/.test(code));
+
+console.log('\n--- 4. The two additive fixes are present ---');
+
+check('an Idempotency-Key header is sent to NaJiki', /["']Idempotency-Key["']\s*:/.test(code));
+check('the idempotency key is one per notification', /`sms:\$\{notificationId\}`/.test(code));
+check('the dispatch secret is compared in constant time', /safeEqual\(/.test(code));
+check('an undeliverable number is rejected before the wallet is touched',
+  /MSISDN_RE/.test(code) && code.indexOf('MSISDN_RE.test') < code.indexOf('debit_sms_wallet'));
+check('SMS_COST has no positive fallback (only an invalid "0")',
+  !/SMS_COST[^\n]*\|\|\s*["']?[1-9]/.test(code));
+check('a missing price returns 503', /SMS pricing is not configured/.test(src));
+
+console.log('\n--- 5. The app agrees with the sender ---');
 
 const appFiles = [
   `${APP_DIR}/app/mark-attendance/actions.ts`,
@@ -121,28 +138,20 @@ const appFiles = [
 ];
 const appSrc = appFiles.map((f) => fs.readFileSync(f, 'utf8')).join('\n');
 check("the app queues notifications as status 'pending'", /status:\s*['"]pending['"]/.test(appSrc));
-check("the app never queues 'queued' SMS rows", !/status:\s*['"]queued['"]/.test(appSrc));
-check("the function only dispatches 'pending' rows", /status\)\s*!==\s*"pending"/.test(indexSrc));
-check("the function's sweep includes both pending and sending",
-  /\.in\("status",\s*\["pending",\s*"sending"\]\)/.test(indexSrc));
+const webhook = fs.readFileSync(`${APP_DIR}/app/api/webhooks/najiki/handler.ts`, 'utf8');
+check('the delivery webhook survives a database without provider_ref',
+  /isMissingProviderRefColumn/.test(webhook));
+check('and can fall back to matching the notification id', /UUID_RE\.test\(v\)/.test(webhook) || /idCandidates/.test(webhook));
+check('the sender passes our notification id as smsId so that fallback can match',
+  /smsId:\s*notif\.id/.test(code));
 
-console.log('\n--- 6. The interface the deployed callers already use is preserved ---');
+console.log('\n--- 6. Deployment instructions match reality ---');
 
-for (const name of ['DISPATCH_SECRET', 'NAJIKI_DOMAIN', 'NAJIKI_API_KEY', 'SMS_COST', 'NAJIKI_TIMEOUT_MS']) {
-  check(`env ${name} is still honoured`, indexSrc.includes(name));
-}
-check('the Bearer dispatch secret is still accepted', /Authorization.*Bearer|presentedSecret/.test(indexSrc));
-check('the x-dispatch-secret header is also accepted', /x-dispatch-secret/.test(indexSrc));
-check('{ notification_id } payloads still work', /notification_id/.test(indexSrc));
-check('{ record: { id } } webhook payloads still work', /record\?\.id|body\?\.record/.test(indexSrc));
-check('{ retry_sweep: true } still works', /retry_sweep/.test(indexSrc));
-
-console.log('\n--- 7. Delivery reports can find the row ---');
-
-const webhookSrc = fs.readFileSync(`${APP_DIR}/app/api/webhooks/najiki/handler.ts`, 'utf8');
-check('the app matches delivery reports on provider_ref', /provider_ref/.test(webhookSrc));
-check('the function stores a non-null provider_ref before marking sent',
-  /status:\s*"sent"[\s\S]{0,200}?provider_ref:\s*result\.providerRef/.test(indexSrc));
+const docs = fs.readFileSync(`${APP_DIR}/SECURITY_AUDIT.md`, 'utf8');
+check('the deploy line names send-attendance-sms', /functions deploy send-attendance-sms/.test(docs));
+check('it does not tell anyone to disable JWT verification for it',
+  !/deploy send-attendance-sms --no-verify-jwt/.test(docs));
+check('the sweep is documented as needing a scheduler', /cron|scheduler|pg_cron/i.test(docs));
 
 await db.end();
 console.log(`\n=== SMS SCHEMA CONTRACT [${LABEL}]: ${fail === 0 ? 'ALL CHECKS PASSED' : fail + ' FAILED'} ===`);

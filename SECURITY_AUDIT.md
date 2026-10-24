@@ -1350,3 +1350,138 @@ every few minutes, or `{"notification_id":"<id>"}` as a database webhook.
   wholesale resets the attempt count. No app code writes that column.
 - `NAJIKI_DOMAIN` defaults to `https://api.najiki.com`; production should set it
   explicitly so a gateway move cannot silently reroute paid traffic.
+
+# Part 23: Correction — aligning the repo to the live project
+
+## What I got wrong in Parts 21 and 22
+
+Parts 21 and 22 measured the **lab database built from this repo's migrations**
+and reported the result as if it described production. It did not. The live
+project, as reported by the owner, is different:
+
+| Thing | Parts 21–22 assumed (repo migrations) | Live project |
+| --- | --- | --- |
+| `school.notifications` retry columns | `retry_count`, `next_retry_at`, `error` **do not exist** | they **do exist** |
+| `provider_response` | `jsonb` | **`text`** |
+| `provider_ref` | exists and is how delivery reports match | **no such column** |
+| `status` default | none | **`pending`** |
+| wallet debit | `school.debit_sms_wallet(p_school_id, …)` | **`public.debit_sms_wallet(p_wallet_id text, p_amount numeric, p_idempotency_key text, p_tenant_id text, p_description text)`** |
+| deployed function | `send-sms` | **`send-attendance-sms`, v16, JWT verification ENABLED** |
+
+So the `42703` / `42883` errors in Part 22 were real **in this repository's
+schema**, and irrelevant to the live database. The honest reading is the
+opposite of what I wrote: **the repo had drifted from production**, and the
+deployed function was written against the live schema all along. The two
+"bugs" that were really my misreading:
+
+- writing `retry_count` / `next_retry_at` / `error` is correct on the live schema;
+- `JSON.stringify(...)` into `provider_response` is correct because that column
+  is `text` there, not `jsonb`.
+
+What *did* hold up, on the live schema, is below — including two genuine defects
+that only became visible once the lab was rebuilt to match production.
+
+## What changed in the repository
+
+1. **`supabase_migrations/15_align_sms_dispatch_schema.sql` (new).** Brings a
+   fresh database up to the live shape: `retry_count int not null default 0`,
+   `next_retry_at timestamptz`, `error text`, `status` default `'pending'`,
+   `provider_response` converted to `text`, a partial index for the sweep, and
+   **`public.debit_sms_wallet(text, numeric, text, text, text)`** with the
+   deployed signature (idempotent on `p_idempotency_key`, tenant-checked,
+   raises on insufficient funds, `service_role` only).
+
+   > **Do not run migration 15 against production.** The live project already
+   > has these objects; replacing its wallet function with my reconstruction
+   > would be a change to production money code based on a signature alone. It
+   > is for fresh installs and the lab. If the live function's body differs
+   > (return shape, rounding, ledger rows), the live one wins.
+
+2. **The function is now `supabase/functions/send-attendance-sms/`** — the
+   deployed implementation, faithful to its column names, status values, RPC
+   signature, request body (`{smsId, to, message}`), env names
+   (`DISPATCH_SECRET`, `NAJIKI_DOMAIN`, `NAJIKI_API_KEY`, `SMS_COST`,
+   `NAJIKI_TIMEOUT_MS`), payload shapes, return values and its 5-attempt cap.
+   `send-sms/` and its helper module were deleted: that function was never
+   deployed, so it was only ever a source of confusion.
+3. **The lab now mirrors production**: the retry columns exist,
+   `provider_response` is `text`, and the wallet RPC has the deployed signature.
+   Every assertion below runs against that shape.
+
+Three changes to the deployed code, all additive and all marked in the file:
+
+| Change | Why |
+| --- | --- |
+| `Idempotency-Key: sms:<notificationId>` on the NaJiki call | Without it, each of the 5 retries creates a **second billable SMS**. With it, a retry is the same message and NaJiki deduplicates it. |
+| Constant-time comparison of the dispatch secret | The deployed `!==` leaks the secret's length/prefix through timing. |
+| A real MSISDN check before the wallet is touched | The deployed `toE164` only rejected **empty** numbers. `12345` became `+12345`, passed, and was **charged** before the gateway rejected it — five times. |
+
+## What the rebuilt lab proved (deployed function, live-shaped schema)
+
+`sms-edge-e2e-check.mjs` — **56/56**, driving the real Deno function against the
+lab shim and asserting on Postgres:
+
+- 401 without/with a wrong `Bearer` secret, 405 on GET, 400 without an id,
+  503 when `SMS_COST` is unset (and nothing sent or charged), and an unknown
+  notification id answered with `skipped` rather than a retry loop;
+- happy path: `pending` → charged 30 UGX exactly once → NaJiki 202 → `sent`,
+  `retry_count` stays 0, `next_retry_at` cleared, `error` null,
+  `provider_response` parses as JSON text, `smsId` carries our notification id,
+  `Idempotency-Key` is `sms:<id>`, and the posted body passes NaJiki's own
+  `SmsInputSchema`; a second dispatch is a no-op with no second charge;
+- `{record:{id}}` webhook payloads work;
+- an unfunded school: `failed` after the cap, `error =
+  insufficient_balance_or_debit_failed`, zero messages to NaJiki, wallet still 0;
+- retries: a 503 leaves the row `pending` with `retry_count` incremented, a
+  **future `next_retry_at` lock** (a second call inside the backoff is refused),
+  the same `Idempotency-Key` on every attempt, at most one charge, and the 5th
+  attempt terminal with the backoff cleared;
+- an idempotency conflict (same key, different body) recorded as
+  `provider_failed` without a second charge;
+- invalid numbers failed **before** any charge, with no gateway call;
+- the sweep sends only due rows, leaves backed-off rows and rows at the cap
+  alone, never re-sends `sent` rows, and charges only what it sends;
+- the app's delivery webhook still returns 200 and leaves a delivered row
+  `sent` on this schema (where `provider_ref` does not exist).
+
+`sms-schema-contract-check.mjs` — **39/39**, no Deno required: the RPC exists
+with the deployed signature and correct ACLs, debits once per idempotency key,
+raises on insufficient funds and on a wallet/tenant mismatch; the notification
+columns have the deployed types and defaults; the repo's function is
+`send-attendance-sms` and the old one is gone; the code writes the retry
+columns, calls the 5-argument RPC, never touches `provider_ref`, stores JSON
+text, charges before sending, dispatches only `pending`, and keeps the three
+fixes above; the app queues `pending` and its webhook survives a schema with no
+`provider_ref`.
+
+`provider-contract-check.mjs` (**30/30**) and the full pentest/regression sweep
+are unchanged and green.
+
+## Deployment and reconciliation
+
+```bash
+supabase functions deploy send-attendance-sms     # JWT verification STAYS ON
+supabase secrets set SMS_COST=... DISPATCH_SECRET=...
+# and a scheduler is required — a URL and a body are not a schedule:
+#   POST /functions/v1/send-attendance-sms   {"retry_sweep": true}
+#   cron: */5 * * * *
+```
+
+About the rows already in the table: 76 pending / 7 sent, of which 63 pending
+carry `error` and `provider_response` markers. Those markers do **not** prove
+whether the provider accepted or billed a message, and `retry_count` alone does
+not either. Do not bulk-requeue them: for a sample, check `public.sms_messages` /
+`public.sms_delivery_reports` by `provider_message_id` against
+`provider_response`, then requeue only rows with no provider record. Rows at
+`retry_count >= 5` will never be picked up by the sweep regardless.
+
+## Still unverified from here
+
+- Whether the deployed revision is byte-identical to the source pasted by the
+  owner (v16 is what is live; the repo now carries that source plus three
+  documented additions).
+- The live `public.debit_sms_wallet` body: only its signature is known. My
+  migration 15 implementation matches that signature and the call contract; it
+  is not a claim about the live body.
+- Whether the 63 marked rows were ever charged. That needs the reconciliation
+  above, against the gateway's own records.
