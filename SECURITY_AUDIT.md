@@ -960,3 +960,131 @@ so that expectation became wrong. The check now asserts the hardened behaviour
 — anonymous/authenticated inserts are refused, and the NULL-inheritance trigger
 is still verified through the service role the app actually uses
 (**4/4 passing**).
+---
+
+# Part 20: Cross-check against the live payment provider source (2026-10-24)
+
+We cloned the provider (`najiki-finance2`) and checked our integration against
+its **actual source**, not against assumptions about it. The new suite
+`security/multi-tenant-lab/provider-contract-check.mjs` imports the provider's
+own modules — `src/lib/schemas.ts` (`CreatePaymentRequestSchema`,
+`InternalNotificationPayloadSchema`), `src/lib/notification-signature.ts`
+(`buildNotificationHeaders`, `verifyNotificationSignature`) and
+`src/lib/constants.ts` (`PLATFORM_FEE_TYPES`, `isPlatformFeeType`) — via a small
+ESM resolver hook (`ts-ext-hook.mjs`) so their TypeScript runs unmodified. It
+then checks the traffic we really produce, captured off the wire.
+
+## Finding 1 — HIGH: every SMS top-up was filed as a TENANT COLLECTION
+
+We sent `paymentTypeCode: "general"`. The provider classifies each charge by
+that code (`payment-intent-handler.ts`):
+
+```ts
+const isPlatformPayment = isPlatformFeeType(paymentType?.code ?? validatedBody.paymentTypeCode)
+let credentialSource = isPlatformPayment ? 'platform-fee' : 'none'
+if (!isPlatformPayment && (tenant || appRequiresTenantCredentials(application.code))) {
+  const resolvedCreds = await resolveTenantOrPlatformCredentials(tenant.id, provider.id, tenant.code)
+  if (!resolvedCreds) return NextResponse.json({ error: `Tenant "..." has no active credentials ...` }, { status: 503 })
+}
+```
+
+`"general"` is **not** in `PLATFORM_FEE_TYPES` (`SMS`, `BUY_SMS`, `SMS_TOPUP`,
+`ACTIVATION`, `ACCOUNT_ACTIVATION`, `SUBSCRIPTION`, `MONTHLY_SUBSCRIPTION`,
+`PLATFORM_FEE`), so every school top-up went down the tenant-collection path and
+demanded per-tenant gateway credentials. For a school without its own LivePay
+account that is a **503 and the top-up never starts**.
+
+An SMS-credit purchase is platform money. The provider seeds `BUY_SMS` itself as
+*"SMS credits top-up (platform fee)"* (`scripts/seed.ts`) and its own messaging
+route documents "BUY_SMS funds go to Na'jiki; the partner allocates SMS credits".
+
+**Fix:** `paymentTypeCode` defaults to `BUY_SMS`, overridable with
+`NAJIKI_PAYMENT_TYPE_CODE`, documented in `.env.example`. The code is also
+echoed in `metadata.paymentTypeCode` for reconciliation.
+
+**Proof (same suite, old value forced back via the env knob):**
+`NAJIKI_PAYMENT_TYPE_CODE=general` → `FAIL our paymentTypeCode is in THEIR
+PLATFORM_FEE_TYPES`; with the default → `PASS ... [BUY_SMS]`.
+
+## Finding 2 — HIGH: a provider-side `tenantId` could reject every payment
+
+The completion notification carries 13 fields, including the provider's **own**
+`tenantId`:
+
+```ts
+const payloadObject = { paymentIntentId, reference, status, amount, currency,
+  providerPaymentId, failureReason, externalEntityId, tenantId, tenantCode,
+  paymentType, paymentTypeCode, metadata }
+```
+
+Our resolver treated `tenantId` as an equal "school UUID" claim next to the
+`externalEntityId` we send. `Tenant.id` is a Prisma `cuid()` today, which fails
+our UUID regex — so the collision was latent, not live — but the moment a
+provider-side tenant id is UUID-shaped, the two claims disagree and every real
+payment is rejected as *"Conflicting school identifiers"*.
+
+**Fix:** two confidence tiers in `resolveWebhookSchool`. Explicit school
+identifiers (`externalEntityId`, `schoolId`, `metadata.schoolId`) decide;
+`tenantId`/`tenant_id` is only consulted when no school UUID is present (our own
+`public.tenants` rows use the school UUID as their id). The existing
+conflict-within-a-tier check is unchanged.
+
+## Finding 3 — MEDIUM: SMS delivery reports matched on one identifier only
+
+The provider's terminal SMS notification is:
+
+```ts
+{ eventType: 'SMS_DELIVERY_UPDATE', smsId, reference, status, providerId,
+  recipient, applicationCode }
+```
+
+`smsId` is the provider's `SmsMessage.id`, `providerId` the carrier's id and
+`reference` the provider's SMS reference. We matched only the first identifier
+we found against `notifications.provider_ref`, so delivery reports were silently
+dropped whenever the SMS Edge Function stored a different one. Also,
+`delivered | failed | unknown | queued | pending` is the provider's status set
+and `unknown` was being treated as a terminal failure.
+
+**Fix:** match `provider_ref` against **any** of `smsId`, `messageId`,
+`providerId`, `providerMessageId`, `reference`, `id`; fall back to the row id
+for UUID-shaped identifiers; add `UNKNOWN` to the non-terminal statuses. The
+"never downgrade an already-`sent` row" guard is preserved.
+
+## Verified contract (`provider-contract-check.mjs`, 30 checks, all passing)
+
+| Direction | Check |
+|---|---|
+| Outbound | Our body passes **their** `CreatePaymentRequestSchema` |
+| Outbound | `applicationCode`, `tenantCode`, `paymentTypeCode` present; `externalEntityId` = school UUID; `amount` a JSON **number** of whole shillings; `currency` normalises to `UGX`; `phoneNumber` 9–15 MSISDN digits; `idempotencyKey` `sch_topup_<uuid>` |
+| Outbound | Their `CreatePaymentResponse` shape `{paymentId uuid, reference, status}` |
+| Routing | `paymentTypeCode` ∈ `PLATFORM_FEE_TYPES` → `credentialSource='platform-fee'` |
+| Routing | `general` (the old value) is **not** a platform fee → tenant collection (regression guard) |
+| Inbound | Their completion payload (all 13 fields) passes their `InternalNotificationPayloadSchema` |
+| Inbound | Credits exactly the amount paid, once; redelivery is idempotent |
+| Inbound | A foreign UUID `tenantId` does not block crediting |
+| Inbound | Their own `verifyNotificationSignature` accepts the signature we were sent |
+| Inbound | `/api/internal/payment-completed` credits identically to `/api/webhooks/najiki` |
+| Inbound | `SMS_DELIVERY_UPDATE` matches by `smsId` and by `reference`; `unknown` is a no-op; late `failed` does not downgrade `sent`; a queued row does receive `failed` |
+
+`/api/internal/payment-completed` is a thin delegation to the same
+`handleNajikiWebhook`, so both the legacy path and the provider's self-healed
+`/api/webhooks/najiki` path behave identically. Note the provider's self-heal
+(`resolvePartnerWebhookUrl` / `postSignedPartnerWebhook`) only rewrites the
+legacy path for `application.code === 'sacco'`; for `school` it is our route
+that must answer — and it does.
+
+## Regression
+
+Re-ran after the fix, all green: `money-reconcile` **ALL MONEY CHECKS OK**,
+`money-round13-attack` **0/24**, `payments-attack` **0/20**, `rogue-attack`
+**0/21**, `round4-attack` **0/5**, `pay-rls-check` **0/8**,
+`full-branch-pentest` **27/27 SECURE**, `flows-check` **ALL FLOWS OK**,
+`round12` **35/35**, `round14` **40/40**, `round16` **18/18**. `tsc` 0 errors,
+`lint` 0 errors, production build OK.
+
+## Deployment note
+
+`NAJIKI_PAYMENT_TYPE_CODE` defaults to `BUY_SMS`; only change it if the
+`school` application in the gateway expects a different platform-fee code. The
+`tenantCode` we send must exist as a tenant of the `school` application in the
+gateway's own `tenants` table — the two systems must agree on tenant codes.

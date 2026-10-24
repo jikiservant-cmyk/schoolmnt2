@@ -452,10 +452,27 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   }
   const appCode = (process.env.NAJIKI_APP_CODE || "school").trim();
 
+  // NaJiki classifies every payment by paymentTypeCode, and the classification
+  // decides whose credentials take the money:
+  //
+  //   * a PLATFORM FEE code (najiki-finance2 src/lib/constants.ts
+  //     PLATFORM_FEE_TYPES) is charged on the platform's LivePay account —
+  //     this is what an SMS-credit top-up is. `BUY_SMS` is the code NaJiki
+  //     itself seeds for "SMS credits top-up (platform fee)".
+  //   * anything else is treated as a TENANT COLLECTION, which demands
+  //     per-tenant gateway credentials for that school and returns
+  //     503 "Tenant ... has no active credentials configured" when it has
+  //     none (najiki-finance2 src/lib/payment-intent-handler.ts).
+  //
+  // This used to send "general", which is not in PLATFORM_FEE_TYPES, so every
+  // school top-up was routed down the tenant-collection path and failed for
+  // schools without their own LivePay credentials.
+  const paymentTypeCode = (process.env.NAJIKI_PAYMENT_TYPE_CODE || "BUY_SMS").trim();
+
   // Build clean, full-spec STK push payload for NaJiki
   const payload = {
     applicationCode: appCode,
-    paymentTypeCode: "general",
+    paymentTypeCode: paymentTypeCode,
     tenantCode: tenantCode,
     tenant_code: tenantCode,
     code: tenantCode,
@@ -482,7 +499,10 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
       tenant_code: tenantCode,
       code: tenantCode,
       amount: Number(amount),
-      idempotencyKey: idempotencyKey
+      idempotencyKey: idempotencyKey,
+      // Echoed back on the completion notification; kept inside metadata so a
+      // reconciliation report can group top-ups by NaJiki's own classification.
+      paymentTypeCode: paymentTypeCode,
     }
   };
 

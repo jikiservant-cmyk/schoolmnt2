@@ -430,7 +430,7 @@ http.createServer((req, res) => {
         if (String(b.phoneNumber).endsWith('999')) { NAJIKI.push({ headers: { authorization: auth }, body: b, response: null }); await new Promise((r) => setTimeout(r, 60000)); return send(res, 504, { error: 'timeout' }); }
         const paymentId = crypto.randomUUID();
         const reference = String(b.applicationCode).slice(0, 6).toUpperCase() + '-PAY-' + Date.now().toString(16).slice(-8).toUpperCase() + '-' + crypto.randomBytes(5).toString('hex').toUpperCase();
-        NAJIKI.push({ headers: { authorization: auth }, body: b, response: { paymentId, reference } });
+        NAJIKI.push({ headers: { authorization: auth }, body: b, response: { paymentId, reference, status: 'pending' } });
         return send(res, 200, { paymentId, reference, status: 'pending' });
       }
       if (url.pathname === '/__najiki/log') { if (req.method === 'DELETE') NAJIKI.length = 0; return send(res, 200, NAJIKI); }

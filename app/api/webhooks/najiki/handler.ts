@@ -141,24 +141,49 @@ async function resolveWebhookSchool(
 ): Promise<{ schoolId: string; via: string } | { error: string }> {
   const md = (eventData && typeof eventData.metadata === 'object' && eventData.metadata) || {};
   const outerMd = (outerPayload && typeof outerPayload.metadata === 'object' && outerPayload.metadata) || {};
-  const uuidCandidates = [
+
+  // Two confidence tiers, because the provider sends its OWN tenant UUID and it
+  // is not our school UUID.
+  //
+  // najiki-finance2 puts `tenantId` (its `Tenant.id`, a cuid today) on every
+  // completion notification alongside `externalEntityId` (the school UUID we
+  // sent). Treating both as equal "school id" claims meant any provider-side
+  // tenant identifier in UUID form would disagree with our own school UUID and
+  // reject the payment as "conflicting identifiers" — losing real money events.
+  //
+  // So: explicit school identifiers decide. `tenantId`/`tenant_id` are only a
+  // fallback for payloads that carry no school UUID at all (our own
+  // public.tenants rows use the school UUID as their id).
+  const explicitIds = [
     outerPayload?.school_id, outerPayload?.schoolId, outerMd.schoolId, outerMd.school_id,
     outerPayload?.externalEntityId, outerPayload?.external_entity_id,
-    outerPayload?.tenant_id, outerPayload?.tenantId, outerMd.tenantId, outerMd.tenant_id,
     eventData?.school_id, eventData?.schoolId, md.schoolId, md.school_id,
     eventData?.externalEntityId, eventData?.external_entity_id,
+  ].filter((v) => typeof v === 'string' && UUID_RE.test(v)).map((v: string) => v.toLowerCase());
+
+  const tenantIds = [
+    outerPayload?.tenant_id, outerPayload?.tenantId, outerMd.tenantId, outerMd.tenant_id,
     eventData?.tenant_id, eventData?.tenantId, md.tenantId, md.tenant_id,
   ].filter((v) => typeof v === 'string' && UUID_RE.test(v)).map((v: string) => v.toLowerCase());
 
-  const distinct = Array.from(new Set(uuidCandidates));
+  const explicitDistinct = Array.from(new Set(explicitIds));
+  const tenantDistinct = Array.from(new Set(tenantIds));
+
   let schoolId: string | null = null;
   let via = 'school_uuid';
 
-  if (distinct.length > 1) {
+  if (explicitDistinct.length > 1) {
     return { error: 'Conflicting school identifiers in payment payload' };
   }
-  if (distinct.length === 1) {
-    schoolId = distinct[0];
+  if (explicitDistinct.length === 1) {
+    // An explicit school UUID wins; provider-side tenant ids are ignored rather
+    // than compared against it.
+    schoolId = explicitDistinct[0];
+  } else if (tenantDistinct.length > 1) {
+    return { error: 'Conflicting school identifiers in payment payload' };
+  } else if (tenantDistinct.length === 1) {
+    schoolId = tenantDistinct[0];
+    via = 'tenant_uuid';
   } else {
     const code = [
       eventData?.tenantCode, eventData?.tenant_code, md.tenantCode, md.tenant_code, eventData?.code,
@@ -345,6 +370,10 @@ async function recordRejectedPayment(outcome: string, eventData: Json, amount: n
 const DELIVERED_SMS_STATUSES = new Set(['DELIVERED', 'SENT', 'SUCCESS', 'COMPLETED']);
 const INFLIGHT_SMS_STATUSES = new Set([
   '', 'QUEUED', 'PENDING', 'SUBMITTED', 'ACCEPTED', 'SENDING', 'BUFFERED', 'PROCESSING', 'ENROUTE', 'SCHEDULED',
+  // najiki-finance2 SmsMessage.status is "queued | pending | unknown | delivered | failed";
+  // 'unknown' means the carrier has not told us anything yet, so it must never
+  // be recorded as a failure.
+  'UNKNOWN',
 ]);
 
 function isMissingProviderRefColumn(err: { code?: string; message?: string } | null | undefined): boolean {
@@ -352,11 +381,24 @@ function isMissingProviderRefColumn(err: { code?: string; message?: string } | n
 }
 
 async function handleDeliveryReport(eventData: Json, outerPayload?: Json): Promise<NextResponse> {
-  const raw = eventData?.messageId || eventData?.smsId || eventData?.id || eventData?.provider_ref;
-  const smsId = typeof raw === 'string' || typeof raw === 'number' ? String(raw).trim().slice(0, 200) : '';
-  if (!smsId) {
+  // najiki-finance2 sends, for every terminal SMS:
+  //   { eventType: 'SMS_DELIVERY_UPDATE', smsId, reference, status,
+  //     providerId, recipient, applicationCode }
+  // `smsId` is NaJiki's own SmsMessage row id, `providerId` is the carrier's
+  // message id and `reference` is NaJiki's SMS reference. Which one the SMS
+  // Edge Function stored on school.notifications.provider_ref is a deployment
+  // detail we do not control, so match on ANY of them instead of guessing.
+  const identifiers = Array.from(new Set(
+    [eventData?.smsId, eventData?.messageId, eventData?.providerId, eventData?.providerMessageId,
+     eventData?.provider_ref, eventData?.id, eventData?.reference]
+      .filter((v) => typeof v === 'string' || typeof v === 'number')
+      .map((v) => String(v).trim().slice(0, 200))
+      .filter(Boolean)
+  ));
+  if (identifiers.length === 0) {
     return NextResponse.json({ received: true }, { status: 200 });
   }
+  const smsId = identifiers[0];
 
   const statusStr = String(eventData?.status || '').trim().toUpperCase();
   if (INFLIGHT_SMS_STATUSES.has(statusStr)) {
@@ -382,7 +424,7 @@ async function handleDeliveryReport(eventData: Json, outerPayload?: Json): Promi
   const scopedSchoolId = schoolUuids.length === 1 ? schoolUuids[0] : null;
 
   const admin = createAdminClient();
-  let qRef = admin.from('notifications').update({ status: targetStatus }).eq('provider_ref', smsId);
+  let qRef = admin.from('notifications').update({ status: targetStatus }).in('provider_ref', identifiers);
   if (scopedSchoolId) qRef = qRef.eq('school_id', scopedSchoolId);
   if (targetStatus === 'failed') qRef = qRef.neq('status', 'sent');
 
@@ -392,8 +434,9 @@ async function handleDeliveryReport(eventData: Json, outerPayload?: Json): Promi
     return NextResponse.json({ error: 'Could not update delivery status' }, { status: 500 });
   }
 
-  if ((!updatedByRef || updatedByRef.length === 0) && UUID_RE.test(smsId)) {
-    let qId = admin.from('notifications').update({ status: targetStatus }).eq('id', smsId);
+  const idCandidates = identifiers.filter((v) => UUID_RE.test(v));
+  if ((!updatedByRef || updatedByRef.length === 0) && idCandidates.length > 0) {
+    let qId = admin.from('notifications').update({ status: targetStatus }).in('id', idCandidates);
     if (scopedSchoolId) qId = qId.eq('school_id', scopedSchoolId);
     if (targetStatus === 'failed') qId = qId.neq('status', 'sent');
     const { error: idErr } = await qId;
