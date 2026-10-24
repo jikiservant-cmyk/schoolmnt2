@@ -7,6 +7,9 @@ const fs = require('fs');
   const c = new Client({ host: '127.0.0.1', port: 54329, user: 'postgres', password: 'pw', database: 'postgres' });
   await c.connect();
   c.on('notice', (n) => console.log('  NOTICE:', n.message));
+  // Re-runnable: this test builds its own throwaway `school` schema inside the
+  // `postgres` database, so a previous (possibly failed) run must not poison it.
+  await c.query('DROP SCHEMA IF EXISTS school CASCADE');
   await c.query(`
     CREATE SCHEMA school;
     CREATE TABLE school.schools(id uuid primary key);
@@ -60,6 +63,7 @@ const fs = require('fs');
   await expect('rename person (no tenant change)', true, `UPDATE school.people SET full_name='x' WHERE id=$1`, [sA]);
   await expect('duplicate serial other case', false, `INSERT INTO school.devices(school_id,serial_number) VALUES ($1,'sna')`, [B]);
   console.log(`\n${pass} passed, ${fail} failed`);
+  await c.query('DROP SCHEMA IF EXISTS school CASCADE');
   await c.end();
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(2); });

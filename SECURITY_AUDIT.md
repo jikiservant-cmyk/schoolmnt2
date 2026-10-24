@@ -886,3 +886,77 @@ All requested existing suites were rerun with migration 09 enabled. Payments, SM
 
 
 
+---
+
+# Part 19: Full re-verification from a clean machine (2026-10-24)
+
+Everything above was re-proven end to end on a freshly rebuilt environment:
+PostgreSQL **17.5** (embedded binaries), the strict PostgREST/GoTrue shim
+(`SHIM_NO_AUTOCOL=1 PGRST_TS=1`), and the **production start path**
+(`npm start` -> `scripts/start-standalone.mjs`, i.e. the standalone server, not
+`next start`) so the redirect + header hardening is tested exactly as it ships.
+
+## Re-verification results
+
+| Suite | Result |
+|---|---|
+| `full-branch-pentest.mjs` (27 vectors, incl. production launcher) | **27/27 SECURE, 0 vulnerable** |
+| `full-branch-pentest.mjs before` (`MIG14=0`, regression proof) | **19/27, 8 vulnerable** (same 8, unchanged) |
+| `attack.mjs` strict (`ZKTECO_GLOBAL_SECRET_FALLBACK=false`) | **0/42 vulnerable** |
+| `device-attack.mjs` strict | **0/15 vulnerable** |
+| `round12-check.mjs` | **35/35 passed** |
+| `round14-settings-check.mjs` | **40/40 passed** |
+| `round16-two-writes-check.mjs` | **18/18 passed** |
+| `double-thumb-check.mjs` / `double-thumb-migration-check.mjs` | **11/11** / **9/9** |
+| `money-round13-attack.mjs` | **0/24 vulnerable**, 4-way parity exact |
+| `payments-attack.mjs` | **0/20 vulnerable** |
+| `money-reconcile.mjs` | **ALL MONEY CHECKS OK** |
+| `rogue-attack.mjs` / `round4-attack.mjs` / `pay-rls-check.mjs` / `rls-attack.mjs` | **0/21**, **0/5**, **0/8**, **0/32** |
+| `flows-check.mjs` / `link-crawl.mjs` | **ALL FLOWS OK** / **NO PROBLEMS FOUND** |
+| `null-inherit-check.js` / `test-triggers.js` | **4/4** / **16/16** |
+| `device-names-check.mjs` / `device-push-categories-check.mjs` | **ALL CHECKS OK** |
+| `topup-limit-check.mjs` (production default limit) | **6 allowed, then refused** |
+| `genuine-najiki-check.mjs` (cross-repo) | **200, 2000 of 2000 UGX credited** |
+| `najiki-own-signer-check.mjs` (signed by NaJiki's own source) | **200, 3100 of 3100 UGX; NaJiki's verifier agrees** |
+| `npm audit` (prod and full) / `lint` / `tsc` / `build` | **0 vulnerabilities** / 0 errors (2 pre-existing warnings) / 0 / success |
+
+## Issues found by the re-run and fixed
+
+1. **[HIGH, dependency] `zod < 4.6.6` memory-exhaustion advisory (GHSA-mrhx-c7xc-m3w5).**
+   Surfaced by `npm audit` on a fresh install. `zod` was a declared but unused
+   dependency (no import anywhere in the app), so it was upgraded to
+   **`zod ^4.6.7`** with no API surface affected. `npm audit` is back to
+   **0 vulnerabilities** for both `--omit=dev` and the full tree.
+2. **[Test flakiness] `money-round13-attack.mjs` R13-13 replayed a fixed reference.**
+   The wallet-debit race test fired 20 concurrent debits and then replayed
+   `sms_debit_0` to prove idempotency. Only 5 of the 20 can win, so ~75% of runs
+   replayed a *losing* reference and correctly got `insufficient_funds` instead
+   of `duplicate` — a false "vulnerable". The test now replays a reference that
+   actually won. The security property itself was never at risk: it stayed
+   **exactly 5 debits, final balance 0, no overdraft, no double-debit** in every
+   run. Verified **5/5 consecutive clean runs**.
+3. **[Harness deadlock] Lab shim could exhaust its connection pool.**
+   Each `/rest/v1/` request pins one pooled client for its whole transaction, but
+   two in-request probes (`pg_proc` lookups in `auth_school_id` and the RPC
+   resolver) asked the pool for a *second* client. With pg's default `max: 10`,
+   ~10 concurrent requests deadlocked the shim — which is why concurrent webhook
+   suites could hang indefinitely. Fixed by running those probes on the request's
+   own client (`dbq(...)`) and raising the pool to `max: 32`.
+4. **[Harness robustness] A dropped Postgres connection killed the shim.**
+   `pg_terminate_backend` (or any server restart/failover) emitted an unhandled
+   `'error'` on the pool and exited the process mid-run, which looks like a test
+   failure. Added a `pool.on('error')` listener that logs and keeps serving.
+5. **[Test hygiene] `test-triggers.js` could only ever run once.**
+   It creates a `school` schema in the `postgres` database and never dropped it,
+   so every subsequent run died with `42P06`. It now drops the schema before and
+   after, and is re-runnable (verified by two consecutive runs).
+
+## Note on `null-inherit-check.js`
+
+The third case previously asserted that a school-A admin could `INSERT` into
+`school.device_logs` (with `school_id` NULL inheriting to A). Migration 14
+deliberately makes `device_logs` a **server-only audit table** (finding PT-11),
+so that expectation became wrong. The check now asserts the hardened behaviour
+— anonymous/authenticated inserts are refused, and the NULL-inheritance trigger
+is still verified through the service role the app actually uses
+(**4/4 passing**).

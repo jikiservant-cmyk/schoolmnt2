@@ -26,12 +26,25 @@ const pool = new Pool({
   user: 'postgres',
   password: 'pw',
   database: 'mtlab',
+  // Each REST request pins one client for the whole transaction. pg's default
+  // of 10 means ~10 concurrent requests exhaust the pool; anything that then
+  // asks for a second client (an in-request catalog/RPC probe) deadlocks.
+  max: 32,
   ...(process.env.PGRST_TS === '1' ? {
     // pg-pool awaits onConnect before handing a client to a request, so the
     // session timezone is set before any PostgREST query runs.
     onConnect: (client) => client.query("SET TIME ZONE 'UTC'"),
   } : {}),
 });
+
+// Postgres may drop an idle pooled backend at any time (admin pg_terminate_backend,
+// server restart, failover). Without a listener, pg-pool re-emits that as an
+// unhandled 'error' event and the whole lab shim dies mid-run — which looks like
+// a test failure. Log and keep serving; pg-pool discards the dead client.
+pool.on('error', (err) => {
+  console.error('[shim] idle postgres client dropped:', err.message);
+});
+
 const SECRET = 'lab-secret';
 const USERS = {}; // email -> {id,password,email}
 const LOG = [];
@@ -87,7 +100,7 @@ async function ensureColumns(schema, table, obj) {
     }
     const v = obj[k];
     const type = v !== null && typeof v === 'object' ? 'jsonb' : typeof v === 'boolean' ? 'boolean' : typeof v === 'number' ? 'numeric' : 'text';
-    await pool.query('ALTER TABLE ' + qi(schema) + '.' + qi(table) + ' ADD COLUMN IF NOT EXISTS ' + qi(k) + ' ' + type);
+    await dbq('ALTER TABLE ' + qi(schema) + '.' + qi(table) + ' ADD COLUMN IF NOT EXISTS ' + qi(k) + ' ' + type);
     console.log('[shim] auto-added column ' + schema + '.' + table + '.' + k + ' ' + type);
     changed = true;
   }
@@ -257,13 +270,13 @@ function pgError(res, e) {
 async function handleRpc(req, res, name, args, jwt, schema = 'public') {
   if (name === 'auth_school_id') {
     if (!jwt || !jwt.sub) return send(res, 200, null);
-    const hasFn = (await pool.query("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='school' AND p.proname='auth_school_id'")).rowCount;
+    const hasFn = (await dbq("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='school' AND p.proname='auth_school_id'")).rowCount;
     const r = hasFn ? await dbq('SELECT school.auth_school_id() AS school_id') : await dbq('SELECT school_id FROM school.staff_users WHERE auth_user_id = $1 LIMIT 1', [jwt.sub]);
     return send(res, 200, r.rows[0] ? r.rows[0].school_id : null);
   }
   // Real functions that exist in the DB are called like PostgREST does
   // (named arguments, run as the request's role).
-  const fn = (await pool.query("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1 AND p.proname=$2", [schema, name])).rows;
+  const fn = (await dbq("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1 AND p.proname=$2", [schema, name])).rows;
   if (fn.length) {
     const keys = Object.keys(args);
     const vals = keys.map((k) => { const v = args[k]; return v !== null && typeof v === 'object' && !Array.isArray(v) ? JSON.stringify(v) : v; });

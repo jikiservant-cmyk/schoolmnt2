@@ -528,12 +528,19 @@ const legit = (name, ok, detail) => {
   const debitOutcomes = await Promise.all(
     Array.from({ length: 20 }, (_, i) =>
       pool.query("SELECT school.debit_sms_wallet($1, 300, $2, 'SMS parallel test') AS r", [debitSchool, `sms_debit_${i}`])
+        .then((x) => ({ i, outcome: x.rows[0]?.r?.outcome }))
     )
   );
-  // Replay first reference to verify idempotency
-  const dupDebit = (await pool.query("SELECT school.debit_sms_wallet($1, 300, 'sms_debit_0', 'SMS replay test') AS r", [debitSchool])).rows[0].r;
+  // Replay a reference that actually won the race. Picking a fixed one
+  // (e.g. sms_debit_0) is non-deterministic: only 5 of the 20 concurrent
+  // debits succeed, so a replay of a losing reference correctly answers
+  // insufficient_funds instead of duplicate.
+  const winner = debitOutcomes.find((x) => x.outcome === 'debited');
+  const dupDebit = winner
+    ? (await pool.query('SELECT school.debit_sms_wallet($1, 300, $2, $3) AS r', [debitSchool, `sms_debit_${winner.i}`, 'SMS replay test'])).rows[0].r
+    : null;
   await pool.end();
-  const debitedCount = debitOutcomes.filter((x) => x.rows[0]?.r?.outcome === 'debited').length;
+  const debitedCount = debitOutcomes.filter((x) => x.outcome === 'debited').length;
   const finalDebitBal = await walletBal(debitSchool);
   rec(
     'R13-13 concurrent SMS wallet debits overdraw balance or double-debit under race',
