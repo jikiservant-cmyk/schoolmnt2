@@ -234,3 +234,41 @@ export function nextAttempt(
   const maxAttempts = charged ? MAX_CHARGED_ATTEMPTS : MAX_SEND_ATTEMPTS;
   return { attempts, maxAttempts, charged, exhausted: attempts >= maxAttempts };
 }
+
+/**
+ * Where to POST the message.
+ *
+ * The deployed function uses a base domain (`NAJIKI_DOMAIN=https://api.najiki.com`)
+ * and appends the path; older configuration may hold the full URL. Both work,
+ * and a bare host is tolerated.
+ */
+export function resolveEndpoint(
+  domain: string | null | undefined,
+  fullUrl?: string | null,
+): string {
+  const url = String(fullUrl ?? "").trim();
+  if (url) return url;
+  let base = String(domain ?? "").trim() || "https://api.najiki.com";
+  if (!/^https?:\/\//i.test(base)) base = "https://" + base;
+  base = base.replace(/\/+$/, "");
+  if (/\/api\/messaging\/send$/i.test(base)) return base;
+  return base + "/api/messaging/send";
+}
+
+/**
+ * Is this claim dead? `sending` rows carry `provider_response.claimed_at`; if it
+ * is older than `staleMs` (or unreadable, which means the writer died before
+ * recording it) the row may be reclaimed instead of waiting forever.
+ */
+export function isStaleClaim(
+  providerResponse: unknown,
+  nowMs: number,
+  staleMs: number,
+): boolean {
+  if (!providerResponse || typeof providerResponse !== "object") return true;
+  const raw = (providerResponse as Record<string, unknown>).claimed_at;
+  if (typeof raw !== "string" || !raw) return true;
+  const at = Date.parse(raw);
+  if (!Number.isFinite(at)) return true;
+  return nowMs - at >= staleMs;
+}

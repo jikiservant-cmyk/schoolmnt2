@@ -45,7 +45,7 @@ const { buildNotificationHeaders } =
 
 const senderPath = fileURLToPath(new URL('../supabase/functions/send-sms/sms-sender.ts', import.meta.url));
 const { buildSmsRequest, classifySendResponse, normalizeMsisdn, idempotencyKeyFor, resolveUnitPrice, MAX_SMS_CHARS,
-  nextAttempt, readAttempts, MAX_SEND_ATTEMPTS, MAX_CHARGED_ATTEMPTS } =
+  nextAttempt, readAttempts, resolveEndpoint, isStaleClaim, MAX_SEND_ATTEMPTS, MAX_CHARGED_ATTEMPTS } =
   await import(pathToFileURL(fs.existsSync(senderPath) ? senderPath : '/home/user/schoolmnt2/supabase/functions/send-sms/sms-sender.ts').href);
 
 if (!process.env.SKIP_SEED) {
@@ -161,6 +161,30 @@ check('charging during the attempt switches to the charged cap',
 check('garbage in provider_response cannot break the counter',
   nextAttempt({ attempts: 'nonsense' }).attempts === 1 && readAttempts('not-an-object').attempts === 0,
   JSON.stringify(nextAttempt({ attempts: 'nonsense' })));
+
+console.log('\n--- 2c. Endpoint + stale-claim helpers ---');
+
+check('NAJIKI_DOMAIN gets the provider path appended',
+  resolveEndpoint('https://api.najiki.com') === 'https://api.najiki.com/api/messaging/send',
+  resolveEndpoint('https://api.najiki.com'));
+check('a full URL is used as-is',
+  resolveEndpoint('https://x.test', 'https://y.test/api/messaging/send') === 'https://y.test/api/messaging/send');
+check('a URL that already ends in the path is not doubled',
+  resolveEndpoint('http://127.0.0.1:54321/api/messaging/send') === 'http://127.0.0.1:54321/api/messaging/send');
+check('a bare host is upgraded to https', resolveEndpoint('api.najiki.com') === 'https://api.najiki.com/api/messaging/send');
+check('trailing slashes do not break it', resolveEndpoint('https://api.najiki.com///') === 'https://api.najiki.com/api/messaging/send');
+check('an empty domain falls back to the documented host',
+  resolveEndpoint('') === 'https://api.najiki.com/api/messaging/send');
+
+const NOW = Date.parse('2026-10-24T12:00:00.000Z');
+check('a 30-minute-old claim is stale',
+  isStaleClaim({ claimed_at: '2026-10-24T11:30:00.000Z' }, NOW, 10 * 60_000) === true);
+check('a fresh claim is not stale',
+  isStaleClaim({ claimed_at: '2026-10-24T11:59:00.000Z' }, NOW, 10 * 60_000) === false);
+check('a claim with no timestamp is treated as stale',
+  isStaleClaim({}, NOW, 10 * 60_000) === true && isStaleClaim(null, NOW, 10 * 60_000) === true);
+check('an unparseable timestamp is treated as stale',
+  isStaleClaim({ claimed_at: 'not-a-date' }, NOW, 10 * 60_000) === true);
 
 console.log('\n--- 3. End to end: sender -> NaJiki -> delivery report ---');
 

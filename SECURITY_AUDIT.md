@@ -1232,3 +1232,121 @@ columns added there.
 - **Delivery-report matching** is identifier-based and deliberately generous
   (Part 20), so an unrelated `reference` collision could flip a status. It
   cannot move money, and `sent` rows are never downgraded by a `failed` report.
+
+# Part 22: The deployed SMS function could not send a single SMS
+
+## What happened
+
+The function running in the database was not the one written in Part 21. It was
+a separate implementation, written against a schema and an RPC that **do not
+exist**. Every one of the following was verified directly against Postgres, not
+guessed:
+
+| # | The deployed code did | Reality | Effect |
+| --- | --- | --- | --- |
+| 22-1 | `.update({ retry_count, next_retry_at, error })` | `school.notifications` has none of those columns (`42703`) | The **first claim UPDATE raised**, so `dispatchOne` returned 500 and no SMS was ever sent. The sweep's `.lt("retry_count", 5)` failed the same way. |
+| 22-2 | `rpc("debit_sms_wallet", { p_wallet_id, p_amount, p_idempotency_key, p_tenant_id, p_description })` | No `public.debit_sms_wallet` with that shape (`42883`). The audited one is `school.debit_sms_wallet(p_school_id, p_amount, p_reference, p_description)` (migration 11). | Even with 22-1 fixed, every send would fail at the charge and be recorded as `insufficient_balance_or_debit_failed`. |
+| 22-3 | Posted to NaJiki with **no `Idempotency-Key`** | `/api/messaging/send` dedupes only on that header | Each of the 5 retries would create a **new** SMS: up to 5 duplicate messages per notification, billed to the platform. |
+| 22-4 | Never set `provider_ref` | `SMS_DELIVERY_UPDATE` matches on `provider_ref` (or an id) | Delivery reports would match nothing; rows would stay `sent` forever with no delivery state. |
+| 22-5 | Wrote `provider_response: JSON.stringify(data)` | The column is `jsonb` | jsonb stores that as a **string scalar** (`jsonb_typeof` = `string`), so the payload is unreadable as data. |
+| 22-6 | `SMS_COST = Number(env || "1")` | SMS price is platform-only | A missing secret would silently sell SMS at **1 UGX** instead of refusing. |
+
+Note the inconsistency that made 22-1/22-2 easy to miss: the deployed function
+used status `pending`, while Part 21's version used `queued`. The app writes
+`pending` (`app/mark-attendance/actions.ts:366`,
+`app/manual-attendance/[classId]/actions.ts:700`,
+`lib/devices/processor.ts:539`), so the deployed vocabulary was right and
+Part 21's was wrong.
+
+## The replacement
+
+`supabase/functions/send-sms/index.ts` is now a **drop-in replacement**: it keeps
+the deployed function's entire external interface, because the app and the cron
+callers already depend on it —
+
+- auth: `Authorization: Bearer <DISPATCH_SECRET>` (and `x-dispatch-secret`);
+- payloads: `{ notification_id }`, `{ record: { id } }`, `{ new: { id } }`,
+  `{ id }` and `{ retry_sweep: true }`;
+- statuses: `pending` → `sending` → `sent` | `failed` | `pending` (retry);
+- env: `DISPATCH_SECRET`, `NAJIKI_DOMAIN`, `NAJIKI_API_KEY`, `SMS_COST`,
+  `NAJIKI_TIMEOUT_MS` — the names already set on the project, so a redeploy
+  needs no secret changes. (`NAJIKI_APP_CODE`, `NAJIKI_SENDER_ID`,
+  `NAJIKI_API_URL`/`NAJIKI_MESSAGING_URL`, `SMS_UNIT_PRICE_UGX` and
+  `SMS_BATCH_BUDGET_MS` are honoured as optional extras.)
+
+...while fixing all six findings:
+
+- charges through `school.debit_sms_wallet(p_school_id, …)` and reads its
+  `outcome` (`debited` / `duplicate` / `insufficient_funds` / `invalid_*`)
+  instead of treating every error as "insufficient balance";
+- retry bookkeeping lives in `provider_response` JSON (`attempts`, `charged`,
+  `reason`, `claimed_at`) — no new columns, so it runs on today's schema;
+- sends `Idempotency-Key: sms_<notificationId>`, the same value as the wallet
+  reference: a retry can neither charge nor send twice;
+- stores NaJiki's `smsId` in `provider_ref`, so delivery reports match;
+- writes `provider_response` as an object;
+- no price default: a missing/invalid `SMS_COST` returns 503 and sends nothing.
+
+Retry policy is unchanged from Part 21 in spirit, and now also protects money:
+3 attempts while nothing was charged, 10 once it was, and a row that still
+cannot be delivered fails as `charged_undelivered:` so the charge is visible for
+manual reconciliation. The `finally` block returns a still-claimed row to
+`pending`, and the sweep reclaims `sending` rows whose
+`provider_response.claimed_at` is older than 10 minutes — which also closes the
+"sending rows with no `updated_at`" residual risk noted in Part 21.
+
+## Verification
+
+Three suites, all green:
+
+- **`sms-edge-e2e-check.mjs` — 57/57.** Runs the real function under Deno
+  against the lab shim and asserts on Postgres through the deployed interface:
+  Bearer/`x-dispatch-secret` auth, 405, 503 with no price, `{notification_id}`
+  and `{record:{id}}` payloads, charge-once, NaJiki 202, `provider_ref`,
+  `provider_response` as an object, no `smsId` leak into their schema, 503 → row
+  stays `pending` with `attempts`/`charged`, 429/409 handling, `charged_undelivered`
+  at the charged cap, invalid phone/over-length/non-SMS rows never charged, the
+  sweep reclaiming a stale claim while leaving a live one alone, a tiny budget
+  stranding nothing, and `SMS_DELIVERY_UPDATE` matching the stored `provider_ref`.
+- **`sms-schema-contract-check.mjs` — 49/49 (new).** Database + static
+  contract, no Deno needed: the debit RPC exists with exactly that signature,
+  the legacy 5-argument call still fails with `42883`, `retry_count` /
+  `next_retry_at` / `error` / `attempt_count` do not exist, the function's
+  *code* (comments excluded) uses none of them, the app and the function agree
+  on `pending`, the deployed env names and payload shapes are preserved, the
+  price has no numeric fallback, and `provider_ref` is written before `sent`.
+- **`sms-sender-contract-check.mjs` — 56/56.** Now also covers
+  `resolveEndpoint` (domain vs full URL, trailing slashes, bare host) and
+  `isStaleClaim` (fresh vs 30-minute-old vs missing vs unparseable timestamps),
+  against NaJiki's own `SmsInputSchema`.
+
+**Negative controls:** appending `retry_count` / `next_retry_at` / `p_wallet_id`
+to the function → the schema suite fails 3 checks; the Part 21 controls
+(`status === 200`, charged-cap revert) still fail their suites.
+
+Full sweep after these changes: pentest **27/27**, provider-contract **30/30**,
+money-round13 **0/24**, payments-attack **0/20**, rogue **0/21**, round4
+**0/5**, pay-rls **0/8**, money-reconcile **OK**, flows **OK**, round12
+**35/35**, round14 **40/40**, round16 **18/18**. `tsc`, `lint`, `build` clean.
+
+## Deploying the replacement
+
+```bash
+supabase functions deploy send-sms --no-verify-jwt
+# no secret changes needed; set SMS_COST first if it is not already set:
+supabase secrets set SMS_COST=30 DISPATCH_SECRET=$(openssl rand -hex 32)
+```
+
+Then, from a scheduler, either `POST /functions/v1/send-sms {"retry_sweep":true}`
+every few minutes, or `{"notification_id":"<id>"}` as a database webhook.
+
+## Residual risk
+
+- The **existing queued rows** should be checked after the redeploy: rows left at
+  `failed` by the old function (`error = 'insufficient_balance_or_debit_failed'`
+  or `'provider_failed'`) were never sent, and if the old code ever did reach the
+  debit step they were never charged either. Requeue deliberately, not in bulk.
+- `provider_response` is the retry ledger, so anything that overwrites it
+  wholesale resets the attempt count. No app code writes that column.
+- `NAJIKI_DOMAIN` defaults to `https://api.najiki.com`; production should set it
+  explicitly so a gateway move cannot silently reroute paid traffic.

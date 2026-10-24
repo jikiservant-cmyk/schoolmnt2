@@ -436,7 +436,7 @@ http.createServer((req, res) => {
       }
       // Fake NaJiki SMS API: mirrors najiki-finance2 POST /api/messaging/send
       // (SmsInputSchema, Idempotency-Key dedupe, 202 Accepted).
-      if (url.pathname === '/__najiki/messaging/send') {
+      if (url.pathname === '/__najiki/messaging/send' || url.pathname === '/api/messaging/send') {
         const b = JSON.parse(body || '{}');
         const auth = req.headers.authorization || '';
         const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
