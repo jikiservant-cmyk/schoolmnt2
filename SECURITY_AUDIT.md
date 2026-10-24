@@ -388,7 +388,7 @@ Regression after this pass: legit flows 17/17, app attacks 1/42 (known device tr
 
 ### Notes
 
-- **SMS sending happens in a Supabase Edge Function** (confirmed by the owner). It is not in this repo, so it was not reviewed. Things to check there: it should use the service-role key, because migration 04 RLS blocks anon access to `school.notifications`. It should charge the school's wallet atomically, once per SMS. It should mark a row as sent only after NaJiki accepts it. NaJiki delivery reports update `school.notifications.status` to `sent`/`failed`, matched by `provider_ref` (store NaJiki's `smsId` there) or the notification id.
+- **SMS sending happens in a Supabase Edge Function** (confirmed by the owner). *Update: that function now lives in this repo at `supabase/functions/send-sms/` and is reviewed and tested end to end in Part 21 — read that part instead of this note.* The checklist raised here was: use the service-role key (migration 04 RLS blocks anon access to `school.notifications`), charge the wallet atomically once per SMS, mark a row sent only after NaJiki accepts it, and store NaJiki's `smsId` in `provider_ref` so delivery reports can match it. All four are now implemented and verified.
 - **NaJiki side (other repo):** `POST /api/messaging/send` does not check or debit any wallet. Anyone holding the school app's `NAJIKI_API_KEY` can send unlimited SMS billed to NaJiki's SMS account. Keep that key server-side only (it is), and rotate it if it was ever exposed.
 
 # Part 6: Money round 3 ("rogue" pentest): public key, teacher, races
@@ -762,4 +762,945 @@ All requested existing suites were rerun with migration 09 enabled. Payments, SM
 | `eslint` | Passed with 0 errors (one existing `loadData` hook-dependency warning in `app/dashboard/attendance/page.tsx`) |
 | `next build` | Passed |
 
-**Go-live:** run migrations **05 → 06 → 07 → 08 → 09** (back up first; run 09 outside gate hours).
+**Go-live:** run migrations **05 → 06 → 07 → 08 → 09 → 10** (back up first; run 09 outside gate hours).
+
+# Part 12: Round 12 Production Hardening, Scoped Capability Tokens & Zero-Vulnerability Supply Chain
+
+## Findings & Fixes (all 11 resolved)
+
+1. **Guardian linkage column & error propagation (`app/dashboard/people/actions.ts`):**
+   - Fixed `student_parents` fallback insert column from nonexistent `is_primary` to `is_primary_contact: true`.
+   - Checked `{ error }` on both `parents` and `student_parents` lookups/inserts, rolling back partial person rows and failing loudly instead of returning `guardian_linked: true` when guardian linking fails.
+   - Sanitized leading formula prefixes (`=`, `+`, `-`, `@`, control characters) on person and guardian names and enforced canonical numeric enrollment PIN collision checks (`0555` vs `555`) in both `addPersonAction` and `updatePersonDeviceUserIdAction`.
+2. **Production schema reconciliation & missing-column fallback resilience (`supabase_migrations/10_round12_production_hardening.sql`, `utils/zkteco/commandQueue.ts`, `app/iclock/devicecmd/route.ts`, `lib/devices/processor.ts`, `app/mark-attendance/actions.ts`, `security/multi-tenant-lab/seed.js`):**
+   - Added idempotent migration `10_round12_production_hardening.sql` reconciling 19 columns across `school.devices`, `school.device_commands`, `school.device_logs`, and `school.person_credentials`, adding unique index `person_credentials_school_type_val_uniq`, and refreshing column-level `SELECT` grants while keeping secret columns (`pin_hash`, `failed_attempts`, `locked_until`, `device_secret`, `device_secret_hash`) strictly server-only and preserving zero client writes on `school.staff_users` per `06_money_lockdown.sql`.
+   - Added `PGRST204` missing-column fallback loops in `commandQueue.ts`, `devicecmd/route.ts`, `processor.ts`, and `mark-attendance/actions.ts` so deployments stay operational even before migration `10` runs (`MIG10=0` + `SHIM_NO_AUTOCOL=1` verified).
+3. **Legacy ADMS proxy lockdown (`app/legacy-adms-proxy/server.js`):**
+   - Removed the hardcoded dev Cloud Run URL (`UPSTREAM_URL` required at startup), restricted paths/methods strictly to `GET|POST /iclock/cdata`, `GET /iclock/getrequest`, and `POST /iclock/devicecmd`, stripped incoming `x-forwarded-for`, `x-real-ip`, `x-device-token`, `authorization`, and `cookie` headers, enforced a 1 MiB body limit (`413`) and 15 s upstream timeout, and injected per-serial `X-Device-Token` values from `DEVICE_TOKENS_JSON` (falling back to `ZKTECO_DEVICE_SECRET`).
+4. **Trusted proxy client IP extraction, hardware GoTrue bypass & relative redirects (`lib/security/request.ts`, `lib/devices/gateway.ts`, `middleware.ts`, `utils/supabase/middleware.ts`, `scripts/start-standalone.mjs`):**
+   - Hardened `getClientIp` to ignore spoofed `X-Forwarded-For` headers unless running behind a verified proxy (`K_SERVICE`, `VERCEL`, or `TRUSTED_PROXY_HOPS`) and to read the right-most external hop rather than `split(',')[0]`.
+   - Bypassed `supabase.auth.getUser()` round-trips on `/iclock/*`, `/api/devices/*`, and `/api/webhooks/*`.
+   - Switched `middleware.ts` to `runtime: 'nodejs'` (ensuring live runtime secret resolution even on zero-secret Docker builds) and enforced host-header-immune relative `Location: /login` and `Location: /dashboard` 307 redirects preserving `Set-Cookie`.
+5. **Web-Crypto HMAC-SHA256 scoped capability tokens for classroom teachers & gate kiosks (`lib/security/register-token.ts`, `app/manual-attendance/[classId]/{layout.tsx,page.tsx,actions.ts}`, `app/mark-attendance/{layout.tsx,actions.ts}`, `app/dashboard/classes/{page.tsx,CopyLinkButton.tsx}`, `app/dashboard/attendance/{actions.ts,page.tsx}`):**
+   - Classroom teachers and gate kiosks now open `/manual-attendance/[classId]?token=...` (`sk_reg_cap` HttpOnly cookie) and `/mark-attendance?token=...` (`sk_kiosk_cap` HttpOnly cookie) without sharing the full `school_admin` session cookie.
+   - Student rosters on capability-scoped register sessions are withheld until a valid Teacher PIN is verified (`sk_reg_pin` cookie bound to `pin_hash` digest so PIN resets immediately revoke prior sessions), while `school_admin` sessions retain full compatibility.
+6. **PWA service worker v3 & logout `Clear-Site-Data` (`public/sw.js`, `app/api/logout/route.ts`):**
+   - Bumped service worker cache to `smartskoolz-pwa-v3`, purged stale caches on `activate`, removed `/dashboard` from `STATIC_ASSETS`, bypassed all dynamic/authenticated/API/hardware paths (`/`, `/dashboard*`, `/manual-attendance*`, `/mark-attendance*`, `/login`, `/signup`, `/api/*`, `/iclock/*`, `/auth/*`), and added `Clear-Site-Data: "cache", "cookies", "storage"` + capability cookie expiration to `POST /api/logout`.
+7. **Zero-dependency OpenXML `.xlsx` / Blob CSV export & dependency upgrades (`lib/security/safe-spreadsheet.ts`, `app/dashboard/attendance/AttendanceReports.tsx`, `package.json`, `scripts/start-standalone.mjs`):**
+   - Replaced vulnerable `xlsx@0.18.5` with a zero-dependency ECMA-376 OpenXML `.xlsx` + RFC 4180 `Blob` CSV builder neutralizing formula injection (`=`, `+`, `-`, `@`, `\t`, `\r`) and fixing `#` data-URI truncation.
+   - Removed unused `firebase-tools`, upgraded `next` & `eslint-config-next` to `15.5.28` and `sharp` to `^0.35.5`, added `scripts/start-standalone.mjs` for `"output": "standalone"`, and regenerated `package-lock.json` (`npm audit --omit=dev`: **0 vulnerabilities**; `npm audit --audit-level=critical`: **0 critical**).
+8. **Device quotas, invite gate, multi-gate `ALL` broadcasts, midnight `% 24` formatting & repository hygiene (`app/dashboard/devices/actions.ts`, `app/signup/actions.ts`, `app/iclock/getrequest/route.ts`, `lib/devices/processor.ts`, `lib/attendance-window.ts`, `lib/eat-time.ts`, `.gitignore`):**
+   - Added rate limiting and `MAX_DEVICES_PER_SCHOOL` quota enforcement to `addDeviceAction`, optional timing-safe `SIGNUP_INVITE_CODE` gating to `signupAction`, per-gate `delivered_device_ids` tracking on `target_serial = 'ALL'` broadcasts in `getrequest`, exact-match-first + canonical ambiguity guard on numeric PIN matching in `processor.ts`, `% 24` normalization on all `hour12: false` formatters, and purged tracked debug/cache artifacts (`fix-cdata.js`, `fix-route.js`, `.env.test.local`, `node-compile-cache/`).
+
+## Verification Summary (PostgreSQL 17.5 + `SHIM_NO_AUTOCOL=1` + Standalone Next.js 15.5.28)
+
+| Suite | Result |
+|---|---|
+| `round12-check.mjs` (`MIG10=0` fallback + `MIG10=1` full suite) | **35/35 PASSED** |
+| `rls-attack.mjs` | **0/32 vulnerable** |
+| `attack.mjs` (strict mode `ZKTECO_GLOBAL_SECRET_FALLBACK=false`) | **0/42 vulnerable** |
+| `regress.mjs` | **17/17 OK** |
+| `device-attack.mjs` | **0/15 vulnerable** |
+| `device-names-check.mjs` | **17/17 OK** |
+| `device-push-categories-check.mjs` | **45/45 OK** |
+| `double-thumb-check.mjs` / `double-thumb-migration-check.mjs` | **10/10 PASS** / **9/9 PASS** |
+| `payments-attack.mjs` (dedicated `NAJIKI_WEBHOOK_SECRET`) | **0/20 vulnerable; 0 legit failures** |
+| `rogue-attack.mjs` | **0/21 vulnerable; 0 legit failures** |
+| `round4-attack.mjs` | **0/5 vulnerable; 0 legit failures** |
+| `pay-rls-check.mjs` | **0/8 vulnerable** |
+| `money-reconcile.mjs` | **All money/reconciliation checks OK** |
+| `topup-limit-check.mjs` | **PASS: 6 allowed, then refused** |
+| `legacy-devlogs.mjs` | **punch 200 OK \| device_logs +1 \| attendance +1** |
+| `flows-check.mjs` / `render-check.mjs` / `link-crawl.mjs` / `orphan-check.mjs` | **25/25 OK** / **5/5 OK** / **No problems found** / **No leak** |
+| `security/pentest/attack.mjs` & `security/pentest/regress.mjs` | **15/15 SECURE** & **14/14 PASS** |
+| `npm ci` + `npm audit --omit=dev` + `eslint` + `tsc --noEmit` + `npm run build` | **0 prod vulnerabilities, 0 errors, clean standalone build** |
+
+# Part 13: Round 13 Deep Money Integrity, Webhook Hardening & Live Penetration Testing
+
+## Adversarial Findings Reproduced Live & Closed (`money-round13-attack.mjs`)
+
+1. **Cross-Tenant Deduplication Black Hole via Placeholder References (`supabase_migrations/11_round13_money_integrity.sql`, `lib/payments/webhook.ts`):**
+   - **Pre-patch reproduction (`R13-01`, `R13-02`):** Auxiliary/placeholder values echoed by mobile money gateways (`providerPaymentId: "N/A"`, `"0"`, `"NONE"`, `"MTN"`, etc.) were stored in `school.payment_events.detail.refs` and matched globally via `(detail -> 'refs') ?| v_refs` *before* intent matching. Once any school completed a payment carrying `"N/A"`, every subsequent payment across every school carrying `"N/A"` returned `200 {"outcome":"duplicate"}`, permanently dropping paid money without retries.
+   - **Fix:** Added `school.clean_payment_refs(text[])` in PostgreSQL and `cleanReferenceToken()` in `lib/payments/webhook.ts` to strip placeholder/noise/short tokens before deduplicating or persisting `detail.refs`.
+2. **Payment Webhook Black Hole on Event Names Containing `sms` (`app/api/webhooks/najiki/handler.ts`, `lib/payments/webhook.ts`):**
+   - **Pre-patch reproduction (`R13-03`):** `isDeliveryReport` matched any event type containing `"sms"` when `"payment"` was absent (e.g. `sms_topup.completed`, `wallet.sms_topup`), skipping `handlePayment()` and answering `200 {"received":true}` without crediting or logging the payment.
+   - **Fix:** Added `hasPaymentIndicators()` and broadened `classifyPayment()` so any payload carrying payment/top-up identifiers (`paymentIntentId`, `providerPaymentId`, `sch_topup_*`) routes exclusively to `handlePayment()`.
+3. **Outer-Envelope Foreign Currency Bypass & Object Coercion (`lib/payments/webhook.ts`, `app/api/webhooks/najiki/handler.ts`):**
+   - **Pre-patch reproduction (`R13-04`):** `paidCurrency()` inspected only inner `payload.data` and coerced non-string objects (e.g. `{ code: "KES" }`) to `"" || "UGX"`, crediting `USD` and `KES` payments at 1:1 `UGX` value.
+   - **Fix:** `paidCurrency(eventData, payload)` inspects all currency fields across outer `payload`, inner `data`, `data.amount`, and `metadata`, rejects conflicting or malformed values, and passes non-UGX codes straight to `apply_payment()` (`currency_mismatch`, HTTP `202`).
+4. **Sub-Shilling Dust Attack (`0.001 UGX`) Burning Pending `50,000 UGX` Intents & Money Envelope Parsing (`lib/payments/webhook.ts`, `supabase_migrations/11_round13_money_integrity.sql`):**
+   - **Pre-patch reproduction (`R13-05`):** A webhook reporting `amount: 0.001` matched a `50,000 UGX` `pending` intent, marked it `credited` with `credited_amount = 0.00` while adding `0.001` to `public.wallets.balance` (breaking double-entry parity), and caused the genuine `50,000 UGX` webhook to be dropped as `duplicate`. Meanwhile, valid money envelopes (`{ value: 3500, currency: "UGX" }`) or whitespace `amount: "   "` + `amount_paid` failed with HTTP `400`.
+   - **Fix:** Enforced whole-shilling positive integer UGX validation (`>= 1`, `trunc(p_amount) = p_amount`, non-`NaN`) in both `paidAmount()` and SQL `school.apply_payment()`, while unwrapping `{ value | amount }` envelopes and skipping blank strings cleanly.
+5. **Outer vs Inner Envelope School ID Conflict Bypass (`app/api/webhooks/najiki/handler.ts`):**
+   - **Pre-patch reproduction (`R13-06`):** `resolveWebhookSchool()` ignored outer `payload.externalEntityId` / `payload.schoolId`, allowing conflicting outer vs inner tenant UUIDs to pass with HTTP `200`.
+   - **Fix:** Collected school UUID candidates across both outer and inner envelopes (plus `metadata`), rejecting any discrepancy with HTTP `400` and recording `rejected_conflicting_school`.
+6. **Blank / Punctuation-Only Phone Bypass, Cross-Tenant `profiles.code` Routing, & Multi-Instance Quota Race in `topUpBalance()` (`app/dashboard/attendance/actions.ts`, `app/dashboard/attendance/page.tsx`, `supabase_migrations/11_round13_money_integrity.sql`):**
+   - **Pre-patch reproduction (`R13-07`, `R13-08`, `R13-09`):** `"         "` and `"---------"` passed `/^\+?[0-9\s\-().]{9,20}$/`, inserting empty-phone intents and calling NaJiki; a stale `public.profiles` row pointing to another school routed Mobile Money collection into the other school's NaJiki merchant account; and concurrent requests across instances raced past `SELECT ... LIMIT maxTopUps` (`1003` rows vs `1000` limit).
+   - **Fix:** Normalized and validated 9–15 numeric MSISDN digits up front in both client UI and server action, verified `profiles.school_id === school.id` without raw `.or()` interpolation, sanitized error responses, and introduced advisory-locked `school.create_payment_intent()` (`pg_advisory_xact_lock`) with graceful `MIG11=0` fallback.
+7. **Wallet Kernel Constraints, `wallet_migrated` Persistence & Atomic SMS Debit (`supabase_migrations/11_round13_money_integrity.sql`, `lib/payments/wallet.ts`, `app/dashboard/attendance/actions.ts`):**
+   - **Pre-patch reproduction (`R13-10a`, `R13-10b`, `R13-10c`):** `public.wallets` allowed cross-tenant hybrid rows (`tenant_id = B, school_id = A`) and negative balances (`-500`), while `getSchoolBalance()` resurrected spent `settings.balance` when `settings.wallet_migrated = true`.
+   - **Fix:** Added `wallets_same_tenant_chk` and `wallets_non_negative_balance_chk` constraints on `public.wallets`, stamped `settings.wallet_migrated = true` on wallet updates, failed closed on non-missing-table errors in `legacyBalanceUsable()`, aligned single-tenant wallet selection across SQL and TypeScript, and added atomic server-only `school.debit_sms_wallet()` (verified under 20x concurrency in `R13-13`).
+8. **SMS Delivery State Machine, Schema Reconciliation & Retry Semantics (`app/api/webhooks/najiki/handler.ts`, `supabase_migrations/11_round13_money_integrity.sql`):**
+   - **Pre-patch reproduction (`R13-11a`–`d`):** Delayed `QUEUED` / `SUBMITTED` webhooks overwrote `'sent'` SMS rows back to `'failed'`; `school.notifications` lacked `provider_ref`, `sent_at`, and `provider_response` under strict PostgREST (`SHIM_NO_AUTOCOL=1`); explicit `schoolId` claims on delivery webhooks were unvalidated; and transient DB errors returned `200` instead of `500`.
+   - **Fix:** Added `provider_ref`, `sent_at`, and `provider_response` + partial index in `11_round13_money_integrity.sql` (with `MIG11=0` fallback), treated intermediate carrier statuses as non-terminal no-ops, guarded `.neq('status', 'sent')` against state regressions, scoped updates by explicit `schoolId` when provided, and returned HTTP `500` on DB failures so QStash retries cleanly.
+9. **Static Non-Unique Gateway Tags (`"SMARTSKOOLZ_SMS"`), Multi-Intent Reference Stuffing, Top-Level JSON Array Guard & 4-Way Ledger Parity (`supabase_migrations/11_round13_money_integrity.sql`, `app/api/webhooks/najiki/handler.ts`, `app/dashboard/attendance/actions.ts`):**
+   - **Fixes (`R13-19`–`R13-22`):** Required digit/UUID entropy in SQL `school.apply_payment()` deduplication so static labels such as `"SMARTSKOOLZ_SMS"` or `"MOBILE_MONEY"` can never falsely drop another school's payment as `duplicate`; counted ALL matching pending intents in `apply_payment()` (`count(*)`) so multi-intent reference stuffing returns `ambiguous_intent` (`HTTP 202`) instead of burning an intent; rejected top-level JSON arrays (`[]`) at `handler.ts` with `HTTP 400 Invalid JSON payload`; checked `intentErr` on direct fallback insert in `topUpBalance()`; and verified exact 4-way reconciliation across `public.wallets.balance`, `school.payment_events`, `public.transactions`, and `school.schools.settings.balance` mirror (`School A: 91,700 === 91,700 === 91,700 === 91,700`, `School B: 30,000 === 30,000 === 30,000 === 30,000`).
+10. **Next.js Multipart `FormData` Streaming Race Elimination (`middleware.ts`, `app/dashboard/people/actions.ts`, `app/dashboard/devices/actions.ts` — `R13-23`):**
+   - **Pre-patch reproduction:** Running `regress.mjs` back-to-back against standalone Next.js `15.5.28` with `export const config = { runtime: 'nodejs' }` in `middleware.ts` and synchronous tick-0 `formData.get('fullName')` in `addPersonAction` dropped multipart `FormData` fields on ~40% of cold socket bursts (`2/5` runs returning `{"error":"Full Name and Role are required."}`).
+   - **Fix:** Restored standard Next.js Edge Runtime in `middleware.ts` (`lib/security/register-token.ts` uses pure Web Crypto `crypto.subtle`) and moved `await requireSchoolAdmin()` ahead of `formData.get(...)` in both `addPersonAction` and `addDeviceAction` (rejecting unauthenticated callers before parsing untrusted form inputs and yielding across async auth I/O). Verified `10/10` consecutive stress runs (`170/170` checks, `0.00%` failure rate).
+
+## Round 13 Verification Matrix
+
+| Suite | Pre-Patch | Post-Patch |
+|---|---|---|
+| `money-round13-attack.mjs` (24 red-team + 4-way double-entry + `MIG11=0` checks) | **16 vulnerable / 16 + ledger drift** | **0 vulnerable / 24; 0 legit failures (`91,700` & `30,000` 4-way exact)** |
+| `payments-attack.mjs` | — | **0 vulnerable / 20; 0 legit failures** |
+| `money-reconcile.mjs` + `genuine-najiki-check.mjs` | — | **BOOKS BALANCE: ALL MONEY CHECKS OK (`21,700 === 21,700`, `19 vs 19`)** |
+| `round4-attack.mjs` / `pay-rls-check.mjs` / `rogue-attack.mjs` | — | **0/5** / **0/8** / **0/23 vulnerable** |
+| `topup-limit-check.mjs` | — | **PASS: 6 allowed, then refused** |
+| `rls-attack.mjs` / `null-inherit-check.js` / `test-triggers.js` | — | **0/32 vulnerable** / **3/3 passed** / **16/16 passed** |
+| Strict `attack.mjs` / `regress.mjs` (10x stress) / `device-attack.mjs` | **40% multipart race in `regress.mjs`** | **0/42 vulnerable** / **10/10 (`170/170` OK)** / **0/15 vulnerable** |
+| `round12-check.mjs` + all device, duplicate, crawl, SSR, orphan & `pentest` suites | — | **100% PASS (35/35, 10/10, 9/9, 15/15 SECURE, 14/14 PASS)** |
+
+**Go-live migration sequence:** run **05 → 06 → 07 → 08 → 09 → 10 → 11 → 12 → 13 → 14** (all migrations are 100% idempotent).
+
+## Rounds 14–17: Per-School Settings Lockdown, Strict 2-Write Daily Attendance & Full-Branch Offensive Penetration Test
+
+### New Migrations & Security Controls Added
+1. **`supabase_migrations/12_school_settings.sql` + `lib/school-settings.ts` + `app/dashboard/settings/*`:**
+   - Dedicated `school.school_settings` table containing strictly **0 financial, pricing, or wallet columns** (`31` operational columns only), completely isolated from `school.schools.settings` JSONB.
+   - Direct PostgREST writes (`INSERT`/`UPDATE`/`DELETE`) and client RPC execution on `school.save_school_settings` revoked from `anon` and `authenticated`; enforced server-side via `validateSchoolSettingsInput()` + PL/pgSQL rejection of all financial keys (`smsPrice`, `balance`, `walletBalance`, etc.) + strict GSM-7 single-segment SMS cap (`<= 160` ASCII chars, zero UCS-2 emojis).
+2. **`supabase_migrations/13_two_daily_punches_guard.sql` + `lib/devices/processor.ts` + Kiosk/Register Actions:**
+   - Enforces at most **2 attendance writes per person per local school day** across both application code and PostgreSQL (`UNIQUE INDEX attendance_logs_one_in_one_out_per_day (person_id, attendance_date, attendance_type)` + automatic timezone slot trigger `trg_attendance_logs_daily_slot`).
+   - Archives pre-existing duplicate punches safely into RLS-locked `school.attendance_logs_duplicates_backup` (`service_role` only; `0` grants to `PUBLIC`/`anon`/`authenticated`) while preserving historical `late` `check_in` rows untouched.
+3. **`supabase_migrations/14_rbac_audit_immutability_hardening.sql` (Discovered & Remediated During Full-Branch Penetration Test):**
+   - **Pre-Patch Red-Team Findings (`full-branch-pentest.mjs before` — `8/27` Exploitable):**
+     - `PT-05..PT-09` (**High — Intra-Tenant Vertical Privilege Escalation**): Non-admin `teacher` accounts blocked from `/dashboard` in Next.js could extract their own GoTrue JWT and call PostgREST directly to read parent phone directories, overwrite guardian SMS phone numbers, inject raw `ZKTeco` hardware commands (`DATA DELETE USERINFO`), wipe `school.attendance_logs`, and read `public.wallets`.
+     - `PT-10..PT-11` (**High — Audit Trail Tampering Under Compromised Token**): A stolen `school_admin` JWT could execute `DELETE` on `school.attendance_logs` and `POST`/`DELETE` on raw biometric `school.device_logs`.
+     - `PT-12` (**Medium — Arbitrary `status` Injection**): Direct PostgREST inserts accepted arbitrary strings (e.g. `<script>alert(1)</script>`) in `school.attendance_logs.status`.
+   - **Remediation Verified (`full-branch-pentest.mjs after` — `27/27 SECURE | 0 VULNERABLE`):**
+     - Added `SECURITY DEFINER` function `school.is_school_admin()` and enforced `RESTRICTIVE` RLS policies (`rbac_school_admin_only`) across every `school.*` table plus `public.wallets`, `public.transactions`, and `public.tenants`.
+     - Revoked `DELETE, TRUNCATE` on `school.attendance_logs` and `INSERT, UPDATE, DELETE, TRUNCATE` on `school.device_logs` from `anon` and `authenticated`.
+     - Enforced `CHECK (status IN ('present', 'late', 'absent', 'excused'))` on `school.attendance_logs`.
+
+
+
+
+---
+
+# Part 19: Full re-verification from a clean machine (2026-10-24)
+
+Everything above was re-proven end to end on a freshly rebuilt environment:
+PostgreSQL **17.5** (embedded binaries), the strict PostgREST/GoTrue shim
+(`SHIM_NO_AUTOCOL=1 PGRST_TS=1`), and the **production start path**
+(`npm start` -> `scripts/start-standalone.mjs`, i.e. the standalone server, not
+`next start`) so the redirect + header hardening is tested exactly as it ships.
+
+## Re-verification results
+
+| Suite | Result |
+|---|---|
+| `full-branch-pentest.mjs` (27 vectors, incl. production launcher) | **27/27 SECURE, 0 vulnerable** |
+| `full-branch-pentest.mjs before` (`MIG14=0`, regression proof) | **19/27, 8 vulnerable** (same 8, unchanged) |
+| `attack.mjs` strict (`ZKTECO_GLOBAL_SECRET_FALLBACK=false`) | **0/42 vulnerable** |
+| `device-attack.mjs` strict | **0/15 vulnerable** |
+| `round12-check.mjs` | **35/35 passed** |
+| `round14-settings-check.mjs` | **40/40 passed** |
+| `round16-two-writes-check.mjs` | **18/18 passed** |
+| `double-thumb-check.mjs` / `double-thumb-migration-check.mjs` | **11/11** / **9/9** |
+| `money-round13-attack.mjs` | **0/24 vulnerable**, 4-way parity exact |
+| `payments-attack.mjs` | **0/20 vulnerable** |
+| `money-reconcile.mjs` | **ALL MONEY CHECKS OK** |
+| `rogue-attack.mjs` / `round4-attack.mjs` / `pay-rls-check.mjs` / `rls-attack.mjs` | **0/21**, **0/5**, **0/8**, **0/32** |
+| `flows-check.mjs` / `link-crawl.mjs` | **ALL FLOWS OK** / **NO PROBLEMS FOUND** |
+| `null-inherit-check.js` / `test-triggers.js` | **4/4** / **16/16** |
+| `device-names-check.mjs` / `device-push-categories-check.mjs` | **ALL CHECKS OK** |
+| `topup-limit-check.mjs` (production default limit) | **6 allowed, then refused** |
+| `genuine-najiki-check.mjs` (cross-repo) | **200, 2000 of 2000 UGX credited** |
+| `najiki-own-signer-check.mjs` (signed by NaJiki's own source) | **200, 3100 of 3100 UGX; NaJiki's verifier agrees** |
+| `npm audit` (prod and full) / `lint` / `tsc` / `build` | **0 vulnerabilities** / 0 errors (2 pre-existing warnings) / 0 / success |
+
+## Issues found by the re-run and fixed
+
+1. **[HIGH, dependency] `zod < 4.6.6` memory-exhaustion advisory (GHSA-mrhx-c7xc-m3w5).**
+   Surfaced by `npm audit` on a fresh install. `zod` was a declared but unused
+   dependency (no import anywhere in the app), so it was upgraded to
+   **`zod ^4.6.7`** with no API surface affected. `npm audit` is back to
+   **0 vulnerabilities** for both `--omit=dev` and the full tree.
+2. **[Test flakiness] `money-round13-attack.mjs` R13-13 replayed a fixed reference.**
+   The wallet-debit race test fired 20 concurrent debits and then replayed
+   `sms_debit_0` to prove idempotency. Only 5 of the 20 can win, so ~75% of runs
+   replayed a *losing* reference and correctly got `insufficient_funds` instead
+   of `duplicate` — a false "vulnerable". The test now replays a reference that
+   actually won. The security property itself was never at risk: it stayed
+   **exactly 5 debits, final balance 0, no overdraft, no double-debit** in every
+   run. Verified **5/5 consecutive clean runs**.
+3. **[Harness deadlock] Lab shim could exhaust its connection pool.**
+   Each `/rest/v1/` request pins one pooled client for its whole transaction, but
+   two in-request probes (`pg_proc` lookups in `auth_school_id` and the RPC
+   resolver) asked the pool for a *second* client. With pg's default `max: 10`,
+   ~10 concurrent requests deadlocked the shim — which is why concurrent webhook
+   suites could hang indefinitely. Fixed by running those probes on the request's
+   own client (`dbq(...)`) and raising the pool to `max: 32`.
+4. **[Harness robustness] A dropped Postgres connection killed the shim.**
+   `pg_terminate_backend` (or any server restart/failover) emitted an unhandled
+   `'error'` on the pool and exited the process mid-run, which looks like a test
+   failure. Added a `pool.on('error')` listener that logs and keeps serving.
+5. **[Test hygiene] `test-triggers.js` could only ever run once.**
+   It creates a `school` schema in the `postgres` database and never dropped it,
+   so every subsequent run died with `42P06`. It now drops the schema before and
+   after, and is re-runnable (verified by two consecutive runs).
+
+## Note on `null-inherit-check.js`
+
+The third case previously asserted that a school-A admin could `INSERT` into
+`school.device_logs` (with `school_id` NULL inheriting to A). Migration 14
+deliberately makes `device_logs` a **server-only audit table** (finding PT-11),
+so that expectation became wrong. The check now asserts the hardened behaviour
+— anonymous/authenticated inserts are refused, and the NULL-inheritance trigger
+is still verified through the service role the app actually uses
+(**4/4 passing**).
+---
+
+# Part 20: Cross-check against the live payment provider source (2026-10-24)
+
+We cloned the provider (`najiki-finance2`) and checked our integration against
+its **actual source**, not against assumptions about it. The new suite
+`security/multi-tenant-lab/provider-contract-check.mjs` imports the provider's
+own modules — `src/lib/schemas.ts` (`CreatePaymentRequestSchema`,
+`InternalNotificationPayloadSchema`), `src/lib/notification-signature.ts`
+(`buildNotificationHeaders`, `verifyNotificationSignature`) and
+`src/lib/constants.ts` (`PLATFORM_FEE_TYPES`, `isPlatformFeeType`) — via a small
+ESM resolver hook (`ts-ext-hook.mjs`) so their TypeScript runs unmodified. It
+then checks the traffic we really produce, captured off the wire.
+
+## Finding 1 — HIGH: every SMS top-up was filed as a TENANT COLLECTION
+
+We sent `paymentTypeCode: "general"`. The provider classifies each charge by
+that code (`payment-intent-handler.ts`):
+
+```ts
+const isPlatformPayment = isPlatformFeeType(paymentType?.code ?? validatedBody.paymentTypeCode)
+let credentialSource = isPlatformPayment ? 'platform-fee' : 'none'
+if (!isPlatformPayment && (tenant || appRequiresTenantCredentials(application.code))) {
+  const resolvedCreds = await resolveTenantOrPlatformCredentials(tenant.id, provider.id, tenant.code)
+  if (!resolvedCreds) return NextResponse.json({ error: `Tenant "..." has no active credentials ...` }, { status: 503 })
+}
+```
+
+`"general"` is **not** in `PLATFORM_FEE_TYPES` (`SMS`, `BUY_SMS`, `SMS_TOPUP`,
+`ACTIVATION`, `ACCOUNT_ACTIVATION`, `SUBSCRIPTION`, `MONTHLY_SUBSCRIPTION`,
+`PLATFORM_FEE`), so every school top-up went down the tenant-collection path and
+demanded per-tenant gateway credentials. For a school without its own LivePay
+account that is a **503 and the top-up never starts**.
+
+An SMS-credit purchase is platform money. The provider seeds `BUY_SMS` itself as
+*"SMS credits top-up (platform fee)"* (`scripts/seed.ts`) and its own messaging
+route documents "BUY_SMS funds go to Na'jiki; the partner allocates SMS credits".
+
+**Fix:** `paymentTypeCode` defaults to `BUY_SMS`, overridable with
+`NAJIKI_PAYMENT_TYPE_CODE`, documented in `.env.example`. The code is also
+echoed in `metadata.paymentTypeCode` for reconciliation.
+
+**Proof (same suite, old value forced back via the env knob):**
+`NAJIKI_PAYMENT_TYPE_CODE=general` → `FAIL our paymentTypeCode is in THEIR
+PLATFORM_FEE_TYPES`; with the default → `PASS ... [BUY_SMS]`.
+
+## Finding 2 — HIGH: a provider-side `tenantId` could reject every payment
+
+The completion notification carries 13 fields, including the provider's **own**
+`tenantId`:
+
+```ts
+const payloadObject = { paymentIntentId, reference, status, amount, currency,
+  providerPaymentId, failureReason, externalEntityId, tenantId, tenantCode,
+  paymentType, paymentTypeCode, metadata }
+```
+
+Our resolver treated `tenantId` as an equal "school UUID" claim next to the
+`externalEntityId` we send. `Tenant.id` is a Prisma `cuid()` today, which fails
+our UUID regex — so the collision was latent, not live — but the moment a
+provider-side tenant id is UUID-shaped, the two claims disagree and every real
+payment is rejected as *"Conflicting school identifiers"*.
+
+**Fix:** two confidence tiers in `resolveWebhookSchool`. Explicit school
+identifiers (`externalEntityId`, `schoolId`, `metadata.schoolId`) decide;
+`tenantId`/`tenant_id` is only consulted when no school UUID is present (our own
+`public.tenants` rows use the school UUID as their id). The existing
+conflict-within-a-tier check is unchanged.
+
+## Finding 3 — MEDIUM: SMS delivery reports matched on one identifier only
+
+The provider's terminal SMS notification is:
+
+```ts
+{ eventType: 'SMS_DELIVERY_UPDATE', smsId, reference, status, providerId,
+  recipient, applicationCode }
+```
+
+`smsId` is the provider's `SmsMessage.id`, `providerId` the carrier's id and
+`reference` the provider's SMS reference. We matched only the first identifier
+we found against `notifications.provider_ref`, so delivery reports were silently
+dropped whenever the SMS Edge Function stored a different one. Also,
+`delivered | failed | unknown | queued | pending` is the provider's status set
+and `unknown` was being treated as a terminal failure.
+
+**Fix:** match `provider_ref` against **any** of `smsId`, `messageId`,
+`providerId`, `providerMessageId`, `reference`, `id`; fall back to the row id
+for UUID-shaped identifiers; add `UNKNOWN` to the non-terminal statuses. The
+"never downgrade an already-`sent` row" guard is preserved.
+
+## Verified contract (`provider-contract-check.mjs`, 30 checks, all passing)
+
+| Direction | Check |
+|---|---|
+| Outbound | Our body passes **their** `CreatePaymentRequestSchema` |
+| Outbound | `applicationCode`, `tenantCode`, `paymentTypeCode` present; `externalEntityId` = school UUID; `amount` a JSON **number** of whole shillings; `currency` normalises to `UGX`; `phoneNumber` 9–15 MSISDN digits; `idempotencyKey` `sch_topup_<uuid>` |
+| Outbound | Their `CreatePaymentResponse` shape `{paymentId uuid, reference, status}` |
+| Routing | `paymentTypeCode` ∈ `PLATFORM_FEE_TYPES` → `credentialSource='platform-fee'` |
+| Routing | `general` (the old value) is **not** a platform fee → tenant collection (regression guard) |
+| Inbound | Their completion payload (all 13 fields) passes their `InternalNotificationPayloadSchema` |
+| Inbound | Credits exactly the amount paid, once; redelivery is idempotent |
+| Inbound | A foreign UUID `tenantId` does not block crediting |
+| Inbound | Their own `verifyNotificationSignature` accepts the signature we were sent |
+| Inbound | `/api/internal/payment-completed` credits identically to `/api/webhooks/najiki` |
+| Inbound | `SMS_DELIVERY_UPDATE` matches by `smsId` and by `reference`; `unknown` is a no-op; late `failed` does not downgrade `sent`; a queued row does receive `failed` |
+
+`/api/internal/payment-completed` is a thin delegation to the same
+`handleNajikiWebhook`, so both the legacy path and the provider's self-healed
+`/api/webhooks/najiki` path behave identically. Note the provider's self-heal
+(`resolvePartnerWebhookUrl` / `postSignedPartnerWebhook`) only rewrites the
+legacy path for `application.code === 'sacco'`; for `school` it is our route
+that must answer — and it does.
+
+## Regression
+
+Re-ran after the fix, all green: `money-reconcile` **ALL MONEY CHECKS OK**,
+`money-round13-attack` **0/24**, `payments-attack` **0/20**, `rogue-attack`
+**0/21**, `round4-attack` **0/5**, `pay-rls-check` **0/8**,
+`full-branch-pentest` **27/27 SECURE**, `flows-check` **ALL FLOWS OK**,
+`round12` **35/35**, `round14` **40/40**, `round16` **18/18**. `tsc` 0 errors,
+`lint` 0 errors, production build OK.
+
+## Deployment note
+
+`NAJIKI_PAYMENT_TYPE_CODE` defaults to `BUY_SMS`; only change it if the
+`school` application in the gateway expects a different platform-fee code. The
+`tenantCode` we send must exist as a tenant of the `school` application in the
+gateway's own `tenants` table — the two systems must agree on tenant codes.
+
+# Part 21: The SMS Edge Function (the only component that spends money)
+
+## The rule this part enforces
+
+A school never sends an SMS itself. The Next.js app only inserts a `queued` row
+into `school.notifications` (`lib/notifications/queue.ts`). Everything after
+that — pricing, charging the wallet, calling NaJiki, recording the provider's
+id — happens in `supabase/functions/send-sms/`, a Deno Edge Function. Two files:
+
+- `sms-sender.ts` — pure helpers (phone normalisation, request building,
+  response classification, retry accounting, price validation). No I/O, so the
+  test harness can import and unit-test them.
+- `index.ts` — the function itself: claim, charge, send, record, release.
+
+SMS purchases continue to use the payment code **`BUY_SMS`** (Part 20). The
+per-message price is **platform-only** (`SMS_UNIT_PRICE_UGX`); no school-facing
+setting, form or policy can reach it. That is the financial-integrity rule from
+Part 13/20 applied to SMS specifically.
+
+## What the function does, and why each step is safe
+
+1. **Authorise** — `x-dispatch-secret` compared in constant time against
+   `SMS_DISPATCH_SECRET`; a missing secret on the platform side fails closed
+   (401), so an unconfigured deployment cannot be driven by anyone. GET → 405.
+2. **Refuse to guess a price** — `resolveUnitPrice` must return a positive
+   integer, otherwise the function returns 503 and sends nothing. An empty
+   `SMS_UNIT_PRICE_UGX` (a very likely misconfiguration) therefore cannot invent
+   a price or send free SMS.
+3. **Claim** — `update({status:'sending'}).eq('status','queued')`. Postgres
+   re-checks the predicate under the row lock, so two concurrent workers can
+   never claim the same row; the loser sees 0 rows and does nothing.
+4. **Charge once** — `school.debit_sms_wallet(school_id, price, 'sms_<id>')`,
+   the `service_role`-only RPC from migration 11. The reference is derived from
+   the notification id, so a retry returns `duplicate` instead of charging
+   twice. `insufficient_funds` fails the row without sending.
+5. **Send** — `POST /api/messaging/send` with
+   `Idempotency-Key: sms_<notificationId>` (the same value as the wallet
+   reference) and NaJiki's own shape: `to`, `message`, `applicationCode`,
+   optional `senderId`. Success is **HTTP 202**, not 200.
+6. **Record** — `provider_ref` is set to NaJiki's `smsId` (never a locally
+   generated id, or the delivery report could not match), plus `sent_at`,
+   plus the raw `provider_response`.
+7. **Release** — a `finally` block returns every row still in `sending` back to
+   `queued`. Without it, a function killed at the platform's wall-clock limit
+   would strand rows as `sending` forever and they would never be retried.
+
+## Findings fixed in this round
+
+| # | Finding | Impact | Fix |
+| --- | --- | --- | --- |
+| 21-1 | The retry branch read `row.attempt_count`, but no such column exists (migration 11 only adds `provider_ref`, `sent_at`, `provider_response`). | `attempt_count` was always `undefined`, so `MAX_ATTEMPTS` was dead code: a permanently failing row was retried forever, on every cron tick. | Counter is persisted in `provider_response` (`{reason, attempts, charged}`) via `readAttempts`/`nextAttempt`. |
+| 21-2 | Retries ignored whether money had already been taken. | A charged SMS that NaJiki kept failing would be marked `failed` after 3 tries: the school paid, got no SMS, and nothing flagged it for refund. There is no automatic refund RPC, so this is silent financial loss. | Two caps: 3 attempts when nothing was charged, 10 when it was; terminal failures of charged rows are labelled `charged_undelivered:` so they are findable and refundable by hand. |
+| 21-3 | The batch loop could outlive the platform timeout (25 rows × 12 s worst case = 300 s vs a 150 s limit), leaving claimed rows in `sending` forever. | Paid-for messages silently stuck; queue leak. | 45 s soft budget (`SMS_BATCH_BUDGET_MS`) plus the `finally` release above. |
+| 21-4 | `Deno.serve(handler)` always bound port 8000. | Harmless in production (one instance per function), but it made multi-instance verification impossible. | `PORT`/`HOSTNAME` read from env, defaulting to 8000/0.0.0.0 exactly as before. |
+| 21-5 | The Deno function was inside the Next.js TypeScript program. | `npm run build` failed on `npm:` imports and Deno globals — the app could not be built at all with the function present. | `supabase/functions` excluded from `tsconfig.json` and ESLint; the function is type-checked with `deno check` instead (0 errors). |
+
+## How it was verified
+
+`security/multi-tenant-lab/sms-edge-e2e-check.mjs` runs the **real function**:
+it spawns `deno run --allow-net --allow-env supabase/functions/send-sms/index.ts`,
+points it at the lab shim (Supabase REST + RPC + the fake NaJiki SMS API that
+mirrors `najiki-finance2`), and asserts against Postgres, never against HTTP
+status alone. **41/41 checks pass**, including:
+
+- 401 without / with a wrong dispatch secret, 405 on GET, 503 when
+  `SMS_UNIT_PRICE_UGX` is unset (and nothing sent or charged in that case);
+- happy path: `queued` → charged exactly 30 UGX once → NaJiki 202 →
+  `sent`, `provider_ref` equal to NaJiki's `smsId`, `sent_at` set,
+  `Idempotency-Key` = wallet reference = `sms_<id>`; a second run sends
+  nothing and charges nothing;
+- an unfunded school: `failed`, zero messages to NaJiki, wallet still 0;
+- 503 from the gateway: row stays `queued` with `attempts:1, charged:true`, the
+  charge is not repeated, the counter increments, and at the charged cap the row
+  fails as `charged_undelivered:` (not silently);
+- 429: retryable, and charging during the attempt moves the row onto the
+  charged cap;
+- invalid phone and over-length message: `failed`, no charge, no gateway call;
+- zero time budget: no row left in `sending`, unreached rows uncharged and
+  delivered by the next run.
+
+`sms-sender-contract-check.mjs` adds **46/46** checks against NaJiki's *own*
+code (`SmsInputSchema`, `MAX_SMS_BODY_BYTES`, `verifyNotificationSignature`):
+every body the sender builds is accepted by their schema, 202-with-`smsId` is
+classified as success, 409 as permanent, 429/5xx as retryable, plus 7 unit
+checks on the retry accounting.
+
+**Negative controls** (to prove the tests can fail):
+
+- reverting the 202 check to `status === 200` → **5 failures**, all on the
+  accept path (every real success would have been treated as a failure);
+- reverting the charged-row cap → **5 failures**, including
+  `retry_exhausted: Upstream unavailable (after 3 attempts)` on a row the school
+  had already paid for — exactly finding 21-2.
+
+`deno check` reports 0 type errors. `npm run lint`, `npx tsc --noEmit` and
+`npm run build` are green with the function in the tree.
+
+## Full regression sweep after these changes
+
+`full-branch-pentest` **27/27 SECURE**, `provider-contract-check` **30/30**,
+`sms-sender-contract-check` **46/46**, `sms-edge-e2e-check` **41/41**,
+`money-round13-attack` **0/24**, `payments-attack` **0/20**, `rogue-attack`
+**0/21**, `round4-attack` **0/5**, `pay-rls-check` **0/8**,
+`money-reconcile` **ALL MONEY CHECKS OK**, `flows-check` **ALL FLOWS OK**,
+`round12` **35/35**, `round14` **40/40**, `round16` **18/18**,
+`double-thumb-check` **11/11**. Zero regressions.
+
+## Deploying it
+
+```bash
+supabase functions deploy send-sms --no-verify-jwt
+supabase secrets set \
+  NAJIKI_API_URL=https://<gateway>/api/messaging/send \
+  NAJIKI_API_KEY=... \
+  NAJIKI_APP_CODE=school \
+  NAJIKI_SENDER_ID=SMARTSKOOLZ \
+  SMS_UNIT_PRICE_UGX=30 \
+  SMS_DISPATCH_SECRET=$(openssl rand -hex 32)
+# then, on a schedule (pg_cron / Supabase Scheduler / QStash):
+#   POST /functions/v1/send-sms   x-dispatch-secret: <SMS_DISPATCH_SECRET>
+```
+
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are injected by the platform.
+The service-role key is mandatory: migration 06 revoked anon/authenticated
+writes to `school.notifications` and to the wallet functions.
+
+Before go-live the migrations must be applied in order (`05` → `14`), because
+this function depends on `school.debit_sms_wallet` (11) and on the delivery
+columns added there.
+
+## Residual risk, stated plainly
+
+- **`sending` rows and no `updated_at`.** The `finally` release covers normal
+  exits and the time budget, but a hard kill (OOM, platform SIGKILL) can still
+  strand a row. `school.notifications` has no `updated_at` to age rows by, so
+  there is no safe reaper yet. Recommended follow-up: add `updated_at` in a
+  future migration and requeue `sending` rows older than ~10 minutes.
+- **NaJiki does not debit its own wallet** for SMS it sends (Part 6 note). Our
+  charge is the only one, so `SMS_UNIT_PRICE_UGX` must be kept in step with what
+  the gateway actually costs; it is not derived from the gateway.
+- **Delivery-report matching** is identifier-based and deliberately generous
+  (Part 20), so an unrelated `reference` collision could flip a status. It
+  cannot move money, and `sent` rows are never downgraded by a `failed` report.
+
+# Part 22: The deployed SMS function could not send a single SMS
+
+## What happened
+
+The function running in the database was not the one written in Part 21. It was
+a separate implementation, written against a schema and an RPC that **do not
+exist**. Every one of the following was verified directly against Postgres, not
+guessed:
+
+| # | The deployed code did | Reality | Effect |
+| --- | --- | --- | --- |
+| 22-1 | `.update({ retry_count, next_retry_at, error })` | `school.notifications` has none of those columns (`42703`) | The **first claim UPDATE raised**, so `dispatchOne` returned 500 and no SMS was ever sent. The sweep's `.lt("retry_count", 5)` failed the same way. |
+| 22-2 | `rpc("debit_sms_wallet", { p_wallet_id, p_amount, p_idempotency_key, p_tenant_id, p_description })` | No `public.debit_sms_wallet` with that shape (`42883`). The audited one is `school.debit_sms_wallet(p_school_id, p_amount, p_reference, p_description)` (migration 11). | Even with 22-1 fixed, every send would fail at the charge and be recorded as `insufficient_balance_or_debit_failed`. |
+| 22-3 | Posted to NaJiki with **no `Idempotency-Key`** | `/api/messaging/send` dedupes only on that header | Each of the 5 retries would create a **new** SMS: up to 5 duplicate messages per notification, billed to the platform. |
+| 22-4 | Never set `provider_ref` | `SMS_DELIVERY_UPDATE` matches on `provider_ref` (or an id) | Delivery reports would match nothing; rows would stay `sent` forever with no delivery state. |
+| 22-5 | Wrote `provider_response: JSON.stringify(data)` | The column is `jsonb` | jsonb stores that as a **string scalar** (`jsonb_typeof` = `string`), so the payload is unreadable as data. |
+| 22-6 | `SMS_COST = Number(env || "1")` | SMS price is platform-only | A missing secret would silently sell SMS at **1 UGX** instead of refusing. |
+
+Note the inconsistency that made 22-1/22-2 easy to miss: the deployed function
+used status `pending`, while Part 21's version used `queued`. The app writes
+`pending` (`app/mark-attendance/actions.ts:366`,
+`app/manual-attendance/[classId]/actions.ts:700`,
+`lib/devices/processor.ts:539`), so the deployed vocabulary was right and
+Part 21's was wrong.
+
+## The replacement
+
+`supabase/functions/send-sms/index.ts` is now a **drop-in replacement**: it keeps
+the deployed function's entire external interface, because the app and the cron
+callers already depend on it —
+
+- auth: `Authorization: Bearer <DISPATCH_SECRET>` (and `x-dispatch-secret`);
+- payloads: `{ notification_id }`, `{ record: { id } }`, `{ new: { id } }`,
+  `{ id }` and `{ retry_sweep: true }`;
+- statuses: `pending` → `sending` → `sent` | `failed` | `pending` (retry);
+- env: `DISPATCH_SECRET`, `NAJIKI_DOMAIN`, `NAJIKI_API_KEY`, `SMS_COST`,
+  `NAJIKI_TIMEOUT_MS` — the names already set on the project, so a redeploy
+  needs no secret changes. (`NAJIKI_APP_CODE`, `NAJIKI_SENDER_ID`,
+  `NAJIKI_API_URL`/`NAJIKI_MESSAGING_URL`, `SMS_UNIT_PRICE_UGX` and
+  `SMS_BATCH_BUDGET_MS` are honoured as optional extras.)
+
+...while fixing all six findings:
+
+- charges through `school.debit_sms_wallet(p_school_id, …)` and reads its
+  `outcome` (`debited` / `duplicate` / `insufficient_funds` / `invalid_*`)
+  instead of treating every error as "insufficient balance";
+- retry bookkeeping lives in `provider_response` JSON (`attempts`, `charged`,
+  `reason`, `claimed_at`) — no new columns, so it runs on today's schema;
+- sends `Idempotency-Key: sms_<notificationId>`, the same value as the wallet
+  reference: a retry can neither charge nor send twice;
+- stores NaJiki's `smsId` in `provider_ref`, so delivery reports match;
+- writes `provider_response` as an object;
+- no price default: a missing/invalid `SMS_COST` returns 503 and sends nothing.
+
+Retry policy is unchanged from Part 21 in spirit, and now also protects money:
+3 attempts while nothing was charged, 10 once it was, and a row that still
+cannot be delivered fails as `charged_undelivered:` so the charge is visible for
+manual reconciliation. The `finally` block returns a still-claimed row to
+`pending`, and the sweep reclaims `sending` rows whose
+`provider_response.claimed_at` is older than 10 minutes — which also closes the
+"sending rows with no `updated_at`" residual risk noted in Part 21.
+
+## Verification
+
+Three suites, all green:
+
+- **`sms-edge-e2e-check.mjs` — 57/57.** Runs the real function under Deno
+  against the lab shim and asserts on Postgres through the deployed interface:
+  Bearer/`x-dispatch-secret` auth, 405, 503 with no price, `{notification_id}`
+  and `{record:{id}}` payloads, charge-once, NaJiki 202, `provider_ref`,
+  `provider_response` as an object, no `smsId` leak into their schema, 503 → row
+  stays `pending` with `attempts`/`charged`, 429/409 handling, `charged_undelivered`
+  at the charged cap, invalid phone/over-length/non-SMS rows never charged, the
+  sweep reclaiming a stale claim while leaving a live one alone, a tiny budget
+  stranding nothing, and `SMS_DELIVERY_UPDATE` matching the stored `provider_ref`.
+- **`sms-schema-contract-check.mjs` — 49/49 (new).** Database + static
+  contract, no Deno needed: the debit RPC exists with exactly that signature,
+  the legacy 5-argument call still fails with `42883`, `retry_count` /
+  `next_retry_at` / `error` / `attempt_count` do not exist, the function's
+  *code* (comments excluded) uses none of them, the app and the function agree
+  on `pending`, the deployed env names and payload shapes are preserved, the
+  price has no numeric fallback, and `provider_ref` is written before `sent`.
+- **`sms-sender-contract-check.mjs` — 56/56.** Now also covers
+  `resolveEndpoint` (domain vs full URL, trailing slashes, bare host) and
+  `isStaleClaim` (fresh vs 30-minute-old vs missing vs unparseable timestamps),
+  against NaJiki's own `SmsInputSchema`.
+
+**Negative controls:** appending `retry_count` / `next_retry_at` / `p_wallet_id`
+to the function → the schema suite fails 3 checks; the Part 21 controls
+(`status === 200`, charged-cap revert) still fail their suites.
+
+Full sweep after these changes: pentest **27/27**, provider-contract **30/30**,
+money-round13 **0/24**, payments-attack **0/20**, rogue **0/21**, round4
+**0/5**, pay-rls **0/8**, money-reconcile **OK**, flows **OK**, round12
+**35/35**, round14 **40/40**, round16 **18/18**. `tsc`, `lint`, `build` clean.
+
+## Deploying the replacement
+
+```bash
+supabase functions deploy send-sms --no-verify-jwt
+# no secret changes needed; set SMS_COST first if it is not already set:
+supabase secrets set SMS_COST=30 DISPATCH_SECRET=$(openssl rand -hex 32)
+```
+
+Then, from a scheduler, either `POST /functions/v1/send-sms {"retry_sweep":true}`
+every few minutes, or `{"notification_id":"<id>"}` as a database webhook.
+
+## Residual risk
+
+- The **existing queued rows** should be checked after the redeploy: rows left at
+  `failed` by the old function (`error = 'insufficient_balance_or_debit_failed'`
+  or `'provider_failed'`) were never sent, and if the old code ever did reach the
+  debit step they were never charged either. Requeue deliberately, not in bulk.
+- `provider_response` is the retry ledger, so anything that overwrites it
+  wholesale resets the attempt count. No app code writes that column.
+- `NAJIKI_DOMAIN` defaults to `https://api.najiki.com`; production should set it
+  explicitly so a gateway move cannot silently reroute paid traffic.
+
+# Part 23: Correction — aligning the repo to the live project
+
+## What I got wrong in Parts 21 and 22
+
+Parts 21 and 22 measured the **lab database built from this repo's migrations**
+and reported the result as if it described production. It did not. The live
+project, as reported by the owner, is different:
+
+| Thing | Parts 21–22 assumed (repo migrations) | Live project |
+| --- | --- | --- |
+| `school.notifications` retry columns | `retry_count`, `next_retry_at`, `error` **do not exist** | they **do exist** |
+| `provider_response` | `jsonb` | **`text`** |
+| `provider_ref` | exists and is how delivery reports match | **no such column** |
+| `status` default | none | **`pending`** |
+| wallet debit | `school.debit_sms_wallet(p_school_id, …)` | **`public.debit_sms_wallet(p_wallet_id text, p_amount numeric, p_idempotency_key text, p_tenant_id text, p_description text)`** |
+| deployed function | `send-sms` | **`send-attendance-sms`, v16, JWT verification ENABLED** |
+
+So the `42703` / `42883` errors in Part 22 were real **in this repository's
+schema**, and irrelevant to the live database. The honest reading is the
+opposite of what I wrote: **the repo had drifted from production**, and the
+deployed function was written against the live schema all along. The two
+"bugs" that were really my misreading:
+
+- writing `retry_count` / `next_retry_at` / `error` is correct on the live schema;
+- `JSON.stringify(...)` into `provider_response` is correct because that column
+  is `text` there, not `jsonb`.
+
+What *did* hold up, on the live schema, is below — including two genuine defects
+that only became visible once the lab was rebuilt to match production.
+
+## What changed in the repository
+
+1. **`supabase_migrations/15_align_sms_dispatch_schema.sql` (new).** Brings a
+   fresh database up to the live shape: `retry_count int not null default 0`,
+   `next_retry_at timestamptz`, `error text`, `status` default `'pending'`,
+   `provider_response` converted to `text`, a partial index for the sweep, and
+   **`public.debit_sms_wallet(text, numeric, text, text, text)`** with the
+   deployed signature (idempotent on `p_idempotency_key`, tenant-checked,
+   raises on insufficient funds, `service_role` only).
+
+   > **Do not run migration 15 against production.** The live project already
+   > has these objects; replacing its wallet function with my reconstruction
+   > would be a change to production money code based on a signature alone. It
+   > is for fresh installs and the lab. If the live function's body differs
+   > (return shape, rounding, ledger rows), the live one wins.
+
+2. **The function is now `supabase/functions/send-attendance-sms/`** — the
+   deployed implementation, faithful to its column names, status values, RPC
+   signature, request body (`{smsId, to, message}`), env names
+   (`DISPATCH_SECRET`, `NAJIKI_DOMAIN`, `NAJIKI_API_KEY`, `SMS_COST`,
+   `NAJIKI_TIMEOUT_MS`), payload shapes, return values and its 5-attempt cap.
+   `send-sms/` and its helper module were deleted: that function was never
+   deployed, so it was only ever a source of confusion.
+3. **The lab now mirrors production**: the retry columns exist,
+   `provider_response` is `text`, and the wallet RPC has the deployed signature.
+   Every assertion below runs against that shape.
+
+Three changes to the deployed code, all additive and all marked in the file:
+
+| Change | Why |
+| --- | --- |
+| `Idempotency-Key: sms:<notificationId>` on the NaJiki call | Without it, each of the 5 retries creates a **second billable SMS**. With it, a retry is the same message and NaJiki deduplicates it. |
+| Constant-time comparison of the dispatch secret | The deployed `!==` leaks the secret's length/prefix through timing. |
+| A real MSISDN check before the wallet is touched | The deployed `toE164` only rejected **empty** numbers. `12345` became `+12345`, passed, and was **charged** before the gateway rejected it — five times. |
+
+## What the rebuilt lab proved (deployed function, live-shaped schema)
+
+`sms-edge-e2e-check.mjs` — **56/56**, driving the real Deno function against the
+lab shim and asserting on Postgres:
+
+- 401 without/with a wrong `Bearer` secret, 405 on GET, 400 without an id,
+  503 when `SMS_COST` is unset (and nothing sent or charged), and an unknown
+  notification id answered with `skipped` rather than a retry loop;
+- happy path: `pending` → charged 30 UGX exactly once → NaJiki 202 → `sent`,
+  `retry_count` stays 0, `next_retry_at` cleared, `error` null,
+  `provider_response` parses as JSON text, `smsId` carries our notification id,
+  `Idempotency-Key` is `sms:<id>`, and the posted body passes NaJiki's own
+  `SmsInputSchema`; a second dispatch is a no-op with no second charge;
+- `{record:{id}}` webhook payloads work;
+- an unfunded school: `failed` after the cap, `error =
+  insufficient_balance_or_debit_failed`, zero messages to NaJiki, wallet still 0;
+- retries: a 503 leaves the row `pending` with `retry_count` incremented, a
+  **future `next_retry_at` lock** (a second call inside the backoff is refused),
+  the same `Idempotency-Key` on every attempt, at most one charge, and the 5th
+  attempt terminal with the backoff cleared;
+- an idempotency conflict (same key, different body) recorded as
+  `provider_failed` without a second charge;
+- invalid numbers failed **before** any charge, with no gateway call;
+- the sweep sends only due rows, leaves backed-off rows and rows at the cap
+  alone, never re-sends `sent` rows, and charges only what it sends;
+- the app's delivery webhook still returns 200 and leaves a delivered row
+  `sent` on this schema (where `provider_ref` does not exist).
+
+`sms-schema-contract-check.mjs` — **39/39**, no Deno required: the RPC exists
+with the deployed signature and correct ACLs, debits once per idempotency key,
+raises on insufficient funds and on a wallet/tenant mismatch; the notification
+columns have the deployed types and defaults; the repo's function is
+`send-attendance-sms` and the old one is gone; the code writes the retry
+columns, calls the 5-argument RPC, never touches `provider_ref`, stores JSON
+text, charges before sending, dispatches only `pending`, and keeps the three
+fixes above; the app queues `pending` and its webhook survives a schema with no
+`provider_ref`.
+
+`provider-contract-check.mjs` (**30/30**) and the full pentest/regression sweep
+are unchanged and green.
+
+## Deployment and reconciliation
+
+```bash
+supabase functions deploy send-attendance-sms     # JWT verification STAYS ON
+supabase secrets set SMS_COST=... DISPATCH_SECRET=...
+# optional: SMS_SWEEP_BUDGET_MS=45000 (default) bounds one sweep invocation
+psql "$DATABASE_URL" -f supabase_migrations/16_refund_sms_charge.sql   # refunds
+# and a scheduler is required — a URL and a body are not a schedule:
+#   POST /functions/v1/send-attendance-sms   {"retry_sweep": true}
+#   cron: */5 * * * *
+```
+
+About the rows already in the table: 76 pending / 7 sent, of which 63 pending
+carry `error` and `provider_response` markers. Those markers do **not** prove
+whether the provider accepted or billed a message, and `retry_count` alone does
+not either. Do not bulk-requeue them: for a sample, check `public.sms_messages` /
+`public.sms_delivery_reports` by `provider_message_id` against
+`provider_response`, then requeue only rows with no provider record. Rows at
+`retry_count >= 5` will never be picked up by the sweep regardless.
+
+## Still unverified from here
+
+- Whether the deployed revision is byte-identical to the source pasted by the
+  owner (v16 is what is live; the repo now carries that source plus three
+  documented additions).
+- The live `public.debit_sms_wallet` body: only its signature is known. My
+  migration 15 implementation matches that signature and the call contract; it
+  is not a claim about the live body.
+- Whether the 63 marked rows were ever charged. That needs the reconciliation
+  above, against the gateway's own records.
+
+# Part 24: Stress test — is the deployed sender actually solid?
+
+The contract suite (Part 23) proves the happy path. This part attacks the
+function: races, a wallet that cannot pay, a gateway that lies, content that can
+never be delivered, and hostile payloads. `sms-edge-stress-check.mjs`, **32/32
+after fixes** (6 failures before), driven against the real Deno function and
+asserted on Postgres.
+
+## What held up (no changes needed)
+
+| Attack | Result |
+| --- | --- |
+| **Two workers dispatch the same notification at the same instant** | exactly one claimed it, one charge, one message at NaJiki, one `sent` |
+| **Retry sweep racing a single dispatch on the same row** | one charge, one message |
+| **10 parallel sends against a wallet that can only pay for 5** | exactly 5 sent, 5 not sent, balance ended at 0 and never negative, no row charged twice, total debits == total messages |
+| **Slow gateway (function timeout 1 s, gateway 2.5 s)** | aborted at 1031 ms, row stayed `pending`, `retry_count` incremented, charged once |
+| **Malformed JSON** | 400, no crash |
+| **SQL-ish id (`' OR 1=1 --`)** | treated as an id, no query change |
+| **5000-character id** | no 500 |
+| **Delivery report replayed** | both accepted, row stayed `sent`, no second charge |
+
+The claim race is the interesting one: the sender "locks" a row by writing a
+future `next_retry_at` inside a single `UPDATE ... WHERE status='pending' AND
+(next_retry_at IS NULL OR next_retry_at <= now())`. Postgres re-checks that
+predicate under the row lock, so the loser's update matches zero rows. It is
+atomic, and the concurrency test confirms it.
+
+## What broke, and what was fixed
+
+| # | Finding (all confirmed by a failing test first) | Fix |
+| --- | --- | --- |
+| 24-1 | A **200 with `success:false`** was recorded as `sent`: `res.ok` alone decided success, so a rejected message was silently lost. | Success now requires a 2xx, a payload that does not deny success, **and** an `smsId`. |
+| 24-2 | A **202 with no `smsId`** was also recorded as `sent`, leaving nothing to match a delivery report against. | Retried as `provider_ack_without_id` (same `Idempotency-Key`, so no duplicate). |
+| 24-3 | A **2000-character message was charged** and then failed five times at the gateway. The school paid for something that could never be delivered. | Rejected before the wallet is touched (`invalid_message_length`, NaJiki's 918-char ceiling). |
+| 24-4 | An **empty message was charged** for the same reason. | Same guard (`length < 1`). |
+| 24-5 | A school whose wallet is keyed by **`school_id` instead of `tenant_id`** could never send: the lookup only queried `tenant_id`, so every row died as `wallet_missing`. | Falls back to `school_id` when no tenant-keyed wallet exists. |
+| 24-6 | A **non-string notification id** (`{"$ne": null}`) was coerced to `"[object Object]"`, producing a pointless 200. | Only strings and numbers are accepted; anything else is a 400. |
+
+Each of 24-1…24-6 was red before the fix and green after, in the same suite.
+
+## Regression after the fixes
+
+`sms-edge-e2e-check` **56/56**, `sms-schema-contract-check` **43/43**
+(now also asserts the message-length guard, the payload check, the `ackId`
+requirement and the `school_id` wallet fallback), `provider-contract` **30/30**,
+`full-branch-pentest` **27/27**, `money-round13` **0/24**, `payments-attack`
+**0/20**, `rogue` **0/21**, `round4` **0/5**, `pay-rls` **0/8**,
+`money-reconcile` **OK**, `flows-check` **OK**, `round12` **35/35**,
+`round14` **40/40**, `round16` **18/18**. `deno check`, `tsc`, `lint`, `build`
+clean.
+
+## Still not solid — known, not fixed
+
+- **No "charged but undelivered" marker.** After the 5th failure a charged row is
+  `failed` with `error = 'provider_failed'`, indistinguishable from a row that
+  was never charged. Reconcile with
+  `SELECT ... FROM public.transactions WHERE reference = 'sms:' || n.id`, not by
+  `error`. Adding a `charged_undelivered:` prefix would make it visible but
+  changes the `error` vocabulary the dashboard may parse, so it is a decision for
+  the owner, not a silent edit.
+- **No refund path.** A message that is charged and then cannot be delivered
+  leaves the school out of pocket until someone credits it by hand.
+- **The sweep has no time budget.** It dispatches up to 50 rows sequentially,
+  each with a 30 s gateway timeout: up to 25 minutes inside one invocation. Rows
+  it never reaches simply keep their (expiring) 1-minute claim, so nothing is
+  lost, but a platform timeout will kill the invocation mid-batch. A soft budget
+  before starting a row would make this predictable.
+- **Backoff is fixed at 3 minutes** and ignores NaJiki's `Retry-After`.
+- **`next_retry_at` is both the lock and the schedule.** A send that takes longer
+  than 60 s (only possible if `NAJIKI_TIMEOUT_MS` is raised above 60 s) would let
+  a second worker claim the same row. With the default 30 s it cannot happen, but
+  the two values are not linked in code.
+
+# Part 25: Closing the five "still not solid" items (2026-10-24)
+
+Part 24 ended with a list of known gaps. This part closes all five, and changes
+one piece of vocabulary on purpose.
+
+## 25-1 — Charged-but-undelivered is now visible in one column
+
+A terminal failure that happened **after** a successful debit is written as
+
+```
+error = 'charged_undelivered:<reason>'      -- e.g. charged_undelivered:provider_failed
+```
+
+A terminal failure that never took money keeps the bare reason
+(`invalid_message_length`, `insufficient_balance_or_debit_failed`,
+`provider_rejected`, …). So
+
+```sql
+SELECT id, error FROM school.notifications
+ WHERE error LIKE 'charged_undelivered:%' AND sent_at IS NULL;
+```
+
+is now the exact list of schools that paid for nothing. This is a deliberate
+change to the `error` vocabulary: anything parsing `error = 'provider_failed'`
+must accept the prefix. The suffix after the colon is the old value, so a
+tolerant parser (`error LIKE '%provider_failed'`) keeps working.
+
+The flag is **per row** (`chargedThisRow`, reset on every dispatch), not shared
+across a sweep — a batch is not "charged" because an earlier row was. A late
+success clears `error` to `null` while `provider_response` keeps the history.
+
+## 25-2 — A refund path that cannot pay twice
+
+`supabase_migrations/16_refund_sms_charge.sql` adds
+
+```sql
+SELECT public.refund_sms_charge('<notification uuid>');
+-- { outcome: 'refunded' | 'duplicate' | 'no_charge', amount, balance, reference }
+```
+
+It **credits the wallet and writes a ledger row** with reference
+`sms_refund:<id>`, so a second call returns `duplicate` instead of crediting
+again. It refuses (`no_charge`) when `sms:<id>` was never debited. It is
+`SECURITY DEFINER`, revoked from `anon`/`authenticated`, granted to
+`service_role` only — a school cannot refund itself.
+
+**Why manual, not automatic inside the sender.** A message can still be
+delivered after our last attempt: the gateway may have accepted it and we lost
+the response (that is exactly the `provider_timeout_or_fetch_error` case). An
+automatic refund would then both deliver the SMS and return the money. So the
+sender only *marks*; the refund is an explicit, idempotent act after checking
+`public.sms_messages` / `public.sms_delivery_reports` for a provider record.
+
+## 25-3 — The sweep has a wall-clock budget
+
+`SMS_SWEEP_BUDGET_MS` (default **45 000**) is checked **before starting each
+row**. When it is exhausted the loop stops, leaves the remaining rows `pending`
+with their claim expiring, and returns
+
+```json
+{ "swept": 50, "dispatched": 12, "stopped_early": true }
+```
+
+The next run picks up the rest. Previously a 50-row sweep at 30 s each could run
+for 25 minutes into a platform timeout.
+
+## 25-4 — Backoff honours `Retry-After`
+
+`parseRetryAfter()` accepts both forms in the RFC (`Retry-After: 120` seconds and
+`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`), clamps to **3600 s**, and falls
+back to `DEFAULT_BACKOFF_SEC = 180` when the header is absent or unusable. A 429
+no longer waits 3 minutes for nothing.
+
+## 25-5 — The claim lock is derived from the send timeout
+
+```
+sendTimeoutMs = NAJIKI_TIMEOUT_MS (default 30 000)
+lockMs        = max(60 000, sendTimeoutMs + 15 000)
+```
+
+The lock can no longer expire while a send is still running, even if someone
+raises `NAJIKI_TIMEOUT_MS` above 60 s. The timeout is read once and reused by the
+`AbortController`, so the two values cannot drift.
+
+## Test evidence
+
+`sms-edge-stress-check.mjs` grew from 32 to **46 checks** (two new sections):
+
+| Check | Before | After |
+| --- | --- | --- |
+| 11-1 a terminal failure after a charge is marked `charged_undelivered` | red | green |
+| 11-2 an uncharged terminal failure carries **no** marker | — | green |
+| 11-3 the refund credits exactly one price | red (`function does not exist`) | green |
+| 11-4 refunding twice is refused (`duplicate`) and does not credit again | — | green |
+| 11-5 refunding a never-charged row is a no-op (`no_charge`) | — | green |
+| 12-1 `Retry-After: 2` produces a 2.0 s backoff, not 180 s | red | green |
+| 12-2 a 1 ms budget stops the sweep before the first row | red | green |
+| 12-3 the skipped rows stay `pending` for the next run | — | green |
+| 12-4 the next sweep with a normal budget delivers all four | — | green |
+
+One of those checks was **wrong when first written** and passed for the wrong
+reason: it killed `procs[procs.length - 1]` *before* starting the budget-scoped
+instance, so it restarted nothing and the 1 ms process kept serving. It now
+keeps the handle returned by `startFn()` and asserts `stopped_early === false`
+plus all four rows `sent` afterwards. A passing assertion that does not test what
+it claims is worse than a failing one.
+
+## Regression after the fixes
+
+`sms-edge-stress` **46/46**, `sms-edge-e2e` **56/56**, `sms-schema-contract`
+**61/61** (18 new static checks: the marker, the refund RPC and its grants, the
+`Retry-After` parser, the lock/timeout link, the sweep budget and its older
+alias), `provider-contract` **31/31**, `full-branch-pentest` **27/27**,
+`money-round13` **0/24**, `payments-attack` **0/20**, `rogue` **0/21**,
+`round4` **0/5**, `pay-rls` **0/8**, `money-reconcile` **OK**, `flows-check`
+**OK**, `round12` **35/35**, `round14` **40/40**, `round16` **18/18**.
+`deno fmt --check` + `deno check`, `tsc --noEmit`, `lint` (0 errors) and a clean
+`rm -rf .next && npm run build` all pass.
+
+Two process notes, because they cost time:
+
+- **`.next` was stale at the start of this round.** `payments-attack` and
+  `provider-contract` failed with `Failed to find Server Action` — the running
+  server predated the build. Stopping the app, `rm -rf .next && npm run build`,
+  restarting **with the lab env** and re-seeding fixed all of it. Rebuilding
+  under a running app is the same trap as before.
+- **`RLS` must be exported, not passed inline.** `RLS=1 node suite.mjs` leaves
+  the child re-seed without it, so migrations 05–11 are skipped and the DB has
+  no `school.payment_intents`; the suite then crashes on a missing table that
+  looks like a regression. Use `export RLS=1` for the whole sweep.
+
+## Still open (honest list)
+
+- **The refund is manual.** Nothing runs `refund_sms_charge` on a schedule. Until
+  someone does, `charged_undelivered:%` is a report, not a remedy. A cron that
+  refunds rows older than N days *after* confirming no provider record would be
+  the next step; it needs a human decision about the late-delivery window.
+- **The marker describes our last attempt, not the final truth.** A refunded row
+  can still be delivered by the gateway. That is why the refund is not automatic.
+- **`error` vocabulary changed.** A dashboard that does an exact match on
+  `provider_failed` will show blanks for charged rows until it is updated.
+- **Migration 16 must be applied** before the refund is callable. The sender does
+  not depend on it, so deploying the function first is safe.

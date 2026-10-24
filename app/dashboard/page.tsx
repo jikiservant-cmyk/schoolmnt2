@@ -1,6 +1,8 @@
 import { createClient } from '@/utils/supabase/server';
+import { createAdminClient } from '@/utils/supabase/admin';
 import DashboardClient from './DashboardClient';
 import { getEATDayRange, getEATDateKey, formatEATDate } from '@/lib/eat-time';
+import { getSchoolSettings, DEFAULT_SCHOOL_POLICY_SETTINGS } from '@/lib/school-settings';
 
 export default async function DashboardPage() {
   const supabase = await createClient();
@@ -13,46 +15,12 @@ export default async function DashboardPage() {
   let classBreakdown: any[] = [];
   let weekTrend: any[] = [];
   let recentMessages: any[] = [];
-  let adminName = 'Derrick';
+  let adminName = 'Admin';
+  let schoolTimeZone = DEFAULT_SCHOOL_POLICY_SETTINGS.timeZone;
+  let academicTermLabel = DEFAULT_SCHOOL_POLICY_SETTINGS.academicTermLabel;
 
-  // 1. Get current date range in East Africa Time (EAT, UTC+3)
   const now = new Date();
-  const todayRange = getEATDayRange(now);
-  const todayKey = todayRange.dateStr;
-
-  // 2. Calculate the 7 days of the current week (Monday through Sunday in EAT)
-  // Determine current day of week: 0 is Sun, 1 is Mon, ..., 6 is Sat
-  const dayOfWeek = now.getDay();
-  // Monday offset: if Sunday (0), it's 6 days behind; otherwise dayOfWeek - 1
-  const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-  
-  const mondayDate = new Date(now);
-  mondayDate.setDate(now.getDate() - daysSinceMonday);
-  mondayDate.setHours(0, 0, 0, 0);
-
-  const weekDaysData: { dayName: string; dateKey: string; dateLabel: string; startIso: string; endIso: string; isToday: boolean; isFuture: boolean }[] = [];
   const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-
-  for (let i = 0; i < 7; i++) {
-    const d = new Date(mondayDate);
-    d.setDate(mondayDate.getDate() + i);
-    const dayRange = getEATDayRange(d);
-    const isToday = dayRange.dateStr === todayKey;
-    const isFuture = dayRange.dateStr > todayKey;
-
-    weekDaysData.push({
-      dayName: dayNames[i],
-      dateKey: dayRange.dateStr,
-      dateLabel: formatEATDate(d, { month: 'short', day: 'numeric' }),
-      startIso: dayRange.startIso,
-      endIso: dayRange.endIso,
-      isToday,
-      isFuture,
-    });
-  }
-
-  const weekStartIso = weekDaysData[0].startIso;
-  const weekEndIso = weekDaysData[6].endIso;
 
   try {
     const { data: { user } } = await supabase.auth.getUser();
@@ -70,9 +38,9 @@ export default async function DashboardPage() {
 
       if (staffData && staffData.people) {
         const p = staffData.people as any;
-        adminName = p.full_name?.split(' ')[0] || 'Derrick';
+        adminName = p.full_name?.split(' ')[0] || 'Admin';
       } else {
-        adminName = user.user_metadata?.full_name?.split(' ')[0] || 'Derrick';
+        adminName = user.user_metadata?.full_name?.split(' ')[0] || 'Admin';
       }
     }
 
@@ -89,6 +57,44 @@ export default async function DashboardPage() {
     if (!targetSchoolId) {
       throw new Error('Tenant context required. Please log in with an assigned school.');
     }
+
+    const schoolSettings = await getSchoolSettings(createAdminClient(), targetSchoolId);
+    schoolTimeZone = schoolSettings.timeZone;
+    academicTermLabel = schoolSettings.academicTermLabel;
+
+    // 1. Get current date range in school's configured timezone
+    const todayRange = getEATDayRange(now, schoolTimeZone);
+    const todayKey = todayRange.dateStr;
+
+    // 2. Calculate the 7 days of the current week (Monday through Sunday in school's timezone)
+    const [ty, tm, td] = todayKey.split('-').map(Number);
+    const anchorUtc = new Date(Date.UTC(ty, tm - 1, td, 12, 0, 0));
+    const dayOfWeek = anchorUtc.getUTCDay();
+    const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+    const mondayUtc = new Date(anchorUtc);
+    mondayUtc.setUTCDate(anchorUtc.getUTCDate() - daysSinceMonday);
+
+    const weekDaysData: { dayName: string; dateKey: string; dateLabel: string; startIso: string; endIso: string; isToday: boolean; isFuture: boolean }[] = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(mondayUtc);
+      d.setUTCDate(mondayUtc.getUTCDate() + i);
+      const dayRange = getEATDayRange(d, schoolTimeZone);
+      const isToday = dayRange.dateStr === todayKey;
+      const isFuture = dayRange.dateStr > todayKey;
+
+      weekDaysData.push({
+        dayName: dayNames[i],
+        dateKey: dayRange.dateStr,
+        dateLabel: formatEATDate(d, { month: 'short', day: 'numeric' }, schoolTimeZone),
+        startIso: dayRange.startIso,
+        endIso: dayRange.endIso,
+        isToday,
+        isFuture,
+      });
+    }
+
+    const weekStartIso = weekDaysData[0].startIso;
+    const weekEndIso = weekDaysData[6].endIso;
 
     const [
       { count: students },
@@ -155,25 +161,46 @@ export default async function DashboardPage() {
     todayLogs = todayLogsData || [];
     recentMessages = messagesData || [];
 
-    // Calculate unique student & teacher attendance for TODAY
-    const studentLogsMap = new Map<string, any>();
-    const teacherLogsMap = new Map<string, any>();
+    // Calculate unique student & teacher daily attendance across 2 daily slots
+    // (`1 check_in` + `1 check_out` MAX per person per day):
+    //   - Morning `check_in` establishes daily punctuality (`present` vs `late`)
+    //   - Evening `check_out` NEVER overwrites a morning `late` arrival to `present`
+    //   - Manual `absent` is NEVER counted as attended
+    const buildDailyPersonMap = (rows: any[], matchStudent: boolean) => {
+      const byPerson = new Map<string, { checkIn?: any; checkOut?: any; fallback?: any }>();
+      for (const log of rows) {
+        const personId = log.person_id || log.people?.id;
+        if (!personId) continue;
+        const role = log.people?.role || 'student';
+        const isStudent = role === 'student';
+        if (isStudent !== matchStudent) continue;
 
-    todayLogs.forEach(log => {
-      const personId = log.person_id || log.people?.id;
-      const role = log.people?.role || 'student';
-      if (personId) {
-        if (role === 'student') {
-          if (!studentLogsMap.has(personId) || log.status === 'present') {
-            studentLogsMap.set(personId, log);
-          }
+        const entry = byPerson.get(personId) || {};
+        if (log.attendance_type === 'check_in') {
+          entry.checkIn = log;
+        } else if (log.attendance_type === 'check_out') {
+          entry.checkOut = log;
         } else {
-          if (!teacherLogsMap.has(personId) || log.status === 'present') {
-            teacherLogsMap.set(personId, log);
-          }
+          entry.fallback = log;
+        }
+        byPerson.set(personId, entry);
+      }
+
+      const resolved = new Map<string, 'present' | 'late'>();
+      for (const [personId, entry] of byPerson.entries()) {
+        if (entry.checkIn && entry.checkIn.status !== 'absent') {
+          resolved.set(personId, entry.checkIn.status === 'late' ? 'late' : 'present');
+        } else if (entry.checkOut && entry.checkOut.status !== 'absent') {
+          resolved.set(personId, 'present');
+        } else if (entry.fallback && entry.fallback.status !== 'absent') {
+          resolved.set(personId, entry.fallback.status === 'late' ? 'late' : 'present');
         }
       }
-    });
+      return resolved;
+    };
+
+    const studentLogsMap = buildDailyPersonMap(todayLogs, true);
+    const teacherLogsMap = buildDailyPersonMap(todayLogs, false);
 
     // Class by class breakdown for TODAY
     if (classesData && classesData.length > 0 && studentsList) {
@@ -193,12 +220,9 @@ export default async function DashboardPage() {
         let lateToday = 0;
 
         enrolledIds.forEach(id => {
-          const stLog = studentLogsMap.get(id);
-          if (stLog) {
-            if (stLog.status === 'present') presentToday++;
-            else if (stLog.status === 'late') lateToday++;
-            else presentToday++;
-          }
+          const stStatus = studentLogsMap.get(id);
+          if (stStatus === 'present') presentToday++;
+          else if (stStatus === 'late') lateToday++;
         });
 
         const rate = enrolled > 0 ? Math.round(((presentToday + lateToday) / enrolled) * 100) : 0;
@@ -215,11 +239,11 @@ export default async function DashboardPage() {
       });
     }
 
-    // Calculate 7-Day Week Trend from weekLogsData
+    // Calculate 7-Day Week Trend from weekLogsData (unique students with non-absent attendance)
     const logsByDateKey = new Map<string, Set<string>>();
     (weekLogsData || []).forEach((l: any) => {
-      if ((l.people?.role || 'student') === 'student' && l.person_id) {
-        const key = getEATDateKey(l.occurred_at);
+      if ((l.people?.role || 'student') === 'student' && l.person_id && l.status !== 'absent') {
+        const key = getEATDateKey(l.occurred_at, schoolTimeZone);
         const set = logsByDateKey.get(key) || new Set<string>();
         set.add(l.person_id);
         logsByDateKey.set(key, set);
@@ -248,53 +272,70 @@ export default async function DashboardPage() {
     teacherCount = 0;
   }
 
-  // Student metrics for TODAY
+  // Unique student & staff daily counts (never double-counted across check_in + check_out!)
   let presentCount = 0;
   let lateCount = 0;
+  let teacherPresentCount = 0;
+  let teacherLateCount = 0;
 
-  todayLogs.forEach(l => {
-    const role = l.people?.role || 'student';
-    if (role === 'student') {
-      if (l.status === 'present') presentCount++;
-      else if (l.status === 'late') lateCount++;
+  {
+    const seenStudent = new Map<string, 'present' | 'late'>();
+    const seenTeacher = new Map<string, 'present' | 'late'>();
+    for (const l of todayLogs) {
+      const pid = l.person_id || l.people?.id;
+      if (!pid || l.status === 'absent') continue;
+      const role = l.people?.role || 'student';
+      const target = role === 'student' ? seenStudent : seenTeacher;
+      if (l.attendance_type === 'check_in') {
+        target.set(pid, l.status === 'late' ? 'late' : 'present');
+      } else if (!target.has(pid)) {
+        target.set(pid, l.status === 'late' ? 'late' : 'present');
+      }
     }
-  });
+    for (const st of seenStudent.values()) {
+      if (st === 'late') lateCount++;
+      else presentCount++;
+    }
+    for (const st of seenTeacher.values()) {
+      if (st === 'late') teacherLateCount++;
+      else teacherPresentCount++;
+    }
+  }
 
   const absentCount = Math.max(0, studentCount - (presentCount + lateCount));
   const presentPct = studentCount > 0 ? Number(((presentCount / studentCount) * 100).toFixed(1)) : 0;
   const latePct = studentCount > 0 ? Number(((lateCount / studentCount) * 100).toFixed(1)) : 0;
   const absentPct = studentCount > 0 ? Number(((absentCount / studentCount) * 100).toFixed(1)) : 0;
 
-  // Teacher metrics for TODAY
-  let teacherPresentCount = 0;
-  let teacherLateCount = 0;
-
-  todayLogs.forEach(l => {
-    const role = l.people?.role;
-    if (role === 'teacher' || role === 'admin' || role === 'support_staff') {
-      if (l.status === 'present') teacherPresentCount++;
-      else if (l.status === 'late') teacherLateCount++;
-    }
-  });
-
   const teacherAbsentCount = Math.max(0, teacherCount - (teacherPresentCount + teacherLateCount));
   const teacherPresentPct = teacherCount > 0 ? Number(((teacherPresentCount / teacherCount) * 100).toFixed(1)) : 0;
   const teacherLatePct = teacherCount > 0 ? Number(((teacherLateCount / teacherCount) * 100).toFixed(1)) : 0;
   const teacherAbsentPct = teacherCount > 0 ? Number(((teacherAbsentCount / teacherCount) * 100).toFixed(1)) : 0;
 
-  // Dynamic greeting
-  const hour = new Date().getHours();
+  // Dynamic greeting in school's configured timezone
+  const hourStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: schoolTimeZone,
+    hour: 'numeric',
+    hour12: false,
+  }).format(now);
+  const hour = parseInt(hourStr, 10) % 24;
   let greeting = 'Good afternoon';
   if (hour < 12) greeting = 'Good morning';
   else if (hour >= 17) greeting = 'Good evening';
 
   // Format date in uppercase Apple style e.g. MONDAY · 31 AUGUST 2026
-  const formattedDate = formatEATDate(now, {
-    weekday: 'long',
-    day: 'numeric',
-    month: 'long',
-    year: 'numeric'
-  }).toUpperCase().replace(',', ' ·');
+  const formattedDate = formatEATDate(
+    now,
+    {
+      weekday: 'long',
+      day: 'numeric',
+      month: 'long',
+      year: 'numeric',
+    },
+    schoolTimeZone
+  )
+    .toUpperCase()
+    .replace(',', ' ·');
 
   return (
     <DashboardClient 
@@ -320,6 +361,7 @@ export default async function DashboardPage() {
       greeting={greeting}
       adminName={adminName}
       formattedDate={formattedDate}
+      academicTermLabel={academicTermLabel}
     />
   );
 }

@@ -57,10 +57,31 @@ if (require.main === module) (async () => {
     if (process.env.MIG06 !== '0' && fs.existsSync(mig + '06_money_lockdown.sql')) await c.query(fs.readFileSync(mig + '06_money_lockdown.sql', 'utf8'));
     if (process.env.MIG05 !== '0' && process.env.MIG07 !== '0' && fs.existsSync(mig + '07_payment_hardening.sql')) await c.query(fs.readFileSync(mig + '07_payment_hardening.sql', 'utf8'));
     if (process.env.MIG05 !== '0' && process.env.MIG07 !== '0' && process.env.MIG08 !== '0' && fs.existsSync(mig + '08_payment_retry_dedupe.sql')) await c.query(fs.readFileSync(mig + '08_payment_retry_dedupe.sql', 'utf8'));
+    if (process.env.MIG05 !== '0' && process.env.MIG07 !== '0' && process.env.MIG08 !== '0' && process.env.MIG11 !== '0' && fs.existsSync(mig + '11_round13_money_integrity.sql')) {
+      await c.query(fs.readFileSync(mig + '11_round13_money_integrity.sql', 'utf8'));
+    }
     console.log('RLS migrations applied');
   }
   if (process.env.MIG09 !== '0' && fs.existsSync(mig + '09_attendance_duplicate_guard.sql')) {
     await c.query(fs.readFileSync(mig + '09_attendance_duplicate_guard.sql', 'utf8'));
+  }
+  if (process.env.MIG10 !== '0' && fs.existsSync(mig + '10_round12_production_hardening.sql')) {
+    await c.query(fs.readFileSync(mig + '10_round12_production_hardening.sql', 'utf8'));
+  }
+  if (process.env.RLS === '1' && process.env.MIG06 !== '0' && process.env.MIG12 !== '0' && fs.existsSync(mig + '12_school_settings.sql')) {
+    await c.query(fs.readFileSync(mig + '12_school_settings.sql', 'utf8'));
+  }
+  if (process.env.MIG09 !== '0' && process.env.MIG13 !== '0' && fs.existsSync(mig + '13_two_daily_punches_guard.sql')) {
+    await c.query(fs.readFileSync(mig + '13_two_daily_punches_guard.sql', 'utf8'));
+  }
+  if (process.env.RLS === '1' && process.env.MIG14 !== '0' && fs.existsSync(mig + '14_rbac_audit_immutability_hardening.sql')) {
+    await c.query(fs.readFileSync(mig + '14_rbac_audit_immutability_hardening.sql', 'utf8'));
+  }
+  if (process.env.MIG15 !== '0' && fs.existsSync(mig + '15_align_sms_dispatch_schema.sql')) {
+    await c.query(fs.readFileSync(mig + '15_align_sms_dispatch_schema.sql', 'utf8'));
+  }
+  if (process.env.MIG16 !== '0' && fs.existsSync(mig + '16_refund_sms_charge.sql')) {
+    await c.query(fs.readFileSync(mig + '16_refund_sms_charge.sql', 'utf8'));
   }
   console.log('seeded');
   await c.end();

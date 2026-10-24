@@ -1,6 +1,7 @@
 import { DeviceAdapter, DeviceRecord, AttendanceEvent, EnrollPersonInput, EnrollCommandResult, HandshakeResponse } from '../types';
 import { isAuthorizedDevice } from '../metadata';
 import { formatZKTecoDisplayName } from '@/utils/zkteco/formatter';
+import { parseLocalDateTimeInZone } from '@/lib/eat-time';
 
 export class ZKTecoAdmsAdapter implements DeviceAdapter {
   readonly deviceType = 'zkteco_adms';
@@ -105,8 +106,9 @@ export class ZKTecoAdmsAdapter implements DeviceAdapter {
       
       let logDate: Date;
       try {
+        const deviceTz = device.config?.timeZone || 'Africa/Kampala';
         if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(:\d{2})?$/.test(datetimeStr.trim())) {
-          logDate = new Date(datetimeStr.trim().replace(' ', 'T') + '+03:00');
+          logDate = parseLocalDateTimeInZone(datetimeStr.trim(), deviceTz);
         } else {
           logDate = new Date(datetimeStr);
         }
@@ -145,11 +147,14 @@ export class ZKTecoAdmsAdapter implements DeviceAdapter {
     person: EnrollPersonInput,
     device?: DeviceRecord
   ): EnrollCommandResult {
-    const displayName = formatZKTecoDisplayName({
-      full_name: person.fullName,
-      role: person.role as any,
-      classes: person.className ? { name: person.className } : null
-    });
+    const displayName = formatZKTecoDisplayName(
+      {
+        full_name: person.fullName,
+        role: person.role as any,
+        classes: person.className ? { name: person.className } : null
+      },
+      person.lcdOptions
+    );
 
     const pri = person.role === 'admin' ? 14 : 0;
     const cleanPin = person.pin.trim().replace(/[\t\r\n=]/g, '');

@@ -5,9 +5,32 @@ import { createAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 import { getOwnedClass, getOwnedDeviceBySerial, isUuid, normalizeSerial } from '@/lib/tenant';
+import { consumeRateLimit } from '@/lib/security/rate-limit';
+import { getClientIp } from '@/lib/security/request';
+import { getSchoolSettings } from '@/lib/school-settings';
 
 const DEVICE_TYPES = ['zkteco_adms', 'hikvision_isapi', 'suprema_biostar', 'dahua_isapi', 'generic_webhook'];
 const PUSH_CATEGORIES = ['all', 'teachers', 'support_staff', 'all_students', 'class'];
+const DEFAULT_MAX_DEVICES_PER_SCHOOL = 20;
+const ADD_DEVICE_WINDOW_MS = 10 * 60 * 1000;
+
+function resolveMaxDevicesPerSchool(): number {
+  const raw = process.env.MAX_DEVICES_PER_SCHOOL;
+  if (raw !== undefined && raw.trim() !== '') {
+    const parsed = Number.parseInt(raw.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_MAX_DEVICES_PER_SCHOOL;
+}
+
+function resolveAddDeviceRateLimit(): number {
+  const raw = process.env.ADD_DEVICE_MAX_PER_10_MIN;
+  if (raw !== undefined && raw.trim() !== '') {
+    const parsed = Number.parseInt(raw.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 10;
+}
 
 function isValidTimeZone(tz: string) {
   try {
@@ -48,33 +71,60 @@ async function resolveSchoolId(supabase: any, userId: string): Promise<string | 
 }
 
 export async function addDeviceAction(formData: FormData) {
-  const serialNumber = formData.get('serialNumber') as string;
-  const label = formData.get('label') as string;
-  const ipAddress = (formData.get('ipAddress') as string) || null;
-  const deviceType = ((formData.get('deviceType') as string) || 'zkteco_adms').trim();
-  const rawSecret = (formData.get('deviceSecret') as string)?.trim() || null;
-  const lateCutoff = (formData.get('lateCutoff') as string)?.trim() || '08:00';
-  const timeZone = (formData.get('timeZone') as string)?.trim() || 'Africa/Kampala';
-
-  if (!serialNumber || !serialNumber.trim()) {
-    return { error: 'Device Serial Number is required.' };
-  }
-  if (!normalizeSerial(serialNumber)) {
-    return { error: 'Serial Number may only contain letters, digits, ".", "_" or "-" (max 64).' };
-  }
-  if (!DEVICE_TYPES.includes(deviceType)) {
-    return { error: 'Unsupported device type.' };
-  }
-  if (rawSecret && rawSecret.length < 16) {
-    return { error: 'Custom device secrets must be at least 16 characters (leave blank to auto-generate).' };
-  }
-  if (!isValidTimeZone(timeZone)) {
-    return { error: 'Invalid time zone.' };
-  }
-
   try {
     const { schoolId } = await requireSchoolAdmin();
+    const serialNumber = formData.get('serialNumber') as string;
+    const label = formData.get('label') as string;
+    const ipAddress = (formData.get('ipAddress') as string) || null;
+    const deviceType = ((formData.get('deviceType') as string) || 'zkteco_adms').trim();
+    const rawSecret = (formData.get('deviceSecret') as string)?.trim() || null;
+    const rawLateCutoff = (formData.get('lateCutoff') as string)?.trim() || '';
+    const rawTimeZone = (formData.get('timeZone') as string)?.trim() || '';
+
+    if (!serialNumber || !serialNumber.trim()) {
+      return { error: 'Device Serial Number is required.' };
+    }
+    if (!normalizeSerial(serialNumber)) {
+      return { error: 'Serial Number may only contain letters, digits, ".", "_" or "-" (max 64).' };
+    }
+    if (!DEVICE_TYPES.includes(deviceType)) {
+      return { error: 'Unsupported device type.' };
+    }
+    if (rawSecret && rawSecret.length < 16) {
+      return { error: 'Custom device secrets must be at least 16 characters (leave blank to auto-generate).' };
+    }
+    if (rawTimeZone && !isValidTimeZone(rawTimeZone)) {
+      return { error: 'Invalid time zone.' };
+    }
+
+    const ip = await getClientIp();
+    const maxAttempts = resolveAddDeviceRateLimit();
+    const schoolRl = consumeRateLimit(`add-device:school:${schoolId}`, maxAttempts, ADD_DEVICE_WINDOW_MS);
+    const ipRl = consumeRateLimit(`add-device:ip:${ip}`, maxAttempts * 2, ADD_DEVICE_WINDOW_MS);
+    if (!schoolRl.allowed || !ipRl.allowed) {
+      const waitSecs = Math.max(schoolRl.retryAfterSeconds, ipRl.retryAfterSeconds);
+      return {
+        error: `Too many device registration attempts. Please try again in ${Math.max(1, Math.ceil(waitSecs / 60))} minute(s).`,
+      };
+    }
+
     const adminClient = createAdminClient();
+
+    // Enforce per-school device quota BEFORE querying global serials (prevents unlimited serial enumeration too)
+    const maxDevices = resolveMaxDevicesPerSchool();
+    const { data: schoolDevices, error: quotaErr } = await adminClient
+      .from('devices')
+      .select('id')
+      .eq('school_id', schoolId);
+
+    if (quotaErr) {
+      return { error: 'Unable to verify school device quota. Please try again.' };
+    }
+    if ((schoolDevices?.length ?? 0) >= maxDevices) {
+      return {
+        error: `Device quota reached (maximum ${maxDevices} device(s) per school). Remove or deactivate an unused device, or contact support.`,
+      };
+    }
 
     // Check if device serial already exists
     const cleanSerial = normalizeSerial(serialNumber) as string;
@@ -93,12 +143,18 @@ export async function addDeviceAction(formData: FormData) {
     const secretToSave = rawSecret || generateDeviceSecret();
     const secretHashToSave = hashDeviceSecret(secretToSave);
 
-    const [lateH, lateM] = lateCutoff.split(':').map(n => parseInt(n, 10));
-    const config = {
-      lateCutoffHour: isNaN(lateH) || lateH < 0 || lateH > 23 ? 8 : lateH,
-      lateCutoffMinute: isNaN(lateM) || lateM < 0 || lateM > 59 ? 0 : lateM,
-      timeZone: timeZone || 'Africa/Kampala',
-    };
+    // Leave overrides omitted when blank so devices inherit live School Settings updates automatically
+    const config: Record<string, any> = {};
+    if (rawLateCutoff) {
+      const [lateH, lateM] = rawLateCutoff.split(':').map(n => parseInt(n, 10));
+      if (!isNaN(lateH) && lateH >= 0 && lateH <= 23 && !isNaN(lateM) && lateM >= 0 && lateM <= 59) {
+        config.lateCutoffHour = lateH;
+        config.lateCutoffMinute = lateM;
+      }
+    }
+    if (rawTimeZone) {
+      config.timeZone = rawTimeZone;
+    }
 
     const baseRecord = {
       school_id: schoolId,
@@ -289,6 +345,13 @@ export async function getDevicePushCandidatesAction(options: PushDeviceTargetOpt
       return { error: error.message || 'Failed to fetch candidate people.' };
     }
 
+    const schoolSettings = await getSchoolSettings(adminClient, schoolId);
+    const lcdOptions = {
+      prefixTeacher: schoolSettings.lcdPrefixTeacher,
+      prefixAdmin: schoolSettings.lcdPrefixAdmin,
+      prefixSupport: schoolSettings.lcdPrefixSupport,
+      showStudentClass: schoolSettings.lcdShowStudentClass,
+    };
     const { formatZKTecoDisplayName } = await import('@/utils/zkteco/formatter');
 
     const formattedCandidates = (people || []).map((p: any) => ({
@@ -297,11 +360,14 @@ export async function getDevicePushCandidatesAction(options: PushDeviceTargetOpt
       role: p.role,
       device_user_id: p.device_user_id,
       className: p.classes?.name || null,
-      formattedName: formatZKTecoDisplayName({
-        full_name: p.full_name,
-        role: p.role,
-        classes: p.classes
-      })
+      formattedName: formatZKTecoDisplayName(
+        {
+          full_name: p.full_name,
+          role: p.role,
+          classes: p.classes
+        },
+        lcdOptions
+      )
     }));
 
     const withPin = formattedCandidates.filter(p => !!p.device_user_id);
@@ -392,6 +458,14 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
       };
     }
 
+    const schoolSettings = await getSchoolSettings(adminClient, schoolId);
+    const lcdOptions = {
+      prefixTeacher: schoolSettings.lcdPrefixTeacher,
+      prefixAdmin: schoolSettings.lcdPrefixAdmin,
+      prefixSupport: schoolSettings.lcdPrefixSupport,
+      showStudentClass: schoolSettings.lcdShowStudentClass,
+    };
+
     const { enqueueDeviceCommand, enqueuePersonEnrollmentForSchool } = await import('@/utils/zkteco/commandQueue');
     const { getDeviceAdapter } = await import('@/lib/devices/registry');
     const { parseDeviceMetadata } = await import('@/lib/devices/metadata');
@@ -414,7 +488,8 @@ export async function pushUsersToDeviceAction(options: PushDeviceTargetOptions) 
         pin: p.device_user_id.trim(),
         fullName: p.full_name,
         role: p.role as any,
-        className: (p.classes as any)?.name || null
+        className: (p.classes as any)?.name || null,
+        lcdOptions,
       };
 
       if (targetDevice && targetAdapter) {
@@ -468,6 +543,14 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
     if ('error' in validation) return { error: validation.error };
     if (validation.schoolName) schoolName = validation.schoolName;
 
+    const schoolSettings = await getSchoolSettings(adminClient, schoolId);
+    const lcdOptions = {
+      prefixTeacher: schoolSettings.lcdPrefixTeacher,
+      prefixAdmin: schoolSettings.lcdPrefixAdmin,
+      prefixSupport: schoolSettings.lcdPrefixSupport,
+      showStudentClass: schoolSettings.lcdShowStudentClass,
+    };
+
     // 1. Fetch all people in school to find highest existing numeric PIN
     const { data: allSchoolPeople } = await adminClient
       .from('people')
@@ -475,7 +558,7 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
       .eq('school_id', schoolId);
 
     const existingPins = new Set<string>();
-    let maxNumericPin = 100;
+    let maxNumericPin = Math.max(0, schoolSettings.startingBiometricPin - 1);
 
     (allSchoolPeople || []).forEach(p => {
       if (p.device_user_id) {
@@ -548,11 +631,14 @@ export async function autoAssignDevicePinsAction(options: PushDeviceTargetOption
         .eq('school_id', schoolId);
 
       // Enqueue sync command to terminal
-      const displayName = formatZKTecoDisplayName({
-        full_name: p.full_name,
-        role: p.role as any,
-        classes: p.classes as any
-      });
+      const displayName = formatZKTecoDisplayName(
+        {
+          full_name: p.full_name,
+          role: p.role as any,
+          classes: p.classes as any
+        },
+        lcdOptions
+      );
 
       const pri = p.role === 'admin' ? 14 : 0;
       const cmd = `DATA UPDATE USERINFO PIN=${assignedPin}\tName=${displayName}\tPri=${pri}`;

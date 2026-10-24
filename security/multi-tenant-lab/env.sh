@@ -6,3 +6,5 @@ export NAJIKI_API_KEY=lab-najiki-secret
 export NEXT_TELEMETRY_DISABLED=1
 export NAJIKI_API_URL=http://127.0.0.1:54321/__najiki/payments
 export TOPUP_MAX_PER_10_MIN=1000
+export TRUSTED_PROXY_HOPS=1
+

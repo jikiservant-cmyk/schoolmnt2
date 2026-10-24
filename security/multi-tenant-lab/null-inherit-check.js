@@ -20,15 +20,21 @@ const { IDS } = require('./seed.js');
     ok('A insert with NULL school pointing at B device is rejected', false, 'inserted!');
   } catch (e) { ok('A insert with NULL school pointing at B device is rejected', true, e.message); }
   await c.query('ROLLBACK');
-  // 3. Admin A with NULL school pointing at its own device -> allowed, gets A.
+  // 3. Admin A with NULL school pointing at its own device: since migration 14
+  //    device_logs is a server-only audit table (finding PT-11), so even the
+  //    school's own admin must be refused. The NULL-inheritance trigger itself
+  //    is still verified below through the service role the app actually uses.
   await c.query('BEGIN');
   await c.query('SET LOCAL ROLE authenticated');
   await c.query("SELECT set_config('request.jwt.claims', $1, true)", [JSON.stringify({ sub: IDS.A.admin, role: 'authenticated' })]);
   try {
-    const x = await c.query("INSERT INTO school.device_logs(device_id, raw_data) VALUES ($1, 'A-null-own') RETURNING school_id", [IDS.A.device]);
-    ok('A insert with NULL school on own device gets school A', x.rows[0].school_id === IDS.A.school, x.rows[0].school_id);
-  } catch (e) { ok('A insert with NULL school on own device gets school A', false, e.message); }
+    await c.query("INSERT INTO school.device_logs(device_id, raw_data) VALUES ($1, 'A-null-own')", [IDS.A.device]);
+    ok('A insert into own device_logs is refused (server-only audit table, migration 14)', false, 'inserted!');
+  } catch (e) { ok('A insert into own device_logs is refused (server-only audit table, migration 14)', true, e.message); }
   await c.query('ROLLBACK');
+  // 3b. The app's server path (service role) still inherits school A correctly.
+  const y = await c.query("INSERT INTO school.device_logs(device_id, raw_data) VALUES ($1, 'svc-null-own') RETURNING school_id", [IDS.A.device]);
+  ok('service insert with NULL school on A device gets school A', y.rows[0].school_id === IDS.A.school, y.rows[0].school_id);
   console.log(`\n${pass} passed, ${fail} failed`);
   await c.end();
   process.exit(fail ? 1 : 0);

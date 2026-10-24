@@ -6,9 +6,17 @@ import { createPublicAdminClient } from '@/utils/supabase/admin';
 import { requireSchoolAdmin } from '@/lib/auth-guard';
 import { revalidatePath } from 'next/cache';
 import { createAdminClient } from '@/utils/supabase/admin';
-import { getOwnedPerson } from '@/lib/tenant';
-import { loadSchoolWallet, isMissingTable, legacyBalanceUsable } from '@/lib/payments/wallet';
+import { getOwnedPerson, UUID_RE } from '@/lib/tenant';
+import { loadSchoolWallet, isMissingFunction, isMissingTable, legacyBalanceUsable } from '@/lib/payments/wallet';
 import { consumeRateLimit } from '@/lib/security/rate-limit';
+import { createKioskCapabilityToken } from '@/lib/security/register-token';
+import { getEATDayRange } from '@/lib/eat-time';
+import {
+  getEatTodayRange,
+  getAttendanceStatusForCheckIn,
+  getCurrentAttendanceWindowMode,
+} from '@/lib/attendance-window';
+import { getSchoolSettings } from '@/lib/school-settings';
 
 async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<string | null> {
   // 1. Try auth_school_id RPC
@@ -46,6 +54,8 @@ async function getEffectiveSchoolId(supabase: any, userId?: string): Promise<str
 export async function getAttendanceData(dateFilterStr?: string) {
   try {
     const { supabase, schoolId } = await requireSchoolAdmin();
+    const adminClient = createAdminClient();
+    const schoolSettings = await getSchoolSettings(adminClient, schoolId);
     
     // 1. Get attendance logs strictly scoped to this school
   let logs: any[] = [];
@@ -71,9 +81,8 @@ export async function getAttendanceData(dateFilterStr?: string) {
     .order('occurred_at', { ascending: false });
     
   if (dateFilterStr) {
-    // Expecting YYYY-MM-DD
-    const startIso = `${dateFilterStr}T00:00:00+03:00`; // EAT Start
-    const endIso = `${dateFilterStr}T23:59:59+03:00`;   // EAT End
+    // Expecting YYYY-MM-DD in school's configured timezone
+    const { startIso, endIso } = getEATDayRange(dateFilterStr, schoolSettings.timeZone);
     query = query.gte('occurred_at', startIso).lte('occurred_at', endIso).limit(2000);
   } else {
     query = query.limit(500);
@@ -133,23 +142,34 @@ export async function getAttendanceData(dateFilterStr?: string) {
       const wallet = await loadSchoolWallet(publicAdmin, school.id);
 
       if (wallet && wallet.balance !== null && wallet.balance !== undefined) {
+        const parsedBal = Number(wallet.balance);
         const curSettings = school.settings || {};
-        school.settings = { ...curSettings, balance: Number(wallet.balance) };
-      } else if (!(await legacyBalanceUsable(createAdminClient(), school.id))) {
-        // No wallet row, but the school was credited before: the legacy
+        school.settings = { ...curSettings, balance: Number.isFinite(parsedBal) ? Math.max(0, parsedBal) : 0 };
+      } else if (!(await legacyBalanceUsable(createAdminClient(), school.id, school.settings))) {
+        // No wallet row, or wallet was already migrated / credited before: the legacy
         // settings.balance is a stale mirror, never show it as spendable.
         school.settings = { ...(school.settings || {}), balance: 0 };
+      } else {
+        const parsedLegacy = Number(school.settings?.balance ?? 0);
+        school.settings = { ...(school.settings || {}), balance: Number.isFinite(parsedLegacy) ? Math.max(0, parsedLegacy) : 0 };
       }
     } catch (e) {
       console.warn('Notice loading balance from public.wallets:', e);
+      if (school.settings?.wallet_migrated === true) {
+        school.settings = { ...(school.settings || {}), balance: 0 };
+      }
     }
   }
+
+    const kioskToken = await createKioskCapabilityToken({ schoolId });
 
     return {
       logs: logs || [],
       school,
       classes: classes || [],
       people: people || [],
+      kioskToken,
+      schoolSettings,
       error: undefined as string | undefined
     };
   } catch (err: any) {
@@ -165,11 +185,12 @@ export async function getAttendanceData(dateFilterStr?: string) {
 
 export async function recordTeacherAttendance(personId: string, status?: 'present' | 'late' | 'excused') {
   try {
-    const { supabase, schoolId } = await requireSchoolAdmin();
+    const { schoolId } = await requireSchoolAdmin();
+    const adminClient = createAdminClient();
 
     // MULTI-TENANT: the person must belong to this school (previously any
     // person UUID was accepted and logged under the caller's school_id).
-    const person = await getOwnedPerson(createAdminClient(), schoolId, personId, ['teacher', 'support_staff', 'admin']);
+    const person = await getOwnedPerson(adminClient, schoolId, personId, ['teacher', 'support_staff', 'admin']);
     if (!person) {
       return { error: 'Staff member not found in your school.' };
     }
@@ -177,25 +198,63 @@ export async function recordTeacherAttendance(personId: string, status?: 'presen
       return { error: 'Invalid attendance status.' };
     }
 
+    const schoolSettings = await getSchoolSettings(adminClient, schoolId);
     const now = new Date();
-    // Default rule: if checking in after 08:30 AM East Africa Time, mark as late unless specified
-    const eatHours = (now.getUTCHours() + 3) % 24;
-    const eatMinutes = now.getUTCMinutes();
-    const isLate = eatHours > 8 || (eatHours === 8 && eatMinutes > 30);
-    const finalStatus = status || (isLate ? 'late' : 'present');
+    const { startIso, endIso } = getEatTodayRange(now, schoolSettings.timeZone);
+    const sessionType = getCurrentAttendanceWindowMode(now, {
+      timeZone: schoolSettings.timeZone,
+      afternoonSwitchoverTime: schoolSettings.afternoonSwitchoverTime,
+    });
+    const computedStatus = sessionType === 'check_in'
+      ? getAttendanceStatusForCheckIn(now, {
+          timeZone: schoolSettings.timeZone,
+          role: person.role,
+          staffLateCutoff: schoolSettings.staffLateCutoff,
+        })
+      : 'present';
+    const finalStatus = status || computedStatus;
 
-    const { data, error } = await supabase
+    // Update existing session record in-place if already marked this morning/evening so max 2 rows/day holds
+    const { data: existingRow } = await adminClient
       .from('attendance_logs')
-      .insert({
-        school_id: schoolId,
-        person_id: personId,
-        status: finalStatus,
-        attendance_type: 'check_in',
-        source: 'manual',
-        occurred_at: now.toISOString()
-      })
-      .select()
+      .select('id')
+      .eq('school_id', schoolId)
+      .eq('person_id', personId)
+      .eq('attendance_type', sessionType)
+      .gte('occurred_at', startIso)
+      .lte('occurred_at', endIso)
+      .limit(1)
       .maybeSingle();
+
+    let data: any = null;
+    let error: any = null;
+
+    if (existingRow?.id) {
+      const upd = await adminClient
+        .from('attendance_logs')
+        .update({ status: finalStatus, occurred_at: now.toISOString() })
+        .eq('id', existingRow.id)
+        .eq('school_id', schoolId)
+        .select()
+        .maybeSingle();
+      data = upd.data;
+      error = upd.error;
+    } else {
+      const ins = await adminClient
+        .from('attendance_logs')
+        .insert({
+          school_id: schoolId,
+          person_id: personId,
+          status: finalStatus,
+          attendance_type: sessionType,
+          source: 'manual',
+          occurred_at: now.toISOString()
+        })
+        .select()
+        .maybeSingle();
+      data = ins.data;
+      error = ins.error;
+    }
 
     if (error) {
       return { error: error.message };
@@ -222,7 +281,8 @@ export async function getSchoolBalance() {
     let walletBalance: number | null = null;
     const wallet = await loadSchoolWallet(publicAdmin, schoolId);
     if (wallet && wallet.balance !== null && wallet.balance !== undefined) {
-      walletBalance = Number(wallet.balance);
+      const parsed = Number(wallet.balance);
+      walletBalance = Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
     }
 
     // Also check school settings balance
@@ -232,9 +292,11 @@ export async function getSchoolBalance() {
       .eq('id', schoolId)
       .maybeSingle();
 
-    const settingsBalance = walletBalance === null && schoolRecord?.settings?.balance !== undefined
-      && (await legacyBalanceUsable(createAdminClient(), schoolId))
-      ? Number(schoolRecord.settings.balance) : null;
+    const rawLegacy = schoolRecord?.settings?.balance;
+    const parsedLegacy = rawLegacy !== undefined && rawLegacy !== null ? Number(rawLegacy) : NaN;
+    const settingsBalance = walletBalance === null && Number.isFinite(parsedLegacy)
+      && (await legacyBalanceUsable(createAdminClient(), schoolId, schoolRecord?.settings))
+      ? Math.max(0, parsedLegacy) : null;
 
     const resolvedBalance = walletBalance !== null ? walletBalance : (settingsBalance !== null ? settingsBalance : 0);
 
@@ -260,7 +322,26 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
     if (typeof phoneNumber !== 'string' || !/^\+?[0-9\s\-().]{9,20}$/.test(phoneNumber)) {
       return { error: 'Please enter a valid mobile money phone number.' };
     }
+    // Validate actual numeric MSISDN digits BEFORE consuming rate limits or creating intents
+    // (blocks whitespace/punctuation-only strings like "         " or "---------").
+    let rawPhone = phoneNumber.replace(/[\s\-().]/g, '');
+    if (rawPhone.startsWith('+')) {
+      rawPhone = rawPhone.slice(1);
+    }
+    let formattedPhoneNumeric = rawPhone;
+    if (rawPhone.startsWith('0')) {
+      formattedPhoneNumeric = `256${rawPhone.slice(1)}`;
+    } else if (!rawPhone.startsWith('256') && rawPhone.length === 9) {
+      formattedPhoneNumeric = `256${rawPhone}`;
+    }
+    if (!/^[1-9][0-9]{8,14}$/.test(formattedPhoneNumeric)) {
+      return { error: 'Please enter a valid mobile money phone number.' };
+    }
+
     const userData = { user };
+    if (!userData.user?.id || !UUID_RE.test(userData.user.id)) {
+      return { error: 'Unauthorized user session.' };
+    }
 
     // Each top-up sends a Mobile Money PIN prompt to a phone: cap how often a
     // school can start one (stops prompt-spamming a phone number).
@@ -280,7 +361,7 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
     return { error: 'School record not found.' };
   }
 
-  // 1. Resolve tenant code strictly from the database (public.tenants or public.profiles)
+  // 1. Resolve tenant code strictly from the database (public.tenants or same-school public.profiles)
   let tenantCode = "";
   
   try {
@@ -300,13 +381,27 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
 
   if (!tenantCode) {
     try {
-      // Secondary: Check public.profiles where user matches
-      const { data: profileByUser } = await publicAdmin
+      // Secondary: Check public.profiles without raw .or() interpolation and verify same-tenant ownership
+      const { data: byId } = await publicAdmin
         .from('profiles')
-        .select('code')
-        .or(`id.eq.${userData.user.id},user_id.eq.${userData.user.id}`)
+        .select('code, school_id')
+        .eq('id', userData.user.id)
         .not('code', 'is', null)
         .maybeSingle();
+      const { data: byUserId } = byId
+        ? { data: null }
+        : await publicAdmin
+            .from('profiles')
+            .select('code, school_id')
+            .eq('user_id', userData.user.id)
+            .not('code', 'is', null)
+            .maybeSingle();
+      const profileByUser = byId || byUserId;
+
+      if (profileByUser?.school_id && String(profileByUser.school_id).toLowerCase() !== school.id.toLowerCase()) {
+        console.warn(`[NaJiki STK Push] Refused cross-tenant profile code on school ${school.id}`);
+        return { error: 'Tenant configuration mismatch for your school account. Please contact support.' };
+      }
 
       if (profileByUser?.code && profileByUser.code.trim() !== '') {
         tenantCode = profileByUser.code;
@@ -330,20 +425,7 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   //    arrives. Pre-creating them here raced on double-click and produced
   //    duplicate wallets that hid the real balance.)
 
-  // 3. Clean and standardize phone number
-  // Removes spaces, hyphens, brackets
-  let rawPhone = phoneNumber.replace(/[\s\-\(\)\.]/g, '');
-  if (rawPhone.startsWith('+')) {
-    rawPhone = rawPhone.slice(1);
-  }
-  
-  let formattedPhoneNumeric = rawPhone;
-  if (rawPhone.startsWith('0')) {
-    formattedPhoneNumeric = `256${rawPhone.slice(1)}`;
-  } else if (!rawPhone.startsWith('256') && rawPhone.length === 9) {
-    formattedPhoneNumeric = `256${rawPhone}`;
-  }
-
+  // 3. Phone formats derived from already-validated formattedPhoneNumeric
   const phoneWithPlus = `+${formattedPhoneNumeric}`;
   const phoneLocal07 = formattedPhoneNumeric.startsWith('256') 
     ? `0${formattedPhoneNumeric.slice(3)}` 
@@ -354,26 +436,43 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   const idempotencyKey = `sch_topup_${crypto.randomUUID()}`;
 
   // 5. Determine NaJiki API Endpoint
-  let endpointUrl = process.env.NAJIKI_API_URL;
+  let endpointUrl = process.env.NAJIKI_API_URL?.trim();
   if (!endpointUrl && process.env.NAJIKI_DOMAIN) {
-    const domain = process.env.NAJIKI_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    const domain = process.env.NAJIKI_DOMAIN.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
     endpointUrl = `https://${domain}/api/payments`;
   }
   if (!endpointUrl) {
     endpointUrl = 'https://najiki.vercel.app/api/payments';
   }
 
-  const apiKey = process.env.NAJIKI_API_KEY;
+  const apiKey = process.env.NAJIKI_API_KEY?.trim();
   if (!apiKey) {
     console.error('[NaJiki STK Push] NAJIKI_API_KEY is not configured.');
     return { error: 'Mobile Money payments are not configured. Please contact support.' };
   }
-  const appCode = process.env.NAJIKI_APP_CODE || "school";
+  const appCode = (process.env.NAJIKI_APP_CODE || "school").trim();
+
+  // NaJiki classifies every payment by paymentTypeCode, and the classification
+  // decides whose credentials take the money:
+  //
+  //   * a PLATFORM FEE code (najiki-finance2 src/lib/constants.ts
+  //     PLATFORM_FEE_TYPES) is charged on the platform's LivePay account —
+  //     this is what an SMS-credit top-up is. `BUY_SMS` is the code NaJiki
+  //     itself seeds for "SMS credits top-up (platform fee)".
+  //   * anything else is treated as a TENANT COLLECTION, which demands
+  //     per-tenant gateway credentials for that school and returns
+  //     503 "Tenant ... has no active credentials configured" when it has
+  //     none (najiki-finance2 src/lib/payment-intent-handler.ts).
+  //
+  // This used to send "general", which is not in PLATFORM_FEE_TYPES, so every
+  // school top-up was routed down the tenant-collection path and failed for
+  // schools without their own LivePay credentials.
+  const paymentTypeCode = (process.env.NAJIKI_PAYMENT_TYPE_CODE || "BUY_SMS").trim();
 
   // Build clean, full-spec STK push payload for NaJiki
   const payload = {
     applicationCode: appCode,
-    paymentTypeCode: "general",
+    paymentTypeCode: paymentTypeCode,
     tenantCode: tenantCode,
     tenant_code: tenantCode,
     code: tenantCode,
@@ -400,50 +499,81 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
       tenant_code: tenantCode,
       code: tenantCode,
       amount: Number(amount),
-      idempotencyKey: idempotencyKey
+      idempotencyKey: idempotencyKey,
+      // Echoed back on the completion notification; kept inside metadata so a
+      // reconciliation report can group top-ups by NaJiki's own classification.
+      paymentTypeCode: paymentTypeCode,
     }
   };
 
-  // 6. Record the top-up BEFORE asking for money. The payment webhook only
-  //    credits payments that match one of these (school, amount, reference).
+  // 6. Record the top-up atomically BEFORE asking for money.
+  //    Uses advisory-locked RPC school.create_payment_intent (migration 11) so
+  //    concurrent requests across multiple instances cannot race past maxTopUps.
   const adminSchool = createAdminClient();
-
-  // Durable limit: the in-memory counter above is per server instance, so
-  // with several instances (or after a restart) it can be bypassed. The
-  // intents table is shared by every instance.
-  const since = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-  const { data: recent, error: recentErr } = await adminSchool
-    .from('payment_intents')
-    .select('id')
-    .eq('school_id', school.id)
-    .gte('created_at', since)
-    .limit(maxTopUps);
-  if (!recentErr && (recent?.length ?? 0) >= maxTopUps) {
-    return { error: 'Too many top-up attempts. Please wait 10 minute(s) and try again.' };
-  }
-  if (recentErr && !isMissingTable(recentErr)) {
-    console.error('[NaJiki STK Push] Could not check recent top-ups:', recentErr.message);
-    return { error: 'Could not start the payment. Please try again.' };
-  }
-
   let intentRecorded = false;
-  const { error: intentErr } = await adminSchool.from('payment_intents').insert({
-    school_id: school.id,
-    reference: idempotencyKey,
-    amount,
-    currency: 'UGX',
-    phone: formattedPhoneNumeric,
-    created_by: userData.user.id,
+
+  const { data: intentRpc, error: intentRpcErr } = await adminSchool.rpc('create_payment_intent', {
+    p_school_id: school.id,
+    p_reference: idempotencyKey,
+    p_amount: amount,
+    p_currency: 'UGX',
+    p_phone: formattedPhoneNumeric,
+    p_created_by: userData.user.id,
+    p_max_per_10m: maxTopUps,
   });
-  if (!intentErr) {
-    intentRecorded = true;
-  } else if (isMissingTable(intentErr)) {
-    // FAIL CLOSED: without migration 05 a paid top-up cannot be matched and
-    // credited safely, so don't take the parent's / school's money at all.
+
+  if (!intentRpcErr && intentRpc && typeof intentRpc === 'object') {
+    const outcome = (intentRpc as any).outcome;
+    if (outcome === 'created') {
+      intentRecorded = true;
+    } else if (outcome === 'rate_limited') {
+      return { error: 'Too many top-up attempts. Please wait 10 minute(s) and try again.' };
+    } else if (outcome === 'invalid_phone') {
+      return { error: 'Please enter a valid mobile money phone number.' };
+    } else if (outcome === 'invalid_amount') {
+      return { error: 'Top-up amount must be a whole number between 1 and 10,000,000 UGX.' };
+    } else {
+      return { error: 'Could not start the payment. Please try again.' };
+    }
+  } else if (isMissingFunction(intentRpcErr)) {
+    // Fallback when migration 11 is not yet applied (migrations 05–10 only)
+    const since = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const { data: recent, error: recentErr } = await adminSchool
+      .from('payment_intents')
+      .select('id')
+      .eq('school_id', school.id)
+      .gte('created_at', since)
+      .limit(maxTopUps);
+    if (!recentErr && (recent?.length ?? 0) >= maxTopUps) {
+      return { error: 'Too many top-up attempts. Please wait 10 minute(s) and try again.' };
+    }
+    if (recentErr && !isMissingTable(recentErr)) {
+      console.error('[NaJiki STK Push] Could not check recent top-ups:', recentErr.message);
+      return { error: 'Could not start the payment. Please try again.' };
+    }
+
+    const { error: intentErr } = await adminSchool.from('payment_intents').insert({
+      school_id: school.id,
+      reference: idempotencyKey,
+      amount,
+      currency: 'UGX',
+      phone: formattedPhoneNumeric,
+      created_by: userData.user.id,
+    });
+    if (!intentErr) {
+      intentRecorded = true;
+    } else if (isMissingTable(intentErr)) {
+      console.error('[NaJiki STK Push] school.payment_intents missing: top-ups refused. Run supabase_migrations/05_sms_payment_integrity.sql.');
+      return { error: 'Top-ups are temporarily unavailable. Please contact support.' };
+    } else {
+      console.error('[NaJiki STK Push] Could not record payment intent:', intentErr.message);
+      return { error: 'Could not start the payment. Please try again.' };
+    }
+  } else if (isMissingTable(intentRpcErr)) {
     console.error('[NaJiki STK Push] school.payment_intents missing: top-ups refused. Run supabase_migrations/05_sms_payment_integrity.sql.');
     return { error: 'Top-ups are temporarily unavailable. Please contact support.' };
   } else {
-    console.error('[NaJiki STK Push] Could not record payment intent:', intentErr.message);
+    console.error('[NaJiki STK Push] create_payment_intent failed:', intentRpcErr?.message);
     return { error: 'Could not start the payment. Please try again.' };
   }
   const markIntentFailed = async () => {
@@ -536,6 +666,9 @@ export async function topUpBalance(amount: number, phoneNumber: string) {
   }
   } catch (err: any) {
     console.error('topUpBalance error:', err);
-    return { error: err.message || 'Failed to top up balance' };
+    if (typeof err?.message === 'string' && /Forbidden|Unauthorized/i.test(err.message)) {
+      return { error: err.message };
+    }
+    return { error: 'Failed to top up balance. Please try again.' };
   }
 }

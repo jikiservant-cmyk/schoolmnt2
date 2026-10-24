@@ -107,6 +107,21 @@ export default function SignupPage() {
             />
           </div>
 
+          <div className="space-y-1">
+            <label htmlFor="inviteCode" className="text-xs font-mono uppercase tracking-wider text-meridian-text-2">
+              Invite Code <span className="text-meridian-text-3 normal-case">(if required)</span>
+            </label>
+            <input
+              id="inviteCode"
+              name="inviteCode"
+              type="text"
+              autoComplete="off"
+              disabled={isPending}
+              placeholder="Optional registration code"
+              className="w-full px-3 py-2.5 bg-meridian-panel-raised border border-meridian-border text-sm rounded-lg focus:outline-none focus:ring-1 focus:ring-meridian-gold focus:border-meridian-gold transition-colors disabled:opacity-50 text-meridian-text-1"
+            />
+          </div>
+
           <button
             type="submit"
             disabled={isPending}

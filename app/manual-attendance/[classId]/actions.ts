@@ -1,7 +1,9 @@
 'use server';
 
+import { cookies, headers } from 'next/headers';
 import { checkSchoolAdmin } from '@/lib/auth-guard';
 import { consumeRateLimit, resetRateLimit } from '@/lib/security/rate-limit';
+import { getClientIp } from '@/lib/security/request';
 import { createAdminClient } from '@/utils/supabase/admin';
 import { queueNotifications, attendanceSmsKey } from '@/lib/notifications/queue';
 import { 
@@ -10,6 +12,20 @@ import {
   getEatTodayRange,
   getCurrentAttendanceWindowMode
 } from '@/lib/attendance-window';
+import {
+  getSchoolSettings,
+  isParentSmsEnabledForEvent,
+  renderAttendanceSmsMessage,
+} from '@/lib/school-settings';
+import {
+  REGISTER_CAPABILITY_COOKIE,
+  REGISTER_PIN_COOKIE,
+  verifyRegisterCapabilityToken,
+  createVerifiedTeacherPinToken,
+  verifyTeacherPinSessionToken,
+  computePinHashTag,
+  buildCapabilityCookieOptions,
+} from '@/lib/security/register-token';
 import bcrypt from 'bcryptjs';
 
 export interface StudentAttendanceStatus {
@@ -30,12 +46,58 @@ const MAX_PIN_FAILURES = 5;
 const PIN_LOCK_MS = 10 * 60 * 1000;
 const GENERIC_PIN_ERROR = 'Invalid teacher or PIN.';
 
-async function requireAdminContext() {
-  const result = await checkSchoolAdmin();
-  if (!result.ok) {
-    return { ok: false as const, error: result.reason === 'unauthenticated' ? 'Unauthorized.' : 'Access denied.' };
+async function extractRefererToken(): Promise<string | null> {
+  try {
+    const h = await headers();
+    const ref = h.get('referer');
+    if (!ref) return null;
+    return new URL(ref, 'http://localhost').searchParams.get('token');
+  } catch {
+    return null;
   }
-  return { ok: true as const, supabase: result.supabase, schoolId: result.schoolId, user: result.user };
+}
+
+/**
+ * Resolves access to `/manual-attendance/[classId]` server actions:
+ *   1. Authenticated `school_admin` session (`mode: 'admin'`) — 100% compatible.
+ *   2. Verified Web-Crypto HMAC-SHA256 class capability token (`mode: 'token'`)
+ *      from HttpOnly cookie `sk_reg_cap` (or initial `?token=` query param).
+ */
+async function resolveRegisterContext(classId: string) {
+  if (typeof classId !== 'string' || !UUID_RE.test(classId)) {
+    return { ok: false as const, error: 'Invalid class.' };
+  }
+
+  const result = await checkSchoolAdmin();
+  if (result.ok) {
+    return {
+      ok: true as const,
+      mode: 'admin' as const,
+      schoolId: result.schoolId,
+      callerId: result.user.id,
+    };
+  }
+
+  const cookieStore = await cookies();
+  const rawToken =
+    cookieStore.get(REGISTER_CAPABILITY_COOKIE)?.value ||
+    (await extractRefererToken());
+
+  const cap = await verifyRegisterCapabilityToken(rawToken, classId);
+  if (cap) {
+    const ip = await getClientIp();
+    return {
+      ok: true as const,
+      mode: 'token' as const,
+      schoolId: cap.schoolId,
+      callerId: `cap:${cap.schoolId}:${cap.classId}:${ip}`,
+    };
+  }
+
+  return {
+    ok: false as const,
+    error: result.reason === 'unauthenticated' ? 'Unauthorized.' : 'Access denied.',
+  };
 }
 
 type VerifiedTeacher = {
@@ -69,15 +131,18 @@ async function verifyTeacherPinScoped(
   if (typeof teacherId !== 'string' || !UUID_RE.test(teacherId)) return { success: false, error: GENERIC_PIN_ERROR };
   if (typeof pin !== 'string' || !PIN_RE.test(pin.trim())) return { success: false, error: GENERIC_PIN_ERROR };
 
+  const adminClient = createAdminClient();
+  const schoolSettings = await getSchoolSettings(adminClient, schoolId);
+  const maxPinFailures = schoolSettings.maxPinFailures;
+  const pinLockMs = schoolSettings.pinLockoutMinutes * 60 * 1000;
+
   // Throttle before doing any expensive work (bcrypt) — per teacher and per operator session.
-  const perTeacher = consumeRateLimit(`pin:teacher:${teacherId}`, MAX_PIN_FAILURES * 2, PIN_LOCK_MS);
-  const perCaller = consumeRateLimit(`pin:caller:${callerId}`, 30, PIN_LOCK_MS);
+  const perTeacher = consumeRateLimit(`pin:teacher:${teacherId}`, maxPinFailures * 2, pinLockMs);
+  const perCaller = consumeRateLimit(`pin:caller:${callerId}`, 30, pinLockMs);
   if (!perTeacher.allowed || !perCaller.allowed) {
     const secs = Math.max(perTeacher.retryAfterSeconds, perCaller.retryAfterSeconds);
     return { success: false, error: `Too many attempts. Locked for ${Math.max(1, Math.ceil(secs / 60))} minute(s).` };
   }
-
-  const adminClient = createAdminClient();
 
   // 1. Tenant check FIRST: the teacher must be an active teacher in the caller's school.
   const { data: teacher } = await adminClient
@@ -141,7 +206,7 @@ async function verifyTeacherPinScoped(
     if (hasLockoutColumns) {
       const newFailures = (staffUser.failed_attempts || 0) + 1;
       const update: Record<string, unknown> = { failed_attempts: newFailures };
-      if (newFailures >= MAX_PIN_FAILURES) update.locked_until = new Date(Date.now() + PIN_LOCK_MS).toISOString();
+      if (newFailures >= maxPinFailures) update.locked_until = new Date(Date.now() + pinLockMs).toISOString();
       await adminClient.from('staff_users').update(update).eq('id', staffUser.id);
     }
     return { success: false, error: GENERIC_PIN_ERROR };
@@ -163,21 +228,41 @@ function getDummyHash() {
 }
 
 export async function verifyTeacherPin(classId: string, teacherId: string, pin: string) {
-  const ctx = await requireAdminContext();
+  const ctx = await resolveRegisterContext(classId);
   if (!ctx.ok) return { success: false, error: ctx.error };
 
-  const result = await verifyTeacherPinScoped(ctx.schoolId, classId, teacherId, pin, ctx.user.id);
+  const result = await verifyTeacherPinScoped(ctx.schoolId, classId, teacherId, pin, ctx.callerId);
   if (!result.success) return { success: false, error: result.error };
+
+  const adminClient = createAdminClient();
+  const { data: staffRow } = await adminClient
+    .from('staff_users')
+    .select('pin_hash')
+    .eq('id', result.data.staffUserId)
+    .maybeSingle();
+
+  const { token: pinToken, maxAge } = await createVerifiedTeacherPinToken({
+    schoolId: ctx.schoolId,
+    classId,
+    teacherId: result.data.teacher.id,
+    staffUserId: result.data.staffUserId,
+    pinHash: staffRow?.pin_hash || null,
+  });
+
+  const cookieStore = await cookies();
+  cookieStore.set(REGISTER_PIN_COOKIE, pinToken, buildCapabilityCookieOptions(maxAge));
+
   return { success: true, teacher: result.data.teacher };
 }
 
 export async function getTeachersForClass(classId: string) {
-  const ctx = await requireAdminContext();
+  const ctx = await resolveRegisterContext(classId);
   if (!ctx.ok) return { success: false, error: ctx.error };
-  const { supabase, schoolId } = ctx;
-  if (typeof classId !== 'string' || !UUID_RE.test(classId)) return { success: false, error: 'Invalid class.' };
+  const { schoolId } = ctx;
 
-  const { data: cls } = await supabase
+  const adminClient = createAdminClient();
+
+  const { data: cls } = await adminClient
     .from('classes')
     .select('id')
     .eq('id', classId)
@@ -186,7 +271,7 @@ export async function getTeachersForClass(classId: string) {
 
   if (!cls) return { success: false, error: 'Class not found or access denied.' };
 
-  const { data: teachers } = await supabase
+  const { data: teachers } = await adminClient
     .from('people')
     .select('id, full_name')
     .eq('school_id', schoolId)
@@ -197,13 +282,67 @@ export async function getTeachersForClass(classId: string) {
   return { success: true, teachers: teachers || [] };
 }
 
-export async function getStudentsForClass(classId: string) {
-  const ctx = await requireAdminContext();
+export async function getStudentsForClass(
+  classId: string,
+  teacherId?: string,
+  pin?: string
+) {
+  const ctx = await resolveRegisterContext(classId);
   if (!ctx.ok) return { error: ctx.error };
-  const { supabase, schoolId } = ctx;
-  if (typeof classId !== 'string' || !UUID_RE.test(classId)) return { error: 'Invalid class.' };
+  const { schoolId } = ctx;
 
-  const { data: cls } = await supabase
+  const adminClient = createAdminClient();
+
+  // Scoped capability-token links MUST have a verified Teacher PIN before exposing student rosters.
+  if (ctx.mode === 'token') {
+    let pinVerified = false;
+    const cookieStore = await cookies();
+    const rawPinCookie = cookieStore.get(REGISTER_PIN_COOKIE)?.value;
+
+    if (rawPinCookie) {
+      const pinSession = await verifyTeacherPinSessionToken(rawPinCookie, schoolId, classId);
+      if (pinSession) {
+        const [{ data: staffRow }, { data: teacherRow }] = await Promise.all([
+          adminClient
+            .from('staff_users')
+            .select('id, pin_hash')
+            .eq('id', pinSession.staffUserId)
+            .maybeSingle(),
+          adminClient
+            .from('people')
+            .select('id, is_active')
+            .eq('id', pinSession.teacherId)
+            .eq('school_id', schoolId)
+            .eq('role', 'teacher')
+            .maybeSingle(),
+        ]);
+
+        if (staffRow && teacherRow && teacherRow.is_active !== false) {
+          if (!pinSession.pinTag) {
+            pinVerified = true;
+          } else {
+            const currentTag = staffRow.pin_hash ? await computePinHashTag(staffRow.pin_hash) : '';
+            if (currentTag === pinSession.pinTag) {
+              pinVerified = true;
+            }
+          }
+        }
+      }
+    }
+
+    if (!pinVerified && teacherId && pin) {
+      const inlineCheck = await verifyTeacherPinScoped(schoolId, classId, teacherId, pin, ctx.callerId);
+      if (inlineCheck.success) {
+        pinVerified = true;
+      }
+    }
+
+    if (!pinVerified) {
+      return { error: 'Teacher PIN verification is required before viewing the student roster.' };
+    }
+  }
+
+  const { data: cls } = await adminClient
     .from('classes')
     .select('id')
     .eq('id', classId)
@@ -212,7 +351,7 @@ export async function getStudentsForClass(classId: string) {
 
   if (!cls) return { error: 'Class not found or access denied.' };
 
-  const { data: students, error } = await supabase
+  const { data: students, error } = await adminClient
     .from('people')
     .select('id, full_name, device_user_id')
     .eq('class_id', classId)
@@ -225,15 +364,21 @@ export async function getStudentsForClass(classId: string) {
     return { error: 'Failed to fetch students.' };
   }
 
+  const schoolSettings = await getSchoolSettings(adminClient, schoolId);
+  const activeMode = getCurrentAttendanceWindowMode(new Date(), {
+    timeZone: schoolSettings.timeZone,
+    afternoonSwitchoverTime: schoolSettings.afternoonSwitchoverTime,
+  });
+
   if (!students || students.length === 0) {
-    return { students: [], activeWindowMode: getCurrentAttendanceWindowMode() };
+    return { students: [], activeWindowMode: activeMode };
   }
 
-  // Fetch today's attendance logs in EAT for these students
-  const { startIso, endIso } = getEatTodayRange();
+  // Fetch today's attendance logs in the school's configured timezone for these students
+  const { startIso, endIso } = getEatTodayRange(new Date(), schoolSettings.timeZone);
   const studentIds = students.map(s => s.id);
 
-  const { data: logs } = await supabase
+  const { data: logs } = await adminClient
     .from('attendance_logs')
     .select('person_id, attendance_type, status, occurred_at')
     .eq('school_id', schoolId)
@@ -261,7 +406,7 @@ export async function getStudentsForClass(classId: string) {
 
     const checkInTime = checkInLog?.occurred_at
       ? new Date(checkInLog.occurred_at).toLocaleTimeString('en-US', {
-          timeZone: 'Africa/Kampala',
+          timeZone: schoolSettings.timeZone,
           hour: '2-digit',
           minute: '2-digit',
           hour12: true,
@@ -270,7 +415,7 @@ export async function getStudentsForClass(classId: string) {
 
     const checkOutTime = checkOutLog?.occurred_at
       ? new Date(checkOutLog.occurred_at).toLocaleTimeString('en-US', {
-          timeZone: 'Africa/Kampala',
+          timeZone: schoolSettings.timeZone,
           hour: '2-digit',
           minute: '2-digit',
           hour12: true,
@@ -291,7 +436,7 @@ export async function getStudentsForClass(classId: string) {
 
   return { 
     students: enrichedStudents,
-    activeWindowMode: getCurrentAttendanceWindowMode()
+    activeWindowMode: activeMode
   };
 }
 
@@ -303,9 +448,9 @@ export async function submitClassAttendance(
   attendanceType: 'check_in' | 'check_out' = 'check_in',
   pin: string = ''
 ) {
-  const ctx = await requireAdminContext();
+  const ctx = await resolveRegisterContext(classId);
   if (!ctx.ok) return { success: false, error: ctx.error };
-  const { supabase, schoolId } = ctx;
+  const { schoolId } = ctx;
 
   // Strict input validation — these arrive straight from the client.
   if (attendanceType !== 'check_in' && attendanceType !== 'check_out') {
@@ -324,13 +469,13 @@ export async function submitClassAttendance(
   const adminClient = createAdminClient();
 
   // Re-verify Teacher PIN server-side (scoped to this school)
-  const pinVerification = await verifyTeacherPinScoped(schoolId, classId, teacherId, pin, ctx.user.id);
+  const pinVerification = await verifyTeacherPinScoped(schoolId, classId, teacherId, pin, ctx.callerId);
   if (!pinVerification.success) {
     return { success: false, error: pinVerification.error || 'Invalid Teacher PIN.' };
   }
 
   // Get class and school info, scoped by schoolId
-  const { data: cls } = await supabase
+  const { data: cls } = await adminClient
     .from('classes')
     .select('id, name, school_id')
     .eq('id', classId)
@@ -357,30 +502,34 @@ export async function submitClassAttendance(
   // marked_by comes from the verified staff record — never from client input.
   const markedByStaffUserId: string | null = pinVerification.data.staffUserId;
 
+  const schoolSettings = await getSchoolSettings(adminClient, schoolId);
   const now = new Date();
-  const { startIso, endIso } = getEatTodayRange(now);
+  const { startIso, endIso } = getEatTodayRange(now, schoolSettings.timeZone);
 
-  // Check today's existing attendance logs for these students (ensure strictly ONE mark per time frame)
-  let eligibleStudentIds = presentStudentIds;
-  if (presentStudentIds.length > 0) {
+  // Check today's existing attendance logs across BOTH present and absent lists
+  // so no student ever gets >1 row for Morning Check-In or >1 row for Evening Check-Out.
+  const allSubmittedIds = [...presentStudentIds, ...absentStudentIds];
+  const alreadyRecordedSet = new Set<string>();
+  if (allSubmittedIds.length > 0) {
     const { data: existingLogs } = await adminClient
       .from('attendance_logs')
       .select('person_id, attendance_type')
       .eq('school_id', schoolId)
-      .in('person_id', presentStudentIds)
+      .in('person_id', allSubmittedIds)
       .gte('occurred_at', startIso)
       .lte('occurred_at', endIso);
 
-    const alreadyRecordedSet = new Set(
-      (existingLogs || [])
-        .filter(l => l.attendance_type === attendanceType)
-        .map(l => l.person_id)
-    );
-
-    eligibleStudentIds = presentStudentIds.filter(id => !alreadyRecordedSet.has(id));
+    for (const l of existingLogs || []) {
+      if (l.attendance_type === attendanceType) {
+        alreadyRecordedSet.add(l.person_id);
+      }
+    }
   }
 
-  if (presentStudentIds.length > 0 && eligibleStudentIds.length === 0) {
+  let eligibleStudentIds = presentStudentIds.filter((id) => !alreadyRecordedSet.has(id));
+  const eligibleAbsentIds = absentStudentIds.filter((id) => !alreadyRecordedSet.has(id));
+
+  if (allSubmittedIds.length > 0 && eligibleStudentIds.length === 0 && eligibleAbsentIds.length === 0) {
     return {
       success: true,
       skipped: true,
@@ -390,7 +539,12 @@ export async function submitClassAttendance(
   }
 
   const attendanceStatus: 'present' | 'late' = attendanceType === 'check_in'
-    ? getAttendanceStatusForCheckIn(now)
+    ? getAttendanceStatusForCheckIn(now, {
+        timeZone: schoolSettings.timeZone,
+        role: 'student',
+        studentLateCutoff: schoolSettings.studentLateCutoff,
+        studentGraceMinutes: schoolSettings.studentGraceMinutes,
+      })
     : 'present';
 
   const presentLogs = eligibleStudentIds.map(studentId => ({
@@ -399,7 +553,7 @@ export async function submitClassAttendance(
     person_id: studentId,
     class_id_at_time: cls.id,
     class_name_at_time: cls.name,
-    status: attendanceStatus,
+    status: attendanceStatus as 'present' | 'late' | 'absent',
     attendance_type: attendanceType,
     marked_by: markedByStaffUserId,
     occurred_at: now.toISOString(),
@@ -407,13 +561,13 @@ export async function submitClassAttendance(
     created_at: now.toISOString(),
   }));
 
-  const absentLogs = absentStudentIds.map(studentId => ({
+  const absentLogs = eligibleAbsentIds.map(studentId => ({
     id: crypto.randomUUID(),
     school_id: cls.school_id,
     person_id: studentId,
     class_id_at_time: cls.id,
     class_name_at_time: cls.name,
-    status: 'absent' as const,
+    status: 'absent' as 'present' | 'late' | 'absent',
     attendance_type: attendanceType,
     marked_by: markedByStaffUserId,
     occurred_at: now.toISOString(),
@@ -422,15 +576,29 @@ export async function submitClassAttendance(
   }));
 
   const allLogs = [...presentLogs, ...absentLogs];
+  const storedPresentIds: string[] = [];
 
   if (allLogs.length > 0) {
     const { error: insertError } = await adminClient
       .from('attendance_logs')
       .insert(allLogs);
-      
+
     if (insertError) {
-      console.error("Error inserting manual attendance", insertError);
-      return { success: false, error: 'Failed to save attendance records.' };
+      if (insertError.code !== '23505') {
+        console.error("Error inserting manual attendance", insertError);
+        return { success: false, error: 'Failed to save attendance records.' };
+      }
+      // Race-safe row-by-row insert when simultaneous submissions collide on `23505`
+      for (const row of allLogs) {
+        const { error: rowErr } = await adminClient.from('attendance_logs').insert(row);
+        if (!rowErr) {
+          if (row.status !== 'absent') storedPresentIds.push(row.person_id);
+        } else if (rowErr.code !== '23505') {
+          console.error("Error inserting manual attendance row", rowErr);
+          return { success: false, error: 'Failed to save attendance records.' };
+        }
+      }
+      eligibleStudentIds = storedPresentIds;
     }
   }
 
@@ -487,13 +655,24 @@ export async function submitClassAttendance(
         }
         
 
-        if (notificationsToSend.length > 0) {
-          const windowCheck = isWithinAttendanceSmsWindow(attendanceType, now);
+        if (
+          notificationsToSend.length > 0 &&
+          isParentSmsEnabledForEvent(schoolSettings, attendanceType, attendanceStatus)
+        ) {
+          const windowCheck = isWithinAttendanceSmsWindow(attendanceType, now, {
+            timeZone: schoolSettings.timeZone,
+            restrictSmsWindows: schoolSettings.restrictSmsWindows,
+            checkInSmsStart: schoolSettings.checkInSmsStart,
+            checkInSmsEnd: schoolSettings.checkInSmsEnd,
+            checkOutSmsStart: schoolSettings.checkOutSmsStart,
+            checkOutSmsEnd: schoolSettings.checkOutSmsEnd,
+          });
 
           if (!windowCheck.allowed) {
             console.log(`[Class Manual Attendance] Recorded attendance for ${presentLogs.length} students, but SMS dispatch skipped: ${windowCheck.reason}`);
           } else {
             const timestampStr = windowCheck.eatTimeStr || now.toLocaleTimeString('en-US', { 
+              timeZone: schoolSettings.timeZone,
               hour: '2-digit', 
               minute: '2-digit', 
               hour12: true 
@@ -501,18 +680,17 @@ export async function submitClassAttendance(
 
             const smsRows: Record<string, unknown>[] = [];
             for (const notif of notificationsToSend) {
-              let smsMessageText = `Dear Parent,`;
-              if (attendanceType === 'check_in') {
-                smsMessageText += attendanceStatus === 'late'
-                  ? ` your child ${notif.studentName} checked IN LATE at school at ${timestampStr}.`
-                  : ` your child ${notif.studentName} checked IN at school successfully at ${timestampStr}.`;
-              } else {
-                smsMessageText += ` your child ${notif.studentName} checked OUT of school and is heading home at ${timestampStr}.`;
-              }
+              const smsMessageText = renderAttendanceSmsMessage(schoolSettings, attendanceType, {
+                studentName: notif.studentName,
+                schoolName: schoolSettings.schoolName,
+                time: timestampStr,
+                className: cls.name,
+                status: attendanceStatus,
+              });
 
               smsRows.push({
                 // One SMS per child, direction and day (double submissions can't double-charge)
-                dedupe_key: attendanceSmsKey(notif.studentId, attendanceType, now),
+                dedupe_key: attendanceSmsKey(notif.studentId, attendanceType, now, schoolSettings.timeZone),
                 school_id: cls.school_id,
                 recipient_type: 'parent',
                 recipient_id: notif.parentId,
@@ -524,7 +702,7 @@ export async function submitClassAttendance(
               });
             }
             const { queued, duplicates } = await queueNotifications(adminClient, smsRows);
-            console.log(`[Class Manual Attendance] Queued ${queued} SMS notifications for ${attendanceType} at ${timestampStr} EAT${duplicates ? ` (${duplicates} already queued today, skipped)` : ''}`);
+            console.log(`[Class Manual Attendance] Queued ${queued} SMS notifications for ${attendanceType} at ${timestampStr} (${schoolSettings.timeZone})${duplicates ? ` (${duplicates} already queued today, skipped)` : ''}`);
           }
         }
       }

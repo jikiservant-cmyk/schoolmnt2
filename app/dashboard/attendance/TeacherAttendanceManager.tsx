@@ -23,12 +23,14 @@ interface TeacherAttendanceManagerProps {
   logs: any[];
   teachers: any[];
   onRefresh: () => void;
+  timeZone?: string;
 }
 
 export default function TeacherAttendanceManager({
   logs,
   teachers,
-  onRefresh
+  onRefresh,
+  timeZone,
 }: TeacherAttendanceManagerProps) {
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'present' | 'late'>('all');
@@ -99,13 +101,13 @@ export default function TeacherAttendanceManager({
     });
   }, [teacherLogs, searchTerm, statusFilter]);
 
-  // Group logs by date in East Africa Time (YYYY-MM-DD)
+  // Group logs by date in school's configured timezone (YYYY-MM-DD)
   const groupedTeacherLogs = useMemo(() => {
     const map: { [key: string]: any[] } = {};
 
     filteredTeacherLogs.forEach(log => {
       if (!log.occurred_at) return;
-      const dateKey = getEATDateKey(log.occurred_at);
+      const dateKey = getEATDateKey(log.occurred_at, timeZone);
 
       if (!map[dateKey]) {
         map[dateKey] = [];
@@ -113,24 +115,24 @@ export default function TeacherAttendanceManager({
       map[dateKey].push(log);
     });
 
-    const todayKey = getEATDateKey(new Date());
+    const todayKey = getEATDateKey(new Date(), timeZone);
     
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayKey = getEATDateKey(yesterday);
+    const yesterdayKey = getEATDateKey(yesterday, timeZone);
 
     return Object.keys(map)
       .sort((a, b) => b.localeCompare(a))
       .map(dateKey => {
         const dayLogs = map[dateKey];
-        const sampleIso = dayLogs[0]?.occurred_at || `${dateKey}T00:00:00+03:00`;
+        const sampleIso = dayLogs[0]?.occurred_at || `${dateKey}T12:00:00Z`;
 
         let label = formatEATDate(sampleIso, {
           weekday: 'long',
           month: 'short',
           day: 'numeric',
           year: 'numeric'
-        });
+        }, timeZone);
 
         let badge = '';
         if (dateKey === todayKey) {
@@ -151,7 +153,7 @@ export default function TeacherAttendanceManager({
           lateCount
         };
       });
-  }, [filteredTeacherLogs]);
+  }, [filteredTeacherLogs, timeZone]);
 
   const toggleTeacherDateKey = (dateKey: string) => {
     setCollapsedTeacherDateKeys((prev) => {

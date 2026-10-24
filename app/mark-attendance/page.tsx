@@ -28,14 +28,17 @@ export default function MarkAttendance() {
   const [colonVisible, setColonVisible] = useState(true);
 
   useEffect(() => {
+    if (typeof window !== 'undefined' && window.location.search.includes('token=')) {
+      window.history.replaceState(null, '', window.location.pathname);
+    }
     Promise.resolve().then(() => {
       setMounted(true);
-      setCurrentTime(new Date().toLocaleTimeString('en-US', { hour12: false }));
+      setCurrentTime(new Date().toLocaleTimeString('en-US', { hour12: false, hourCycle: 'h23' }));
     });
     // Clock updates
     const timer = setInterval(() => {
       const now = new Date();
-      setCurrentTime(now.toLocaleTimeString('en-US', { hour12: false }));
+      setCurrentTime(now.toLocaleTimeString('en-US', { hour12: false, hourCycle: 'h23' }));
       setColonVisible(v => !v);
     }, 1000);
     

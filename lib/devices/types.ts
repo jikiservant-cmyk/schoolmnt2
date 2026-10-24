@@ -1,3 +1,5 @@
+import type { ResolvedSchoolConfiguration } from '@/lib/school-settings';
+
 export type DeviceType = 
   | 'zkteco_adms'
   | 'hikvision_isapi'
@@ -9,6 +11,8 @@ export interface DeviceConfig {
   lateCutoffHour?: number;
   lateCutoffMinute?: number;
   timeZone?: string;
+  hasExplicitLateCutoff?: boolean;
+  hasExplicitTimeZone?: boolean;
   autoApproveCheckOut?: boolean;
   [key: string]: any;
 }
@@ -31,6 +35,7 @@ export interface DeviceRecord {
   location_label?: string | null;
   status_code_map: Record<string, 'check_in' | 'check_out'>;
   config: DeviceConfig;
+  schoolSettings?: ResolvedSchoolConfiguration;
   schools?: { id?: string; name?: string } | null;
 }
 
@@ -50,6 +55,12 @@ export interface EnrollPersonInput {
   fullName: string;
   role: 'student' | 'teacher' | 'support_staff' | 'admin' | string;
   className?: string | null;
+  lcdOptions?: {
+    prefixTeacher?: string;
+    prefixAdmin?: string;
+    prefixSupport?: string;
+    showStudentClass?: boolean;
+  };
 }
 
 export interface EnrollCommandResult {

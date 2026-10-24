@@ -3,6 +3,7 @@ import AddClassForm from './AddClassForm';
 import { GraduationCap, ArrowLeft, BookOpen } from 'lucide-react';
 import Link from 'next/link';
 import CopyLinkButton from './CopyLinkButton';
+import { createRegisterCapabilityToken } from '@/lib/security/register-token';
 
 export default async function ClassesPage() {
   const supabase = await createClient();
@@ -48,18 +49,25 @@ export default async function ClassesPage() {
   const teachers = teachersRaw || [];
   const students = studentsRaw || [];
 
-  // 4. Map associations in-memory safely to avoid custom PostgREST schema naming errors
-  const classes = (classesRaw || []).map((cls) => {
-    const assignedTeacher = teachers.find(t => t.id === cls.teacher_id);
-    const count = students.filter(s => s.class_id === cls.id).length;
-    return {
-      id: cls.id,
-      name: cls.name,
-      termName: (cls.academic_years as any)?.name || 'General Term',
-      teacherName: assignedTeacher?.full_name || 'Unassigned',
-      studentCount: count
-    };
-  });
+  // 4. Map associations in-memory safely + mint class-scoped capability tokens
+  const classes = await Promise.all(
+    (classesRaw || []).map(async (cls) => {
+      const assignedTeacher = teachers.find(t => t.id === cls.teacher_id);
+      const count = students.filter(s => s.class_id === cls.id).length;
+      const registerToken = await createRegisterCapabilityToken({
+        schoolId,
+        classId: cls.id,
+      });
+      return {
+        id: cls.id,
+        name: cls.name,
+        termName: (cls.academic_years as any)?.name || 'General Term',
+        teacherName: assignedTeacher?.full_name || 'Unassigned',
+        studentCount: count,
+        registerToken,
+      };
+    })
+  );
 
   return (
     <div className="space-y-8 animate-fade-in">
@@ -124,7 +132,7 @@ export default async function ClassesPage() {
 
                       <div className="flex items-center justify-between text-xs font-mono pt-2 border-t border-meridian-border/50 text-meridian-text-3">
                         <span>Term: {cls.termName}</span>
-                        <CopyLinkButton classId={cls.id} />
+                        <CopyLinkButton classId={cls.id} token={cls.registerToken} />
                       </div>
                     </div>
                   ))}
@@ -170,7 +178,7 @@ export default async function ClassesPage() {
                             </span>
                           </td>
                           <td className="py-3.5 text-right pl-4">
-                            <CopyLinkButton classId={cls.id} />
+                            <CopyLinkButton classId={cls.id} token={cls.registerToken} />
                           </td>
                         </tr>
                       ))}

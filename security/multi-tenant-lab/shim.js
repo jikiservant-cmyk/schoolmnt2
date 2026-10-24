@@ -7,6 +7,7 @@ const { Pool, types } = require('pg');
 const { AsyncLocalStorage } = require('async_hooks');
 const als = new AsyncLocalStorage();
 const NAJIKI = [];
+const SMS_LOG = [];
 const dbq = (sql, p) => (als.getStore() || pool).query(sql, p);
 
 // Match PostgREST's timestamptz JSON representation when requested by tests.
@@ -26,12 +27,25 @@ const pool = new Pool({
   user: 'postgres',
   password: 'pw',
   database: 'mtlab',
+  // Each REST request pins one client for the whole transaction. pg's default
+  // of 10 means ~10 concurrent requests exhaust the pool; anything that then
+  // asks for a second client (an in-request catalog/RPC probe) deadlocks.
+  max: 32,
   ...(process.env.PGRST_TS === '1' ? {
     // pg-pool awaits onConnect before handing a client to a request, so the
     // session timezone is set before any PostgREST query runs.
     onConnect: (client) => client.query("SET TIME ZONE 'UTC'"),
   } : {}),
 });
+
+// Postgres may drop an idle pooled backend at any time (admin pg_terminate_backend,
+// server restart, failover). Without a listener, pg-pool re-emits that as an
+// unhandled 'error' event and the whole lab shim dies mid-run — which looks like
+// a test failure. Log and keep serving; pg-pool discards the dead client.
+pool.on('error', (err) => {
+  console.error('[shim] idle postgres client dropped:', err.message);
+});
+
 const SECRET = 'lab-secret';
 const USERS = {}; // email -> {id,password,email}
 const LOG = [];
@@ -87,7 +101,7 @@ async function ensureColumns(schema, table, obj) {
     }
     const v = obj[k];
     const type = v !== null && typeof v === 'object' ? 'jsonb' : typeof v === 'boolean' ? 'boolean' : typeof v === 'number' ? 'numeric' : 'text';
-    await pool.query('ALTER TABLE ' + qi(schema) + '.' + qi(table) + ' ADD COLUMN IF NOT EXISTS ' + qi(k) + ' ' + type);
+    await dbq('ALTER TABLE ' + qi(schema) + '.' + qi(table) + ' ADD COLUMN IF NOT EXISTS ' + qi(k) + ' ' + type);
     console.log('[shim] auto-added column ' + schema + '.' + table + '.' + k + ' ' + type);
     changed = true;
   }
@@ -257,13 +271,13 @@ function pgError(res, e) {
 async function handleRpc(req, res, name, args, jwt, schema = 'public') {
   if (name === 'auth_school_id') {
     if (!jwt || !jwt.sub) return send(res, 200, null);
-    const hasFn = (await pool.query("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='school' AND p.proname='auth_school_id'")).rowCount;
+    const hasFn = (await dbq("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='school' AND p.proname='auth_school_id'")).rowCount;
     const r = hasFn ? await dbq('SELECT school.auth_school_id() AS school_id') : await dbq('SELECT school_id FROM school.staff_users WHERE auth_user_id = $1 LIMIT 1', [jwt.sub]);
     return send(res, 200, r.rows[0] ? r.rows[0].school_id : null);
   }
   // Real functions that exist in the DB are called like PostgREST does
   // (named arguments, run as the request's role).
-  const fn = (await pool.query("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1 AND p.proname=$2", [schema, name])).rows;
+  const fn = (await dbq("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1 AND p.proname=$2", [schema, name])).rows;
   if (fn.length) {
     const keys = Object.keys(args);
     const vals = keys.map((k) => { const v = args[k]; return v !== null && typeof v === 'object' && !Array.isArray(v) ? JSON.stringify(v) : v; });
@@ -417,9 +431,64 @@ http.createServer((req, res) => {
         if (String(b.phoneNumber).endsWith('999')) { NAJIKI.push({ headers: { authorization: auth }, body: b, response: null }); await new Promise((r) => setTimeout(r, 60000)); return send(res, 504, { error: 'timeout' }); }
         const paymentId = crypto.randomUUID();
         const reference = String(b.applicationCode).slice(0, 6).toUpperCase() + '-PAY-' + Date.now().toString(16).slice(-8).toUpperCase() + '-' + crypto.randomBytes(5).toString('hex').toUpperCase();
-        NAJIKI.push({ headers: { authorization: auth }, body: b, response: { paymentId, reference } });
+        NAJIKI.push({ headers: { authorization: auth }, body: b, response: { paymentId, reference, status: 'pending' } });
         return send(res, 200, { paymentId, reference, status: 'pending' });
       }
+      // Fake NaJiki SMS API: mirrors najiki-finance2 POST /api/messaging/send
+      // (SmsInputSchema, Idempotency-Key dedupe, 202 Accepted).
+      if (url.pathname === '/__najiki/messaging/send' || url.pathname === '/api/messaging/send') {
+        const b = JSON.parse(body || '{}');
+        const auth = req.headers.authorization || '';
+        const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+        const key = bearer || String(req.headers['x-api-key'] || '').trim() || String(b.apiKey || '').trim();
+        if (!key) return send(res, 401, { error: 'Invalid or missing API key' });
+        const idem = String(req.headers['idempotency-key'] || '').trim() || String(b.idempotencyKey || '').trim();
+        if (idem && (idem.length < 8 || idem.length > 255)) return send(res, 400, { error: 'Invalid SMS payload or idempotency key' });
+        if (!/^\+?[0-9]{9,15}$/.test(String(b.to || ''))) return send(res, 400, { error: 'Invalid SMS payload or idempotency key' });
+        if (typeof b.message !== 'string' || !b.message.length || b.message.length > 918) return send(res, 400, { error: 'Invalid SMS payload or idempotency key' });
+        if (b.senderId !== undefined && !/^[A-Za-z0-9]{3,11}$/.test(String(b.senderId))) return send(res, 400, { error: 'Invalid SMS payload or idempotency key' });
+        if (b.applicationCode !== undefined && String(b.applicationCode).length > 64) return send(res, 400, { error: 'Invalid SMS payload or idempotency key' });
+        // Lab-only failure injection: lets the Edge Function's retry/exhaustion
+        // paths be exercised for real. Nothing in the app emits these markers.
+        if (String(b.message).includes('[LAB_SMS_503]')) {
+          SMS_LOG.push({ injected: '503', idempotencyKey: idem || null, body: b, smsId: null });
+          return send(res, 503, { error: 'Upstream unavailable' }, { 'retry-after': '1' });
+        }
+        if (String(b.message).includes('[LAB_SMS_429]')) {
+          SMS_LOG.push({ injected: '429', idempotencyKey: idem || null, body: b, smsId: null });
+          return send(res, 429, { error: 'Rate limit exceeded' }, { 'retry-after': '2' });
+        }
+        // 200 but the payload says it failed: a naive `res.ok` check reads this
+        // as success and marks the row sent.
+        if (String(b.message).includes('[LAB_SMS_200_ERROR]')) {
+          SMS_LOG.push({ injected: '200-error', idempotencyKey: idem || null, body: b, smsId: null });
+          return send(res, 200, { success: false, error: 'Carrier rejected the destination' });
+        }
+        // 202 with no smsId: nothing to match a delivery report against later.
+        if (String(b.message).includes('[LAB_SMS_NO_SMSID]')) {
+          SMS_LOG.push({ injected: '202-no-smsid', idempotencyKey: idem || null, body: b, smsId: null });
+          return send(res, 202, { success: true, message: 'queued' });
+        }
+        // Slow gateway, for the function's own timeout path.
+        if (String(b.message).includes('[LAB_SMS_SLOW]')) {
+          SMS_LOG.push({ injected: 'slow', idempotencyKey: idem || null, body: b, smsId: null });
+          await new Promise((r) => setTimeout(r, 2500));
+          return send(res, 202, { success: true, smsId: 'slow' + crypto.randomBytes(6).toString('hex') });
+        }
+        if (idem) {
+          const prior = SMS_LOG.find((m) => m.idempotencyKey === idem);
+          if (prior) {
+            if (prior.body.message !== b.message || prior.body.to !== b.to) return send(res, 409, { error: 'Idempotency key reused with a different payload' });
+            return send(res, 202, { success: true, message: 'Duplicate request', smsId: prior.smsId, reference: prior.reference, status: prior.status, deduplicated: true, createdAt: prior.createdAt });
+          }
+        }
+        const smsId = 'c' + crypto.randomBytes(12).toString('hex');
+        const reference = 'SCH-' + crypto.randomBytes(6).toString('hex').toUpperCase();
+        const rec = { smsId, reference, status: 'queued', createdAt: new Date().toISOString(), idempotencyKey: idem || null, body: b, headers: { authorization: auth } };
+        SMS_LOG.push(rec);
+        return send(res, 202, { success: true, message: 'SMS send job queued successfully', smsId, reference, status: 'queued', deduplicated: false, createdAt: rec.createdAt });
+      }
+      if (url.pathname === '/__najiki/sms-log') { if (req.method === 'DELETE') SMS_LOG.length = 0; return send(res, 200, SMS_LOG); }
       if (url.pathname === '/__najiki/log') { if (req.method === 'DELETE') NAJIKI.length = 0; return send(res, 200, NAJIKI); }
       if (url.pathname === '/__reload') { await loadCatalog(); return send(res, 200, { ok: true }); }
       if (url.pathname.startsWith('/auth/v1/')) return handleAuth(req, res, url, body);

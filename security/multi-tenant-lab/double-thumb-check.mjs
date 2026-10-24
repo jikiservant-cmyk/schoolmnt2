@@ -1,6 +1,6 @@
-// End-to-end ZKTeco duplicate-punch regression. Usage:
-//   PGRST_TS=1 RLS=1 node double-thumb-check.mjs http://127.0.0.1:3201 before
-// The shim must be started with PGRST_TS=1. MIG09=0 disables only the DB guard.
+// End-to-end ZKTeco strict 2-writes-per-day regression (1 Morning Check-In + 1 Evening Check-Out).
+// Usage:
+//   PGRST_TS=1 RLS=1 node double-thumb-check.mjs http://127.0.0.1:3000 after
 import pg from 'pg';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,10 +8,9 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const [BASE = 'http://127.0.0.1:3201', LABEL = 'run'] = process.argv.slice(2);
+const [BASE = 'http://127.0.0.1:3000', LABEL = 'run'] = process.argv.slice(2);
 const SHIM = 'http://127.0.0.1:54321';
 const SCHOOL = 'aaaaaaaa-0000-4000-8000-000000000001';
-const STUDENT = 'aaaaaaaa-0000-4000-8000-0000000000f1';
 const STUDENT_2 = 'aaaaaaaa-0000-4000-8000-0000000000f2';
 const DEVICE_SECRET = 'A-device-secret-0123456789';
 const EAT_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -56,6 +55,7 @@ async function upload(lines) {
 }
 async function clearRows() {
   await db.query(`DELETE FROM school.attendance_logs WHERE source = 'device'`);
+  await db.query(`DELETE FROM school.device_logs WHERE school_id = $1`, [SCHOOL]);
 }
 async function rowCount() {
   const { rows } = await db.query(
@@ -85,9 +85,8 @@ async function scenario(name, expected, run, keptAt) {
   console.log(`${passed ? 'PASS' : 'FAIL'} ${name}: ${stored.count}/${expected} rows; HTTP ${result.httpStatuses.join(',')}${keptAt === undefined ? '' : `; oldest kept ${keptOk ? 'yes' : 'no'}`}`);
 }
 
-// A fresh, past timestamp with second precision, accepted by the processor's
-// clock-skew guard and far enough from test-to-test traffic.
-const base = Math.floor((Date.now() - 5 * 60_000) / 1000) * 1000;
+// Anchor morning punches on yesterday 07:30 EAT (always in the past & strictly before 13:00 switchover).
+const base = eatAt(7, 30, -1);
 
 await scenario('Same second twice in one upload', 1, () => upload([line('102', base), line('102', base)]));
 await scenario('Same punch re-sent in a later upload', 1, async () => [
@@ -105,30 +104,40 @@ await scenario('Two thumbs 2 seconds apart in separate uploads', 1, async () => 
 ], base + 40_000);
 await scenario('Two thumbs 40 seconds apart', 1,
   () => upload([line('102', base + 90_000), line('102', base + 50_000)]), base + 50_000);
-await scenario('Check-in then check-out 1 minute later', 2, () => upload([
-  line('102', base + 100_000, 'check_in'),
-  line('102', base + 160_000, 'check_out'),
-]));
-await scenario('Same child 3 minutes later in the same direction', 2, () => upload([
+await scenario('Same child 3 minutes later in the morning -> strictly 1 morning write', 1, () => upload([
   line('102', base + 200_000, 'check_in'),
   line('102', base + 380_000, 'check_in'),
-]));
+]), base + 200_000);
+await scenario('Same child 3 hours apart in the morning -> strictly 1 morning write', 1, async () => [
+  await upload([line('102', eatAt(7, 15, -1), 'check_in')]),
+  await upload([line('102', eatAt(10, 45, -1), 'check_in')]),
+], eatAt(7, 15, -1));
+await scenario('Same child multiple times in the evening -> strictly 1 evening write', 1, async () => [
+  await upload([line('102', eatAt(16, 10, -1), 'check_in')]),
+  await upload([line('102', eatAt(17, 25, -1), 'check_in')]),
+], eatAt(16, 10, -1));
 await scenario('Two different students at the same second', 2, () => upload([
   line('102', base + 400_000),
   line('103', base + 400_000),
 ]));
-const todayEAT = new Date(Date.now() + EAT_OFFSET_MS);
-const attendanceDayOffset = todayEAT.getHours() < 14 ? -1 : 0;
-await scenario('Morning check-in and afternoon check-out', 2, () => upload([
-  line('102', eatAt(7, 30, attendanceDayOffset), 'check_in'),
-  line('102', eatAt(14, 0, attendanceDayOffset), 'check_out'),
+await scenario('Morning thumb-in (raw 0) and evening thumb-out (raw 0) -> strictly 2 writes (1 in + 1 out)', 2, () => upload([
+  line('102', eatAt(7, 30, -1), 'check_in'),
+  line('102', eatAt(16, 30, -1), 'check_in'),
 ]));
 
 await clearRows();
-const migrationStatus = await db.query("SELECT to_regclass('school.attendance_logs_device_punch_once') IS NOT NULL AS enabled");
+const migrationStatus = await db.query(
+  "SELECT to_regclass('school.attendance_logs_one_in_one_out_per_day') IS NOT NULL AS enabled"
+);
 await db.end();
 const passed = results.filter((r) => r.passed).length;
-const report = { label: LABEL, duplicateWindowSeconds: process.env.ATTENDANCE_DUPLICATE_WINDOW_SECONDS ?? 'default (120)', migration09Enabled: migrationStatus.rows[0].enabled, passed, total: results.length, results };
+const report = {
+  label: LABEL,
+  migration13Enabled: migrationStatus.rows[0].enabled,
+  passed,
+  total: results.length,
+  results,
+};
 const out = path.join(__dirname, `double-thumb-results-${LABEL}.json`);
 fs.writeFileSync(out, JSON.stringify(report, null, 2) + '\n');
 console.log(`\n[${LABEL}] ${passed}/${results.length} scenarios passed; wrote ${out}`);

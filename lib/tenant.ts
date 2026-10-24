@@ -94,6 +94,27 @@ export async function getOwnedDeviceBySerial(admin: Admin, schoolId: string, ser
 }
 
 /**
+ * Extracts the missing column name from a PostgREST (`PGRST204`) or PostgreSQL
+ * (`42703`) error, or null if `err` is not a missing-column error.
+ */
+export function extractMissingColumn(
+  err: { code?: string; message?: string } | null | undefined
+): string | null {
+  if (!err) return null;
+  const code = err.code || '';
+  const msg = err.message || '';
+  if (code !== 'PGRST204' && code !== '42703') return null;
+
+  const pgrst = msg.match(/Could not find the '([^']+)' column/i);
+  if (pgrst?.[1]) return pgrst[1];
+
+  const pg = msg.match(/column (?:[a-zA-Z0-9_."]+\.)?"?([a-zA-Z0-9_]+)"? does not exist/i);
+  if (pg?.[1]) return pg[1];
+
+  return null;
+}
+
+/**
  * True when PostgREST/Postgres says `column` does not exist on the table.
  * Used for optional columns (e.g. device_logs.school_id) that older databases
  * may not have yet: callers retry the write without that column.

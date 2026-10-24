@@ -5,6 +5,7 @@ import { addDeviceAction } from './actions';
 import { Plus, HelpCircle, Key, RefreshCw, Copy, Check, ShieldCheck, Cpu } from 'lucide-react';
 import { SUPPORTED_DEVICE_TYPES, DeviceTypeOption } from '@/lib/devices/registry';
 import { DeviceType } from '@/lib/devices/types';
+import { COMMON_SCHOOL_TIMEZONES } from '@/lib/school-settings';
 
 function createRandomSecret(): string {
   const chars = '0123456789abcdef';
@@ -15,7 +16,13 @@ function createRandomSecret(): string {
   return `dev_sec_${rand}`;
 }
 
-export default function AddDeviceForm() {
+export default function AddDeviceForm({
+  schoolDefaultLateCutoff = '08:00',
+  schoolDefaultTimeZone = 'Africa/Kampala',
+}: {
+  schoolDefaultLateCutoff?: string;
+  schoolDefaultTimeZone?: string;
+} = {}) {
   const [isPending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<boolean>(false);
@@ -202,32 +209,37 @@ export default function AddDeviceForm() {
         <div className="grid grid-cols-2 gap-3 pt-2 border-t border-meridian-border/50">
           <div className="space-y-1">
             <label htmlFor="lateCutoff" className="text-[11px] font-mono uppercase tracking-wider text-meridian-text-2">
-              Late Cutoff
+              Gate Cutoff Override
             </label>
             <input
               id="lateCutoff"
               name="lateCutoff"
               type="time"
-              defaultValue="08:00"
+              defaultValue=""
+              title={`Leave blank to inherit School Settings (${schoolDefaultLateCutoff})`}
               className="w-full px-2 py-1.5 bg-meridian-panel-raised border border-meridian-border text-xs rounded font-mono text-meridian-text-1"
             />
+            <p className="text-[10px] font-mono text-meridian-text-3">
+              Blank = School policy ({schoolDefaultLateCutoff})
+            </p>
           </div>
 
           <div className="space-y-1">
             <label htmlFor="timeZone" className="text-[11px] font-mono uppercase tracking-wider text-meridian-text-2">
-              Timezone
+              Timezone Override
             </label>
             <select
               id="timeZone"
               name="timeZone"
-              defaultValue="Africa/Kampala"
+              defaultValue=""
               className="w-full px-2 py-1.5 bg-meridian-panel-raised border border-meridian-border text-xs rounded font-mono text-meridian-text-1"
             >
-              <option value="Africa/Kampala">EAT (UTC+3, Kampala)</option>
-              <option value="Africa/Nairobi">EAT (UTC+3, Nairobi)</option>
-              <option value="Africa/Kigali">CAT (UTC+2, Kigali)</option>
-              <option value="Africa/Dar_es_Salaam">EAT (UTC+3, Dar)</option>
-              <option value="UTC">UTC / GMT</option>
+              <option value="">School policy ({schoolDefaultTimeZone})</option>
+              {COMMON_SCHOOL_TIMEZONES.map((tz) => (
+                <option key={tz.value} value={tz.value}>
+                  {tz.label}
+                </option>
+              ))}
             </select>
           </div>
         </div>

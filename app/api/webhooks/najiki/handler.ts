@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 import { createAdminClient, createPublicAdminClient } from '@/utils/supabase/admin';
 import { UUID_RE } from '@/lib/tenant';
-import { classifyPayment, collectReferences, paidAmount, paidCurrency } from '@/lib/payments/webhook';
+import { classifyPayment, collectReferences, hasPaymentIndicators, paidAmount, paidCurrency } from '@/lib/payments/webhook';
 import { loadSchoolWallet, isMissingFunction } from '@/lib/payments/wallet';
 
 /**
@@ -47,10 +47,10 @@ async function readLimitedBody(req: NextRequest): Promise<string | null> {
 }
 
 function webhookSecret(): { secret: string | null; dedicated: boolean } {
-  const dedicated = process.env.NAJIKI_WEBHOOK_SECRET;
+  const dedicated = process.env.NAJIKI_WEBHOOK_SECRET?.trim();
   if (dedicated) return { secret: dedicated, dedicated: true };
   // Legacy: the same key the app sends to NaJiki on every API call.
-  const legacy = process.env.NAJIKI_API_KEY || process.env.SCHOOL_SECRET_KEY || process.env.NAJIKI_SECRET_KEY || null;
+  const legacy = (process.env.NAJIKI_API_KEY || process.env.SCHOOL_SECRET_KEY || process.env.NAJIKI_SECRET_KEY || '').trim() || null;
   return { secret: legacy, dedicated: false };
 }
 
@@ -134,26 +134,61 @@ export function verifyNajikiSignature(
  *     to exactly one school.
  *  3. The resolved school must exist.
  */
-async function resolveWebhookSchool(publicAdmin: any, eventData: Json): Promise<{ schoolId: string; via: string } | { error: string }> {
+async function resolveWebhookSchool(
+  publicAdmin: any,
+  eventData: Json,
+  outerPayload?: Json
+): Promise<{ schoolId: string; via: string } | { error: string }> {
   const md = (eventData && typeof eventData.metadata === 'object' && eventData.metadata) || {};
-  const uuidCandidates = [
+  const outerMd = (outerPayload && typeof outerPayload.metadata === 'object' && outerPayload.metadata) || {};
+
+  // Two confidence tiers, because the provider sends its OWN tenant UUID and it
+  // is not our school UUID.
+  //
+  // najiki-finance2 puts `tenantId` (its `Tenant.id`, a cuid today) on every
+  // completion notification alongside `externalEntityId` (the school UUID we
+  // sent). Treating both as equal "school id" claims meant any provider-side
+  // tenant identifier in UUID form would disagree with our own school UUID and
+  // reject the payment as "conflicting identifiers" — losing real money events.
+  //
+  // So: explicit school identifiers decide. `tenantId`/`tenant_id` are only a
+  // fallback for payloads that carry no school UUID at all (our own
+  // public.tenants rows use the school UUID as their id).
+  const explicitIds = [
+    outerPayload?.school_id, outerPayload?.schoolId, outerMd.schoolId, outerMd.school_id,
+    outerPayload?.externalEntityId, outerPayload?.external_entity_id,
     eventData?.school_id, eventData?.schoolId, md.schoolId, md.school_id,
     eventData?.externalEntityId, eventData?.external_entity_id,
+  ].filter((v) => typeof v === 'string' && UUID_RE.test(v)).map((v: string) => v.toLowerCase());
+
+  const tenantIds = [
+    outerPayload?.tenant_id, outerPayload?.tenantId, outerMd.tenantId, outerMd.tenant_id,
     eventData?.tenant_id, eventData?.tenantId, md.tenantId, md.tenant_id,
   ].filter((v) => typeof v === 'string' && UUID_RE.test(v)).map((v: string) => v.toLowerCase());
 
-  const distinct = Array.from(new Set(uuidCandidates));
+  const explicitDistinct = Array.from(new Set(explicitIds));
+  const tenantDistinct = Array.from(new Set(tenantIds));
+
   let schoolId: string | null = null;
   let via = 'school_uuid';
 
-  if (distinct.length > 1) {
+  if (explicitDistinct.length > 1) {
     return { error: 'Conflicting school identifiers in payment payload' };
   }
-  if (distinct.length === 1) {
-    schoolId = distinct[0];
+  if (explicitDistinct.length === 1) {
+    // An explicit school UUID wins; provider-side tenant ids are ignored rather
+    // than compared against it.
+    schoolId = explicitDistinct[0];
+  } else if (tenantDistinct.length > 1) {
+    return { error: 'Conflicting school identifiers in payment payload' };
+  } else if (tenantDistinct.length === 1) {
+    schoolId = tenantDistinct[0];
+    via = 'tenant_uuid';
   } else {
-    const code = [eventData?.tenantCode, eventData?.tenant_code, md.tenantCode, md.tenant_code, eventData?.code]
-      .find((v) => typeof v === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(v));
+    const code = [
+      eventData?.tenantCode, eventData?.tenant_code, md.tenantCode, md.tenant_code, eventData?.code,
+      outerPayload?.tenantCode, outerPayload?.tenant_code, outerMd.tenantCode, outerMd.tenant_code, outerPayload?.code,
+    ].find((v) => typeof v === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(v));
     if (!code) return { error: 'Missing school identifier' };
     via = 'tenant_code';
 
@@ -210,10 +245,10 @@ export async function handleNajikiWebhook(req: NextRequest) {
     } catch {
       return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
     }
-    if (!payload || typeof payload !== 'object') {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
       return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 });
     }
-    const eventData: Json = (payload.data && typeof payload.data === 'object') ? payload.data : payload;
+    const eventData: Json = (payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)) ? payload.data : payload;
 
     // Log without personal data.
     const safe = { ...payload, data: payload.data ? { ...payload.data } : undefined };
@@ -221,15 +256,15 @@ export async function handleNajikiWebhook(req: NextRequest) {
     console.log('[NaJiki Webhook] Received payload:', JSON.stringify(safe).slice(0, 2000));
 
     const cls = classifyPayment(payload);
-    const isDeliveryReport = !cls.eventType.includes('payment') &&
+    const isDeliveryReport = !hasPaymentIndicators(payload) && !cls.eventType.includes('payment') &&
       (cls.eventType === 'message.status' || cls.eventType === 'sms_delivery_update' ||
        cls.eventType.includes('sms') || cls.eventType.includes('delivery') || cls.eventType.includes('message'));
 
     if (!isDeliveryReport && cls.isPayment) {
-      return await handlePayment(eventData, cls);
+      return await handlePayment(eventData, cls, payload);
     }
     if (isDeliveryReport) {
-      await handleDeliveryReport(eventData);
+      return await handleDeliveryReport(eventData, payload);
     }
     return NextResponse.json({ received: true }, { status: 200 });
   } catch (err) {
@@ -239,7 +274,7 @@ export async function handleNajikiWebhook(req: NextRequest) {
   }
 }
 
-async function handlePayment(eventData: Json, cls: ReturnType<typeof classifyPayment>) {
+async function handlePayment(eventData: Json, cls: ReturnType<typeof classifyPayment>, outerPayload: Json) {
   const { refs, providerRef } = collectReferences(eventData);
 
   if (!cls.isPaid) {
@@ -248,7 +283,7 @@ async function handlePayment(eventData: Json, cls: ReturnType<typeof classifyPay
   }
 
   const amount = paidAmount(eventData);
-  const currency = paidCurrency(eventData);
+  const currency = paidCurrency(eventData, outerPayload);
   if (refs.length === 0 && !providerRef) {
     await recordRejectedPayment('rejected_no_reference', eventData, amount, currency);
     return NextResponse.json({ error: 'Missing transaction reference' }, { status: 400 });
@@ -261,7 +296,7 @@ async function handlePayment(eventData: Json, cls: ReturnType<typeof classifyPay
   // The school named in the payload is only a CLAIM: the payment is matched to
   // the top-up the school started, and a mismatch is refused.
   const publicAdmin = createPublicAdminClient();
-  const resolved = await resolveWebhookSchool(publicAdmin, eventData);
+  const resolved = await resolveWebhookSchool(publicAdmin, eventData, outerPayload);
   if ('error' in resolved && resolved.error.startsWith('Conflicting')) {
     console.warn('[NaJiki Webhook] Conflicting school identifiers in payment payload.');
     await recordRejectedPayment('rejected_conflicting_school', eventData, amount, currency);
@@ -332,17 +367,84 @@ async function recordRejectedPayment(outcome: string, eventData: Json, amount: n
   }
 }
 
-async function handleDeliveryReport(eventData: Json) {
-  const raw = eventData?.messageId || eventData?.smsId || eventData?.id || eventData?.provider_ref;
-  const smsId = typeof raw === 'string' || typeof raw === 'number' ? String(raw).slice(0, 200) : '';
-  if (!smsId) return;
-  const statusStr = String(eventData?.status || '').toUpperCase();
-  const status = (statusStr === 'DELIVERED' || statusStr === 'SENT' || statusStr === 'SUCCESS') ? 'sent' : 'failed';
-  // Notifications live in the `school` schema (this used the public-schema
-  // client before, so delivery reports never reached the queue).
-  const admin = createAdminClient();
-  const { data: updatedByRef } = await admin.from('notifications').update({ status }).eq('provider_ref', smsId).select('id');
-  if ((!updatedByRef || updatedByRef.length === 0) && UUID_RE.test(smsId)) {
-    await admin.from('notifications').update({ status }).eq('id', smsId);
+const DELIVERED_SMS_STATUSES = new Set(['DELIVERED', 'SENT', 'SUCCESS', 'COMPLETED']);
+const INFLIGHT_SMS_STATUSES = new Set([
+  '', 'QUEUED', 'PENDING', 'SUBMITTED', 'ACCEPTED', 'SENDING', 'BUFFERED', 'PROCESSING', 'ENROUTE', 'SCHEDULED',
+  // najiki-finance2 SmsMessage.status is "queued | pending | unknown | delivered | failed";
+  // 'unknown' means the carrier has not told us anything yet, so it must never
+  // be recorded as a failure.
+  'UNKNOWN',
+]);
+
+function isMissingProviderRefColumn(err: { code?: string; message?: string } | null | undefined): boolean {
+  return !!err && (err.code === 'PGRST204' || err.code === '42703') && /provider_ref/.test(err.message || '');
+}
+
+async function handleDeliveryReport(eventData: Json, outerPayload?: Json): Promise<NextResponse> {
+  // najiki-finance2 sends, for every terminal SMS:
+  //   { eventType: 'SMS_DELIVERY_UPDATE', smsId, reference, status,
+  //     providerId, recipient, applicationCode }
+  // `smsId` is NaJiki's own SmsMessage row id, `providerId` is the carrier's
+  // message id and `reference` is NaJiki's SMS reference. Which one the SMS
+  // Edge Function stored on school.notifications.provider_ref is a deployment
+  // detail we do not control, so match on ANY of them instead of guessing.
+  const identifiers = Array.from(new Set(
+    [eventData?.smsId, eventData?.messageId, eventData?.providerId, eventData?.providerMessageId,
+     eventData?.provider_ref, eventData?.id, eventData?.reference]
+      .filter((v) => typeof v === 'string' || typeof v === 'number')
+      .map((v) => String(v).trim().slice(0, 200))
+      .filter(Boolean)
+  ));
+  if (identifiers.length === 0) {
+    return NextResponse.json({ received: true }, { status: 200 });
   }
+  const smsId = identifiers[0];
+
+  const statusStr = String(eventData?.status || '').trim().toUpperCase();
+  if (INFLIGHT_SMS_STATUSES.has(statusStr)) {
+    // Non-terminal carrier callback (e.g. out-of-order QStash retry of QUEUED/SUBMITTED):
+    // acknowledge without overwriting already-sent rows or prematurely failing the SMS.
+    return NextResponse.json({ received: true, ignored: statusStr || 'empty_status' }, { status: 200 });
+  }
+  const targetStatus = DELIVERED_SMS_STATUSES.has(statusStr) ? 'sent' : 'failed';
+
+  const md = (eventData && typeof eventData.metadata === 'object' && eventData.metadata) || {};
+  const outerMd = (outerPayload && typeof outerPayload.metadata === 'object' && outerPayload.metadata) || {};
+  const schoolUuids = Array.from(new Set(
+    [
+      outerPayload?.school_id, outerPayload?.schoolId, outerMd.schoolId, outerMd.school_id,
+      outerPayload?.externalEntityId, outerPayload?.external_entity_id,
+      eventData?.school_id, eventData?.schoolId, md.schoolId, md.school_id,
+      eventData?.externalEntityId, eventData?.external_entity_id,
+    ].filter((v) => typeof v === 'string' && UUID_RE.test(v)).map((v: string) => v.toLowerCase())
+  ));
+  if (schoolUuids.length > 1) {
+    return NextResponse.json({ error: 'Conflicting school identifiers in delivery report' }, { status: 400 });
+  }
+  const scopedSchoolId = schoolUuids.length === 1 ? schoolUuids[0] : null;
+
+  const admin = createAdminClient();
+  let qRef = admin.from('notifications').update({ status: targetStatus }).in('provider_ref', identifiers);
+  if (scopedSchoolId) qRef = qRef.eq('school_id', scopedSchoolId);
+  if (targetStatus === 'failed') qRef = qRef.neq('status', 'sent');
+
+  const { data: updatedByRef, error: refErr } = await qRef.select('id');
+  if (refErr && !isMissingProviderRefColumn(refErr)) {
+    console.error('[NaJiki Webhook] Delivery report DB update failed, requesting retry:', refErr.message);
+    return NextResponse.json({ error: 'Could not update delivery status' }, { status: 500 });
+  }
+
+  const idCandidates = identifiers.filter((v) => UUID_RE.test(v));
+  if ((!updatedByRef || updatedByRef.length === 0) && idCandidates.length > 0) {
+    let qId = admin.from('notifications').update({ status: targetStatus }).in('id', idCandidates);
+    if (scopedSchoolId) qId = qId.eq('school_id', scopedSchoolId);
+    if (targetStatus === 'failed') qId = qId.neq('status', 'sent');
+    const { error: idErr } = await qId;
+    if (idErr) {
+      console.error('[NaJiki Webhook] Delivery report fallback ID update failed, requesting retry:', idErr.message);
+      return NextResponse.json({ error: 'Could not update delivery status' }, { status: 500 });
+    }
+  }
+
+  return NextResponse.json({ received: true }, { status: 200 });
 }

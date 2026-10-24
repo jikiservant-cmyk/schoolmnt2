@@ -2,8 +2,118 @@ import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 import { createPublicAdminClient } from '@/utils/supabase/admin'
 import { hardenAuthCookieOptions } from './cookie-options'
+import {
+  REGISTER_CAPABILITY_COOKIE,
+  KIOSK_CAPABILITY_COOKIE,
+  verifyRegisterCapabilityToken,
+  verifyKioskCapabilityToken,
+  buildCapabilityCookieOptions,
+} from '@/lib/security/register-token'
+
+/**
+ * Emits a safe relative 307 redirect (`Location: /login` or `Location: /dashboard`)
+ * preserving all `Set-Cookie` headers without leaking internal bind hosts
+ * (e.g. `http://0.0.0.0:3000`) or honoring spoofed `Host` headers.
+ */
+function relativeRedirect(
+  request: NextRequest,
+  location: string,
+  supabaseResponse: NextResponse
+): NextResponse {
+  const safeTarget = location.startsWith('/') && !location.startsWith('//') ? location : '/login'
+  const configuredOrigin = (
+    process.env.APP_ORIGIN ||
+    process.env.NEXT_PUBLIC_SITE_URL ||
+    ''
+  ).trim()
+
+  let redirectUrl: URL
+  if (configuredOrigin) {
+    redirectUrl = new URL(safeTarget, configuredOrigin)
+  } else {
+    redirectUrl = request.nextUrl.clone()
+    redirectUrl.pathname = safeTarget
+    redirectUrl.search = ''
+    redirectUrl.hash = ''
+  }
+
+  const redirectResponse = NextResponse.redirect(redirectUrl, {
+    status: 307,
+    headers: {
+      'Cache-Control': 'no-store',
+      'x-internal-rel-location': safeTarget,
+    },
+  })
+  supabaseResponse.headers.getSetCookie().forEach((cookieStr) => {
+    redirectResponse.headers.append('Set-Cookie', cookieStr)
+  })
+  return redirectResponse
+}
 
 export async function updateSession(request: NextRequest) {
+  const { pathname, searchParams } = request.nextUrl
+
+  // Hardware push endpoints & webhooks never use browser sessions — skip GoTrue round-trips entirely.
+  if (
+    pathname === '/iclock' ||
+    pathname.startsWith('/iclock/') ||
+    pathname === '/api/devices' ||
+    pathname.startsWith('/api/devices/') ||
+    pathname === '/api/webhooks' ||
+    pathname.startsWith('/api/webhooks/')
+  ) {
+    return NextResponse.next({ request })
+  }
+
+  // Evaluate Web-Crypto HMAC-SHA256 scoped capability tokens for classroom registers & gate kiosks.
+  let validRegisterTokenToSet: { token: string; maxAge: number } | null = null
+  let validKioskTokenToSet: { token: string; maxAge: number } | null = null
+  let hasScopedCapabilityAccess = false
+
+  const manualMatch = pathname.match(/^\/manual-attendance\/([^/]+)\/?$/)
+  if (manualMatch) {
+    const targetClassId = decodeURIComponent(manualMatch[1])
+    const queryToken = searchParams.get('token')
+    const cookieToken = request.cookies.get(REGISTER_CAPABILITY_COOKIE)?.value
+
+    if (queryToken) {
+      const verified = await verifyRegisterCapabilityToken(queryToken, targetClassId)
+      if (verified) {
+        const ttl = Math.max(1, verified.exp - Math.floor(Date.now() / 1000))
+        request.cookies.set(REGISTER_CAPABILITY_COOKIE, queryToken)
+        validRegisterTokenToSet = { token: queryToken, maxAge: ttl }
+        hasScopedCapabilityAccess = true
+      }
+    }
+
+    if (!hasScopedCapabilityAccess && cookieToken) {
+      const verified = await verifyRegisterCapabilityToken(cookieToken, targetClassId)
+      if (verified) {
+        hasScopedCapabilityAccess = true
+      }
+    }
+  } else if (pathname === '/mark-attendance' || pathname.startsWith('/mark-attendance/')) {
+    const queryToken = searchParams.get('token')
+    const cookieToken = request.cookies.get(KIOSK_CAPABILITY_COOKIE)?.value
+
+    if (queryToken) {
+      const verified = await verifyKioskCapabilityToken(queryToken)
+      if (verified) {
+        const ttl = Math.max(1, verified.exp - Math.floor(Date.now() / 1000))
+        request.cookies.set(KIOSK_CAPABILITY_COOKIE, queryToken)
+        validKioskTokenToSet = { token: queryToken, maxAge: ttl }
+        hasScopedCapabilityAccess = true
+      }
+    }
+
+    if (!hasScopedCapabilityAccess && cookieToken) {
+      const verified = await verifyKioskCapabilityToken(cookieToken)
+      if (verified) {
+        hasScopedCapabilityAccess = true
+      }
+    }
+  }
+
   let supabaseResponse = NextResponse.next({
     request,
   })
@@ -52,18 +162,30 @@ export async function updateSession(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser()
 
-  const { pathname } = request.nextUrl
+  if (validRegisterTokenToSet) {
+    supabaseResponse.cookies.set(
+      REGISTER_CAPABILITY_COOKIE,
+      validRegisterTokenToSet.token,
+      buildCapabilityCookieOptions(validRegisterTokenToSet.maxAge)
+    )
+  }
+  if (validKioskTokenToSet) {
+    supabaseResponse.cookies.set(
+      KIOSK_CAPABILITY_COOKIE,
+      validKioskTokenToSet.token,
+      buildCapabilityCookieOptions(validKioskTokenToSet.maxAge)
+    )
+  }
 
-  // Protected routes: /dashboard, /mark-attendance, and /manual-attendance
-  if (!user && (pathname.startsWith('/dashboard') || pathname.startsWith('/mark-attendance') || pathname.startsWith('/manual-attendance'))) {
-    const url = request.nextUrl.clone()
-    url.pathname = '/login'
-    url.search = ''
-    const redirectResponse = NextResponse.redirect(url)
-    supabaseResponse.headers.getSetCookie().forEach((cookieStr) => {
-      redirectResponse.headers.append('Set-Cookie', cookieStr)
-    })
-    return redirectResponse
+  // Protected routes: /dashboard strictly requires auth; /mark-attendance and
+  // /manual-attendance accept either an authenticated session OR a verified capability token.
+  const isProtectedWithoutCapability =
+    pathname.startsWith('/dashboard') ||
+    ((pathname.startsWith('/mark-attendance') || pathname.startsWith('/manual-attendance')) &&
+      !hasScopedCapabilityAccess)
+
+  if (!user && isProtectedWithoutCapability) {
+    return relativeRedirect(request, '/login', supabaseResponse)
   }
 
   // A logged-in session that is NOT a school admin (staff login, account whose
@@ -89,14 +211,7 @@ export async function updateSession(request: NextRequest) {
 
   // Redirect authenticated user away from login/signup
   if (user && (pathname === '/login' || pathname === '/signup' || pathname === '/')) {
-    const url = request.nextUrl.clone()
-    url.pathname = '/dashboard'
-    url.search = ''
-    const redirectResponse = NextResponse.redirect(url)
-    supabaseResponse.headers.getSetCookie().forEach((cookieStr) => {
-      redirectResponse.headers.append('Set-Cookie', cookieStr)
-    })
-    return redirectResponse
+    return relativeRedirect(request, '/dashboard', supabaseResponse)
   }
 
   // IMPORTANT: You *must* return the supabaseResponse object as it is. If you're

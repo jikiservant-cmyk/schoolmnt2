@@ -30,6 +30,7 @@ export default function Sidebar({ schoolName, adminName, initials }: SidebarProp
     { href: '/dashboard/classes', label: 'Classes', symbol: '▣' },
     { href: '/dashboard/attendance', label: 'Attendance', symbol: '✓' },
     { href: '/dashboard/devices', label: 'Devices', symbol: '▤' },
+    { href: '/dashboard/settings', label: 'Settings', symbol: '⚙' },
     { href: '/mark-attendance', label: 'Kiosk Terminal', symbol: '⇲', external: true },
   ];
 

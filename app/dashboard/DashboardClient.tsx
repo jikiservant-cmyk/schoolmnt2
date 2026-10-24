@@ -63,6 +63,7 @@ interface DashboardInteractiveProps {
   greeting: string;
   adminName: string;
   formattedDate: string;
+  academicTermLabel?: string;
 }
 
 export default function DashboardClient({
@@ -87,7 +88,8 @@ export default function DashboardClient({
   recentMessages,
   greeting,
   adminName,
-  formattedDate
+  formattedDate,
+  academicTermLabel,
 }: DashboardInteractiveProps) {
   const router = useRouter();
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -193,6 +195,11 @@ export default function DashboardClient({
             <span className="text-[10px] font-semibold tracking-[0.12em] uppercase text-[#929297]">
               {formattedDate}
             </span>
+            {academicTermLabel && (
+              <span className="px-2 py-0.5 rounded-full bg-[#edf5ff] text-[#007aff] text-[10px] font-semibold">
+                {academicTermLabel}
+              </span>
+            )}
           </div>
           <h1 className="text-[22px] sm:text-[25px] font-bold tracking-tight text-[#171719] leading-tight">
             {greeting}, {adminName}.

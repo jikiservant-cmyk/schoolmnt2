@@ -6,6 +6,6 @@ const bal = async () => Number((await db.query('SELECT coalesce(sum(balance),0) 
 const b0 = await bal();
 const body = JSON.stringify({ paymentIntentId: crypto.randomUUID(), reference: 'SCHOOL-PAY-AB12CD34-0011223344', status: 'success', amount: 2000, currency: 'UGX', providerPaymentId: 'lp_1', failureReason: null, externalEntityId: S, metadata: { schoolId: S, idempotencyKey: ref, amount: 2000 } });
 const t = Date.now(), v = crypto.createHmac('sha256', process.env.NAJIKI_WEBHOOK_SECRET).update(`${t}.${body}`).digest('hex');
-const r = await fetch('http://127.0.0.1:3201/api/webhooks/najiki', { method: 'POST', body, headers: { 'Content-Type': 'application/json', 'X-Najiki-Notification': 'true', 'X-Najiki-Timestamp': String(t), 'X-Najiki-Signature': `t=${t},v=${v}` } });
-console.log(process.argv[2].padEnd(22), 'HTTP', r.status, ' school credited:', (await bal()) - b0, 'UGX (paid 2000)');
+const r = await fetch((process.env.BASE || 'http://127.0.0.1:3000') + '/api/webhooks/najiki', { method: 'POST', body, headers: { 'Content-Type': 'application/json', 'X-Najiki-Notification': 'true', 'X-Najiki-Timestamp': String(t), 'X-Najiki-Signature': `t=${t},v=${v}` } });
+console.log((process.argv[2] || 'genuine-najiki').padEnd(22), 'HTTP', r.status, ' school credited:', (await bal()) - b0, 'UGX (paid 2000)');
 await db.end();

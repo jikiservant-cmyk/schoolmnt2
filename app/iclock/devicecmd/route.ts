@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { authenticateDeviceRequest, readDeviceBody, payloadTooLarge } from '@/lib/devices/gateway';
-import { isUuid } from '@/lib/tenant';
+import { isUuid, extractMissingColumn } from '@/lib/tenant';
 import { deviceCommandId, isDeviceCommandId } from '@/lib/devices/commandId';
 
 export const dynamic = 'force-dynamic';
@@ -51,19 +51,33 @@ export async function POST(req: NextRequest) {
     if (!cmdId) continue;
     const returnCode = (params.get('Return') || '').slice(0, 16);
     const ok = returnCode === '0';
+    const nowIso = new Date().toISOString();
     const update: Record<string, unknown> = {
       status: ok ? 'acknowledged' : 'failed',
-      acknowledged_at: new Date().toISOString(),
+      acknowledged_at: nowIso,
+      completed_at: nowIso,
+      result: returnCode,
+      error_message: ok ? null : `Terminal execution return code: ${returnCode}`,
     };
-    if (!ok) update.error_message = `Terminal execution return code: ${returnCode}`;
 
-    const { error } = await supabase
-      .from('device_commands')
-      .update(update)
-      .eq('id', cmdId)
-      .eq('school_id', device.school_id)
-      .in('target_serial', [serial, 'ALL']);
-    if (error) console.warn(`[ZKTeco ADMS] ack update failed for ${serial}:`, error.message);
+    let ackErr: { code?: string; message?: string } | null = null;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const { error } = await supabase
+        .from('device_commands')
+        .update(update)
+        .eq('id', cmdId)
+        .eq('school_id', device.school_id)
+        .in('target_serial', [serial, 'ALL']);
+      ackErr = error;
+      if (!ackErr) break;
+      const missing = extractMissingColumn(ackErr);
+      if (missing && Object.prototype.hasOwnProperty.call(update, missing)) {
+        delete update[missing];
+        continue;
+      }
+      break;
+    }
+    if (ackErr) console.warn(`[ZKTeco ADMS] ack update failed for ${serial}:`, ackErr.message);
   }
 
   return text('OK');

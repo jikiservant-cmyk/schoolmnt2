@@ -1,5 +1,6 @@
 'use server';
 
+import crypto from 'crypto';
 import { createClient } from '@/utils/supabase/server';
 import { createPublicAdminClient } from '@/utils/supabase/admin';
 import { revalidatePath } from 'next/cache';
@@ -24,14 +25,23 @@ function validatePassword(password: string): string | null {
   return null;
 }
 
+function timingSafeInviteMatches(provided: string, expected: string): boolean {
+  const ha = crypto.createHash('sha256').update(provided, 'utf8').digest();
+  const hb = crypto.createHash('sha256').update(expected, 'utf8').digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
 export async function signupAction(formData: FormData) {
   const startedAt = Date.now();
 
   const email = normalizeEmail(getFormString(formData, 'email', 254));
   const password = getFormString(formData, 'password', 256);
   const rawName = getFormString(formData, 'fullName', 200);
-  // Strip control characters; React escapes on render but names also flow into SMS / device commands.
-  const fullName = rawName?.replace(/[\u0000-\u001F\u007F]/g, '').trim() || '';
+  // Strip control characters and formula triggers; names flow into spreadsheets / SMS / device commands.
+  let fullName = rawName?.replace(/[\u0000-\u001F\u007F]/g, '').trim() || '';
+  while (/^[=+\-@\t\r]/.test(fullName)) {
+    fullName = fullName.replace(/^[=+\-@\t\r]+/, '').trim();
+  }
 
   if (!email || !password || !fullName) {
     return { error: 'Please fill in all fields with valid values.' };
@@ -46,6 +56,16 @@ export async function signupAction(formData: FormData) {
   const rl = consumeRateLimit(`signup:ip:${ip}`, SIGNUP_IP_LIMIT, SIGNUP_IP_WINDOW_MS);
   if (!rl.allowed) {
     return { error: 'Too many registration attempts. Please try again later.' };
+  }
+
+  // Optional invite-code gate (`SIGNUP_INVITE_CODE`) to restrict self-service school provisioning.
+  const requiredInviteCode = process.env.SIGNUP_INVITE_CODE?.trim() || '';
+  if (requiredInviteCode) {
+    const providedInviteCode = (getFormString(formData, 'inviteCode', 256) || '').trim();
+    if (!providedInviteCode || !timingSafeInviteMatches(providedInviteCode, requiredInviteCode)) {
+      await constantDelay(startedAt);
+      return { error: 'A valid registration invite code is required.' };
+    }
   }
 
   const supabase = await createClient();

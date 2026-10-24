@@ -1,11 +1,40 @@
 /**
- * Utility functions for verifying attendance SMS dispatch windows.
- * All time restrictions are evaluated in East Africa Time (EAT, UTC+3 / Africa/Kampala).
+ * Configurable per-school attendance cutoff, session switchover, and SMS dispatch
+ * window evaluation.
  *
- * Rules:
- * - Morning Check-in: 05:00 AM to 09:00 AM EAT
- * - Evening Check-out: 04:00 PM to 10:00 PM EAT (16:00 to 22:00)
+ * Every school configures its own timezone, late cutoffs, grace period, morning
+ * check-in SMS window, afternoon check-out SMS window, 24/7 mode, and session
+ * switchover time in PostgreSQL (`school.school_settings`).
  */
+
+import { getEATDayRange } from './eat-time';
+import {
+  DEFAULT_SCHOOL_POLICY_SETTINGS,
+  formatHhMm12Hour,
+  parseHhMmToMinutes,
+} from './school-settings';
+
+export interface AttendanceWindowOptions {
+  timeZone?: string;
+  restrictSmsWindows?: boolean;
+  checkInSmsStart?: string;
+  checkInSmsEnd?: string;
+  checkOutSmsStart?: string;
+  checkOutSmsEnd?: string;
+}
+
+export interface CheckInCutoffOptions {
+  timeZone?: string;
+  role?: 'student' | 'teacher' | 'support_staff' | 'admin' | string;
+  studentLateCutoff?: string;
+  studentGraceMinutes?: number;
+  staffLateCutoff?: string;
+}
+
+export interface SwitchoverOptions {
+  timeZone?: string;
+  afternoonSwitchoverTime?: string;
+}
 
 export interface AttendanceSmsWindowResult {
   allowed: boolean;
@@ -16,10 +45,21 @@ export interface AttendanceSmsWindowResult {
 export function isWithinAttendanceSmsWindow(
   attendanceType: 'check_in' | 'check_out',
   date: Date = new Date(),
-  timeZone: string = 'Africa/Kampala'
+  timeZoneOrOptions: string | AttendanceWindowOptions = DEFAULT_SCHOOL_POLICY_SETTINGS.timeZone
 ): AttendanceSmsWindowResult {
+  const opts: AttendanceWindowOptions =
+    typeof timeZoneOrOptions === 'string'
+      ? { timeZone: timeZoneOrOptions }
+      : timeZoneOrOptions || {};
+
+  const timeZone = opts.timeZone || DEFAULT_SCHOOL_POLICY_SETTINGS.timeZone;
+  const restrictWindows = opts.restrictSmsWindows ?? DEFAULT_SCHOOL_POLICY_SETTINGS.restrictSmsWindows;
+  const inStart = opts.checkInSmsStart || DEFAULT_SCHOOL_POLICY_SETTINGS.checkInSmsStart;
+  const inEnd = opts.checkInSmsEnd || DEFAULT_SCHOOL_POLICY_SETTINGS.checkInSmsEnd;
+  const outStart = opts.checkOutSmsStart || DEFAULT_SCHOOL_POLICY_SETTINGS.checkOutSmsStart;
+  const outEnd = opts.checkOutSmsEnd || DEFAULT_SCHOOL_POLICY_SETTINGS.checkOutSmsEnd;
+
   try {
-    // Extract hour & minute formatted specifically in the school/EAT timezone
     const formatter = new Intl.DateTimeFormat('en-US', {
       timeZone,
       hour: 'numeric',
@@ -28,8 +68,8 @@ export function isWithinAttendanceSmsWindow(
     });
 
     const parts = formatter.formatToParts(date);
-    const hour = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10);
-    const minute = parseInt(parts.find(p => p.type === 'minute')?.value || '0', 10);
+    const hour = parseInt(parts.find((p) => p.type === 'hour')?.value || '0', 10) % 24;
+    const minute = parseInt(parts.find((p) => p.type === 'minute')?.value || '0', 10);
     const totalMinutes = hour * 60 + minute;
 
     const displayTime = date.toLocaleTimeString('en-US', {
@@ -39,44 +79,47 @@ export function isWithinAttendanceSmsWindow(
       hour12: true,
     });
 
-    if (attendanceType === 'check_in') {
-      // 05:00 AM (300 mins) to 09:00 AM (540 mins)
-      const minMins = 5 * 60;   // 05:00
-      const maxMins = 9 * 60;   // 09:00
-
-      if (totalMinutes >= minMins && totalMinutes <= maxMins) {
-        return { allowed: true, eatTimeStr: displayTime };
-      }
-
+    if (attendanceType !== 'check_in' && attendanceType !== 'check_out') {
       return {
         allowed: false,
-        reason: `Morning check-in SMS is only sent between 05:00 AM and 09:00 AM EAT. Current time is ${displayTime} EAT.`,
-        eatTimeStr: displayTime,
-      };
-    } else if (attendanceType === 'check_out') {
-      // 04:00 PM (960 mins) to 10:00 PM (1320 mins)
-      const minMins = 16 * 60;  // 16:00 (4:00 PM)
-      const maxMins = 22 * 60;  // 22:00 (10:00 PM)
-
-      if (totalMinutes >= minMins && totalMinutes <= maxMins) {
-        return { allowed: true, eatTimeStr: displayTime };
-      }
-
-      return {
-        allowed: false,
-        reason: `Evening check-out SMS is only sent between 04:00 PM and 10:00 PM EAT. Current time is ${displayTime} EAT.`,
+        reason: `Unknown attendance type: ${attendanceType}`,
         eatTimeStr: displayTime,
       };
     }
 
+    if (!restrictWindows) {
+      return { allowed: true, eatTimeStr: displayTime };
+    }
+
+    if (attendanceType === 'check_in') {
+      const minMins = parseHhMmToMinutes(inStart, 5 * 60);
+      const maxMins = parseHhMmToMinutes(inEnd, 9 * 60);
+
+      if (totalMinutes >= minMins && totalMinutes <= maxMins) {
+        return { allowed: true, eatTimeStr: displayTime };
+      }
+
+      return {
+        allowed: false,
+        reason: `Morning check-in SMS is configured between ${formatHhMm12Hour(inStart)} and ${formatHhMm12Hour(inEnd)} (${timeZone}). Current time is ${displayTime}.`,
+        eatTimeStr: displayTime,
+      };
+    }
+
+    const minMins = parseHhMmToMinutes(outStart, 16 * 60);
+    const maxMins = parseHhMmToMinutes(outEnd, 22 * 60);
+
+    if (totalMinutes >= minMins && totalMinutes <= maxMins) {
+      return { allowed: true, eatTimeStr: displayTime };
+    }
+
     return {
       allowed: false,
-      reason: `Unknown attendance type: ${attendanceType}`,
+      reason: `Check-out SMS is configured between ${formatHhMm12Hour(outStart)} and ${formatHhMm12Hour(outEnd)} (${timeZone}). Current time is ${displayTime}.`,
       eatTimeStr: displayTime,
     };
-  } catch (error: any) {
-    console.error('Error calculating EAT attendance window:', error);
-    // Fallback safe: if timezone fails, allow or use UTC+3 offset
+  } catch (error) {
+    console.error('Error calculating school attendance SMS window:', error);
     return {
       allowed: true,
       eatTimeStr: date.toISOString(),
@@ -85,15 +128,25 @@ export function isWithinAttendanceSmsWindow(
 }
 
 /**
- * Determines the status for a morning check-in based on the time in EAT.
- * Rules:
- * - Arriving at or before 08:00 AM EAT -> 'present'
- * - Arriving after 08:00 AM EAT -> 'late'
+ * Determines `present` vs `late` for a check-in according to the school's
+ * configured student cutoff (+ grace period) or staff cutoff in the school's timezone.
  */
 export function getAttendanceStatusForCheckIn(
   date: Date = new Date(),
-  timeZone: string = 'Africa/Kampala'
+  timeZoneOrOptions: string | CheckInCutoffOptions = DEFAULT_SCHOOL_POLICY_SETTINGS.timeZone
 ): 'present' | 'late' {
+  const opts: CheckInCutoffOptions =
+    typeof timeZoneOrOptions === 'string'
+      ? { timeZone: timeZoneOrOptions }
+      : timeZoneOrOptions || {};
+
+  const timeZone = opts.timeZone || DEFAULT_SCHOOL_POLICY_SETTINGS.timeZone;
+  const isStaff = opts.role === 'teacher' || opts.role === 'support_staff' || opts.role === 'admin';
+  const baseCutoffMins = isStaff
+    ? parseHhMmToMinutes(opts.staffLateCutoff || DEFAULT_SCHOOL_POLICY_SETTINGS.staffLateCutoff, 8 * 60 + 30)
+    : parseHhMmToMinutes(opts.studentLateCutoff || DEFAULT_SCHOOL_POLICY_SETTINGS.studentLateCutoff, 8 * 60) +
+      Math.max(0, Math.min(60, Math.trunc(opts.studentGraceMinutes ?? DEFAULT_SCHOOL_POLICY_SETTINGS.studentGraceMinutes)));
+
   try {
     const formatter = new Intl.DateTimeFormat('en-US', {
       timeZone,
@@ -103,73 +156,58 @@ export function getAttendanceStatusForCheckIn(
     });
 
     const parts = formatter.formatToParts(date);
-    const hour = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10);
-    const minute = parseInt(parts.find(p => p.type === 'minute')?.value || '0', 10);
+    const hour = parseInt(parts.find((p) => p.type === 'hour')?.value || '0', 10) % 24;
+    const minute = parseInt(parts.find((p) => p.type === 'minute')?.value || '0', 10);
     const totalMinutes = hour * 60 + minute;
 
-    // 8:00 AM is 8 * 60 = 480 minutes
-    if (totalMinutes > 480) {
-      return 'late';
-    }
-    return 'present';
+    return totalMinutes > baseCutoffMins ? 'late' : 'present';
   } catch {
     return 'present';
   }
 }
 
 /**
- * Returns the current suggested attendance window mode based on EAT time:
- * - 04:00 AM to 01:00 PM -> 'check_in' (Morning)
- * - 01:00 PM to 11:59 PM -> 'check_out' (Evening)
+ * Returns the suggested attendance window mode (`check_in` vs `check_out`)
+ * based on the school's configured afternoon switchover time.
  */
 export function getCurrentAttendanceWindowMode(
   date: Date = new Date(),
-  timeZone: string = 'Africa/Kampala'
+  timeZoneOrOptions: string | SwitchoverOptions = DEFAULT_SCHOOL_POLICY_SETTINGS.timeZone
 ): 'check_in' | 'check_out' {
+  const opts: SwitchoverOptions =
+    typeof timeZoneOrOptions === 'string'
+      ? { timeZone: timeZoneOrOptions }
+      : timeZoneOrOptions || {};
+
+  const timeZone = opts.timeZone || DEFAULT_SCHOOL_POLICY_SETTINGS.timeZone;
+  const switchoverMins = parseHhMmToMinutes(
+    opts.afternoonSwitchoverTime || DEFAULT_SCHOOL_POLICY_SETTINGS.afternoonSwitchoverTime,
+    13 * 60
+  );
+
   try {
     const formatter = new Intl.DateTimeFormat('en-US', {
       timeZone,
       hour: 'numeric',
+      minute: 'numeric',
       hour12: false,
     });
-    const hour = parseInt(formatter.format(date), 10);
-    if (hour >= 13) {
-      return 'check_out';
-    }
-    return 'check_in';
+    const parts = formatter.formatToParts(date);
+    const hour = parseInt(parts.find((p) => p.type === 'hour')?.value || '0', 10) % 24;
+    const minute = parseInt(parts.find((p) => p.type === 'minute')?.value || '0', 10);
+    return hour * 60 + minute >= switchoverMins ? 'check_out' : 'check_in';
   } catch {
     return 'check_in';
   }
 }
 
 /**
- * Returns ISO strings for the start and end of today in East Africa Time (UTC+3)
+ * Returns ISO strings for the start and end of today in the school's timezone.
  */
 export function getEatTodayRange(
   date: Date = new Date(),
-  timeZone: string = 'Africa/Kampala'
+  timeZone: string = DEFAULT_SCHOOL_POLICY_SETTINGS.timeZone
 ): { startIso: string; endIso: string; dateStr: string } {
-  try {
-    const formatter = new Intl.DateTimeFormat('en-CA', {
-      timeZone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    });
-    // Format is YYYY-MM-DD in EAT
-    const dateStr = formatter.format(date);
-    // EAT is UTC+3. Start of day in EAT (00:00:00+03:00) is 21:00:00 UTC previous day.
-    const startIso = new Date(`${dateStr}T00:00:00+03:00`).toISOString();
-    const endIso = new Date(`${dateStr}T23:59:59.999+03:00`).toISOString();
-    return { startIso, endIso, dateStr };
-  } catch {
-    const start = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
-    const end = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999);
-    return {
-      startIso: start.toISOString(),
-      endIso: end.toISOString(),
-      dateStr: date.toISOString().slice(0, 10),
-    };
-  }
+  const { startIso, endIso, dateStr } = getEATDayRange(date, timeZone);
+  return { startIso, endIso, dateStr };
 }
-

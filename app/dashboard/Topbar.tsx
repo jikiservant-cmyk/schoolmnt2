@@ -25,6 +25,7 @@ export default function Topbar({ adminName, initials, schoolName }: TopbarProps)
   else if (pathname.includes('/people')) pageTitle = 'Students & Teachers';
   else if (pathname.includes('/devices')) pageTitle = 'Hardware Terminals';
   else if (pathname.includes('/attendance')) pageTitle = 'Attendance & SMS Logs';
+  else if (pathname.includes('/settings')) pageTitle = 'School Settings & Policies';
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -55,6 +56,7 @@ export default function Topbar({ adminName, initials, schoolName }: TopbarProps)
     { title: 'Teacher Faculty & Passcodes', category: 'People', href: '/dashboard/people?role=teacher' },
     { title: 'Attendance Logs & SMS Wallet', category: 'Attendance', href: '/dashboard/attendance' },
     { title: 'ADMS Biometric Devices', category: 'Hardware', href: '/dashboard/devices' },
+    { title: 'School Settings & Policies', category: 'Settings', href: '/dashboard/settings' },
     { title: 'Kiosk Attendance Terminal', category: 'Kiosk', href: '/mark-attendance' },
   ].filter(item => 
     !searchQuery || 
@@ -130,6 +132,13 @@ export default function Topbar({ adminName, initials, schoolName }: TopbarProps)
                     className="block px-3 py-2 hover:bg-[#f7f7f8] rounded-lg transition"
                   >
                     SMS Wallet & Billing
+                  </Link>
+                  <Link
+                    href="/dashboard/settings"
+                    onClick={() => setUserDropdown(false)}
+                    className="block px-3 py-2 hover:bg-[#f7f7f8] rounded-lg transition"
+                  >
+                    School Settings
                   </Link>
                   <button
                     type="button"

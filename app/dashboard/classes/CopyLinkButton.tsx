@@ -1,13 +1,20 @@
 'use client';
 
-import React, { useState } from 'react';
-import { Link2, Check } from 'lucide-react';
+import { useState } from 'react';
+import { Copy, Check } from 'lucide-react';
 
-export default function CopyLinkButton({ classId }: { classId: string }) {
+export default function CopyLinkButton({
+  classId,
+  token,
+}: {
+  classId: string;
+  token?: string;
+}) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = () => {
-    const url = `${window.location.origin}/manual-attendance/${classId}`;
+    const base = `${window.location.origin}/manual-attendance/${classId}`;
+    const url = token ? `${base}?token=${encodeURIComponent(token)}` : base;
     navigator.clipboard.writeText(url);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
@@ -15,11 +22,22 @@ export default function CopyLinkButton({ classId }: { classId: string }) {
 
   return (
     <button
+      type="button"
       onClick={handleCopy}
-      title="Copy Attendance Link for Teachers"
-      className="inline-flex items-center justify-center w-8 h-8 rounded hover:bg-meridian-gold/10 text-meridian-text-3 hover:text-meridian-gold transition-colors"
+      title="Copy unique manual register link to share with class teacher via WhatsApp or Email"
+      className="h-8 px-3 rounded-[9px] bg-[#f7f7f9] hover:bg-[#efeff2] border border-[#e1e1e5] text-xs font-medium text-[#171719] flex items-center gap-1.5 transition cursor-pointer shadow-2xs"
     >
-      {copied ? <Check className="w-4 h-4 text-green-500" /> : <Link2 className="w-4 h-4" />}
+      {copied ? (
+        <>
+          <Check className="w-3.5 h-3.5 text-[#30b357]" />
+          <span className="text-[#2da94f] font-semibold">Copied Link!</span>
+        </>
+      ) : (
+        <>
+          <Copy className="w-3.5 h-3.5 text-[#5e5e63]" />
+          <span>Copy Teacher Link</span>
+        </>
+      )}
     </button>
   );
 }

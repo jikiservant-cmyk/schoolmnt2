@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useMemo } from 'react';
-import * as XLSX from 'xlsx';
+import { downloadSafeXlsx, downloadSafeCsv } from '@/lib/security/safe-spreadsheet';
 import { 
   FileText, 
   Download, 
@@ -210,33 +210,51 @@ export default function AttendanceReports({
     });
   }, [logs, startDate, endDate, reportMode, selectedPersonId, selectedGroup, selectedClassId]);
 
-  // DAILY CLASS REGISTER ROSTER (All students in the class with their status on the selected day)
+  // DAILY CLASS REGISTER ROSTER (All students in the class with BOTH Morning Check-In & Evening Check-Out)
   const classDailyRoster = useMemo(() => {
     if (reportMode !== 'class_daily_sheet') return [];
 
-    // Map logs by person_id for the selected day
-    const logByPerson = new Map<string, any>();
+    // Collect BOTH `check_in` and `check_out` per person on the selected day
+    const slotsByPerson = new Map<string, { checkIn?: any; checkOut?: any }>();
     filteredReportLogs.forEach(log => {
-      if (log.person_id) {
-        logByPerson.set(log.person_id, log);
+      if (!log.person_id) return;
+      const cur = slotsByPerson.get(log.person_id) || {};
+      if (log.attendance_type === 'check_out') {
+        cur.checkOut = log;
+      } else {
+        cur.checkIn = log;
       }
+      slotsByPerson.set(log.person_id, cur);
     });
 
     return classStudents.map((student, index) => {
-      const matchLog = logByPerson.get(student.id);
+      const slots = slotsByPerson.get(student.id);
+      const inLog = slots?.checkIn;
+      const outLog = slots?.checkOut;
       let status: 'present' | 'late' | 'absent' = 'absent';
-      let checkInTime: string = '—';
-      let checkInType: string = '—';
+      let checkInTime = '—';
+      let checkOutTime = '—';
+      let checkInType = '—';
 
-      if (matchLog) {
-        status = matchLog.status === 'late' ? 'late' : 'present';
-        if (matchLog.occurred_at) {
-          checkInTime = formatEATTime(matchLog.occurred_at, {
-            hour: '2-digit',
-            minute: '2-digit'
-          });
+      if (inLog && inLog.status !== 'absent') {
+        status = inLog.status === 'late' ? 'late' : 'present';
+        if (inLog.occurred_at) {
+          checkInTime = formatEATTime(inLog.occurred_at, { hour: '2-digit', minute: '2-digit' });
         }
-        checkInType = (matchLog.attendance_type || 'check_in').replace(/_/g, ' ');
+      } else if (outLog && outLog.status !== 'absent') {
+        status = 'present';
+      }
+
+      if (outLog && outLog.status !== 'absent' && outLog.occurred_at) {
+        checkOutTime = formatEATTime(outLog.occurred_at, { hour: '2-digit', minute: '2-digit' });
+      }
+
+      if (inLog && inLog.status !== 'absent' && outLog && outLog.status !== 'absent') {
+        checkInType = 'check in + out';
+      } else if (inLog && inLog.status !== 'absent') {
+        checkInType = 'check in';
+      } else if (outLog && outLog.status !== 'absent') {
+        checkInType = 'check out';
       }
 
       return {
@@ -247,6 +265,7 @@ export default function AttendanceReports({
         phone: student.phone || '—',
         status,
         checkInTime,
+        checkOutTime,
         checkInType,
         className: classMap.get(student.class_id || '') || 'General'
       };
@@ -317,10 +336,10 @@ export default function AttendanceReports({
     }
   }, [reportMode, selectedClassId, selectedPersonId, selectedGroup, people, classMap]);
 
-  // EXCEL (.XLSX) Export Handler
+  // EXCEL (.XLSX) Export Handler (Zero-dependency native OpenXML with formula-injection neutralization)
   const handleExportExcel = () => {
     try {
-      const wb = XLSX.utils.book_new();
+      const sheets = [];
 
       if (reportMode === 'class_daily_sheet') {
         const headerInfo = [
@@ -336,22 +355,24 @@ export default function AttendanceReports({
           [] // empty separator
         ];
 
-        const tableHeaders = ['Roll #', 'Student Full Name', 'Admission / Device UID', 'Class', 'Arrival Time', 'Status', 'Check-In Type', 'Parent Phone', 'Teacher Remarks'];
+        const tableHeaders = ['Roll #', 'Student Full Name', 'Admission / Device UID', 'Class', 'Time In', 'Time Out', 'Status', 'Daily Sessions', 'Parent Phone', 'Teacher Remarks'];
         const tableRows = classDailyRoster.map(row => [
           row.rollNumber,
           row.fullName,
           row.deviceUserId,
           row.className,
           row.checkInTime,
+          row.checkOutTime,
           row.status.toUpperCase(),
           row.checkInType,
           row.phone,
           '' // Empty for remarks
         ]);
 
-        const wsData = [...headerInfo, tableHeaders, ...tableRows];
-        const ws = XLSX.utils.aoa_to_sheet(wsData);
-        XLSX.utils.book_append_sheet(wb, ws, 'Class_Daily_Register');
+        sheets.push({
+          name: 'Class_Daily_Register',
+          rows: [...headerInfo, tableHeaders, ...tableRows],
+        });
       } else {
         const headerInfo = [
           ['NA\'JIKI TECH ATTENDANCE AUDIT REPORT'],
@@ -380,13 +401,14 @@ export default function AttendanceReports({
           ];
         });
 
-        const wsData = [...headerInfo, tableHeaders, ...tableRows];
-        const ws = XLSX.utils.aoa_to_sheet(wsData);
-        XLSX.utils.book_append_sheet(wb, ws, 'Attendance_Audit');
+        sheets.push({
+          name: 'Attendance_Audit',
+          rows: [...headerInfo, tableHeaders, ...tableRows],
+        });
       }
 
       const fileName = `NajikiTech_${targetLabel.replace(/[^a-zA-Z0-9]/g, '_')}_${reportMode === 'class_daily_sheet' ? selectedDayDate : datePreset}.xlsx`;
-      XLSX.writeFile(wb, fileName);
+      downloadSafeXlsx(fileName, sheets);
     } catch (err) {
       console.error('Failed to export Excel file:', err);
       alert('Could not generate Excel export. Falling back to CSV export.');
@@ -394,33 +416,30 @@ export default function AttendanceReports({
     }
   };
 
-  // CSV Export Handler
+  // CSV Export Handler (Blob URL + formula-injection neutralization, never truncated by `#`)
   const handleExportCSV = () => {
     if (reportMode === 'class_daily_sheet') {
       if (classDailyRoster.length === 0) {
         alert('No class roster data available to export.');
         return;
       }
-      const headers = ['Roll Number', 'Student Name', 'Admission / Device UID', 'Class', 'Arrival Time', 'Status', 'Channel', 'Parent Phone'];
+      const headers = ['Roll Number', 'Student Name', 'Admission / Device UID', 'Class', 'Time In', 'Time Out', 'Status', 'Daily Sessions', 'Parent Phone'];
       const rows = classDailyRoster.map(r => [
         r.rollNumber,
-        `"${r.fullName.replace(/"/g, '""')}"`,
-        `"${r.deviceUserId}"`,
-        `"${r.className}"`,
-        `"${r.checkInTime}"`,
-        `"${r.status.toUpperCase()}"`,
-        `"${r.checkInType}"`,
-        `"${r.phone}"`
-      ].join(','));
+        r.fullName,
+        r.deviceUserId,
+        r.className,
+        r.checkInTime,
+        r.checkOutTime,
+        r.status.toUpperCase(),
+        r.checkInType,
+        r.phone,
+      ]);
 
-      const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows].join('\n');
-      const encodedUri = encodeURI(csvContent);
-      const link = document.createElement('a');
-      link.setAttribute('href', encodedUri);
-      link.setAttribute('download', `Class_Register_${classMap.get(selectedClassId) || 'Class'}_${selectedDayDate}.csv`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      downloadSafeCsv(
+        `Class_Register_${classMap.get(selectedClassId) || 'Class'}_${selectedDayDate}.csv`,
+        [headers, ...rows]
+      );
     } else {
       if (filteredReportLogs.length === 0) {
         alert('No attendance logs to export for this report.');
@@ -438,25 +457,21 @@ export default function AttendanceReports({
         const uid = log.people?.device_user_id || 'N/A';
 
         return [
-          `"${dateStr}"`,
-          `"${timeStr}"`,
-          `"${name.replace(/"/g, '""')}"`,
-          `"${role}"`,
-          `"${className}"`,
-          `"${status.toUpperCase()}"`,
-          `"${type}"`,
-          `"${uid}"`
-        ].join(',');
+          dateStr,
+          timeStr,
+          name,
+          role,
+          className,
+          status.toUpperCase(),
+          type,
+          uid,
+        ];
       });
 
-      const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows].join('\n');
-      const encodedUri = encodeURI(csvContent);
-      const link = document.createElement('a');
-      link.setAttribute('href', encodedUri);
-      link.setAttribute('download', `Attendance_Report_${targetLabel.replace(/[^a-zA-Z0-9]/g, '_')}_${datePreset}.csv`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      downloadSafeCsv(
+        `Attendance_Report_${targetLabel.replace(/[^a-zA-Z0-9]/g, '_')}_${datePreset}.csv`,
+        [headers, ...rows]
+      );
     }
   };
 
@@ -929,7 +944,8 @@ export default function AttendanceReports({
                   <th className="py-3 px-4 w-12 text-center">#</th>
                   <th className="py-3 px-4 whitespace-nowrap">Student Name</th>
                   <th className="py-3 px-4 whitespace-nowrap">Class / Stream</th>
-                  <th className="py-3 px-4 whitespace-nowrap">Arrival Time</th>
+                  <th className="py-3 px-4 whitespace-nowrap">Time In</th>
+                  <th className="py-3 px-4 whitespace-nowrap">Time Out</th>
                   <th className="py-3 px-4 whitespace-nowrap">Status</th>
                   <th className="py-3 px-4 whitespace-nowrap">Parent Phone</th>
                   <th className="py-3 px-4 whitespace-nowrap">UID</th>
@@ -939,7 +955,7 @@ export default function AttendanceReports({
               <tbody className="divide-y divide-[#f7f7f9]">
                 {classDailyRoster.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="py-16 text-center text-xs text-[#929297]">
+                    <td colSpan={9} className="py-16 text-center text-xs text-[#929297]">
                       <div className="flex flex-col items-center justify-center gap-2">
                         <GraduationCap className="w-10 h-10 text-[#929297]" />
                         <p className="font-semibold text-[#171719]">No students registered in this class</p>
@@ -970,6 +986,10 @@ export default function AttendanceReports({
 
                       <td className="py-3 px-4 whitespace-nowrap font-mono text-[11px] text-[#171719]">
                         {row.checkInTime}
+                      </td>
+
+                      <td className="py-3 px-4 whitespace-nowrap font-mono text-[11px] text-[#5e5e63]">
+                        {row.checkOutTime}
                       </td>
 
                       <td className="py-3 px-4 whitespace-nowrap">
