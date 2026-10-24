@@ -458,6 +458,23 @@ http.createServer((req, res) => {
           SMS_LOG.push({ injected: '429', idempotencyKey: idem || null, body: b, smsId: null });
           return send(res, 429, { error: 'Rate limit exceeded' }, { 'retry-after': '2' });
         }
+        // 200 but the payload says it failed: a naive `res.ok` check reads this
+        // as success and marks the row sent.
+        if (String(b.message).includes('[LAB_SMS_200_ERROR]')) {
+          SMS_LOG.push({ injected: '200-error', idempotencyKey: idem || null, body: b, smsId: null });
+          return send(res, 200, { success: false, error: 'Carrier rejected the destination' });
+        }
+        // 202 with no smsId: nothing to match a delivery report against later.
+        if (String(b.message).includes('[LAB_SMS_NO_SMSID]')) {
+          SMS_LOG.push({ injected: '202-no-smsid', idempotencyKey: idem || null, body: b, smsId: null });
+          return send(res, 202, { success: true, message: 'queued' });
+        }
+        // Slow gateway, for the function's own timeout path.
+        if (String(b.message).includes('[LAB_SMS_SLOW]')) {
+          SMS_LOG.push({ injected: 'slow', idempotencyKey: idem || null, body: b, smsId: null });
+          await new Promise((r) => setTimeout(r, 2500));
+          return send(res, 202, { success: true, smsId: 'slow' + crypto.randomBytes(6).toString('hex') });
+        }
         if (idem) {
           const prior = SMS_LOG.find((m) => m.idempotencyKey === idem);
           if (prior) {

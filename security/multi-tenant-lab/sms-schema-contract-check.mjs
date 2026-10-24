@@ -125,6 +125,14 @@ check('the idempotency key is one per notification', /`sms:\$\{notificationId\}`
 check('the dispatch secret is compared in constant time', /safeEqual\(/.test(code));
 check('an undeliverable number is rejected before the wallet is touched',
   /MSISDN_RE/.test(code) && code.indexOf('MSISDN_RE.test') < code.indexOf('debit_sms_wallet'));
+check('unsendable content is rejected before the wallet is touched',
+  /MAX_MESSAGE_CHARS/.test(code) && code.indexOf('MAX_MESSAGE_CHARS') < code.indexOf('debit_sms_wallet'));
+check('a 2xx is not enough: the payload must not admit failure',
+  /payloadSaysFailed/.test(code));
+check('a 2xx without an smsId is retried, not marked sent',
+  /provider_ack_without_id/.test(code));
+check('the wallet lookup falls back to school_id',
+  /\.eq\("school_id",\s*schoolIdText\)/.test(code));
 check('SMS_COST has no positive fallback (only an invalid "0")',
   !/SMS_COST[^\n]*\|\|\s*["']?[1-9]/.test(code));
 check('a missing price returns 503', /SMS pricing is not configured/.test(src));

@@ -1485,3 +1485,76 @@ not either. Do not bulk-requeue them: for a sample, check `public.sms_messages` 
   is not a claim about the live body.
 - Whether the 63 marked rows were ever charged. That needs the reconciliation
   above, against the gateway's own records.
+
+# Part 24: Stress test — is the deployed sender actually solid?
+
+The contract suite (Part 23) proves the happy path. This part attacks the
+function: races, a wallet that cannot pay, a gateway that lies, content that can
+never be delivered, and hostile payloads. `sms-edge-stress-check.mjs`, **32/32
+after fixes** (6 failures before), driven against the real Deno function and
+asserted on Postgres.
+
+## What held up (no changes needed)
+
+| Attack | Result |
+| --- | --- |
+| **Two workers dispatch the same notification at the same instant** | exactly one claimed it, one charge, one message at NaJiki, one `sent` |
+| **Retry sweep racing a single dispatch on the same row** | one charge, one message |
+| **10 parallel sends against a wallet that can only pay for 5** | exactly 5 sent, 5 not sent, balance ended at 0 and never negative, no row charged twice, total debits == total messages |
+| **Slow gateway (function timeout 1 s, gateway 2.5 s)** | aborted at 1031 ms, row stayed `pending`, `retry_count` incremented, charged once |
+| **Malformed JSON** | 400, no crash |
+| **SQL-ish id (`' OR 1=1 --`)** | treated as an id, no query change |
+| **5000-character id** | no 500 |
+| **Delivery report replayed** | both accepted, row stayed `sent`, no second charge |
+
+The claim race is the interesting one: the sender "locks" a row by writing a
+future `next_retry_at` inside a single `UPDATE ... WHERE status='pending' AND
+(next_retry_at IS NULL OR next_retry_at <= now())`. Postgres re-checks that
+predicate under the row lock, so the loser's update matches zero rows. It is
+atomic, and the concurrency test confirms it.
+
+## What broke, and what was fixed
+
+| # | Finding (all confirmed by a failing test first) | Fix |
+| --- | --- | --- |
+| 24-1 | A **200 with `success:false`** was recorded as `sent`: `res.ok` alone decided success, so a rejected message was silently lost. | Success now requires a 2xx, a payload that does not deny success, **and** an `smsId`. |
+| 24-2 | A **202 with no `smsId`** was also recorded as `sent`, leaving nothing to match a delivery report against. | Retried as `provider_ack_without_id` (same `Idempotency-Key`, so no duplicate). |
+| 24-3 | A **2000-character message was charged** and then failed five times at the gateway. The school paid for something that could never be delivered. | Rejected before the wallet is touched (`invalid_message_length`, NaJiki's 918-char ceiling). |
+| 24-4 | An **empty message was charged** for the same reason. | Same guard (`length < 1`). |
+| 24-5 | A school whose wallet is keyed by **`school_id` instead of `tenant_id`** could never send: the lookup only queried `tenant_id`, so every row died as `wallet_missing`. | Falls back to `school_id` when no tenant-keyed wallet exists. |
+| 24-6 | A **non-string notification id** (`{"$ne": null}`) was coerced to `"[object Object]"`, producing a pointless 200. | Only strings and numbers are accepted; anything else is a 400. |
+
+Each of 24-1…24-6 was red before the fix and green after, in the same suite.
+
+## Regression after the fixes
+
+`sms-edge-e2e-check` **56/56**, `sms-schema-contract-check` **43/43**
+(now also asserts the message-length guard, the payload check, the `ackId`
+requirement and the `school_id` wallet fallback), `provider-contract` **30/30**,
+`full-branch-pentest` **27/27**, `money-round13` **0/24**, `payments-attack`
+**0/20**, `rogue` **0/21**, `round4` **0/5**, `pay-rls` **0/8**,
+`money-reconcile` **OK**, `flows-check` **OK**, `round12` **35/35**,
+`round14` **40/40**, `round16` **18/18**. `deno check`, `tsc`, `lint`, `build`
+clean.
+
+## Still not solid — known, not fixed
+
+- **No "charged but undelivered" marker.** After the 5th failure a charged row is
+  `failed` with `error = 'provider_failed'`, indistinguishable from a row that
+  was never charged. Reconcile with
+  `SELECT ... FROM public.transactions WHERE reference = 'sms:' || n.id`, not by
+  `error`. Adding a `charged_undelivered:` prefix would make it visible but
+  changes the `error` vocabulary the dashboard may parse, so it is a decision for
+  the owner, not a silent edit.
+- **No refund path.** A message that is charged and then cannot be delivered
+  leaves the school out of pocket until someone credits it by hand.
+- **The sweep has no time budget.** It dispatches up to 50 rows sequentially,
+  each with a 30 s gateway timeout: up to 25 minutes inside one invocation. Rows
+  it never reaches simply keep their (expiring) 1-minute claim, so nothing is
+  lost, but a platform timeout will kill the invocation mid-batch. A soft budget
+  before starting a row would make this predictable.
+- **Backoff is fixed at 3 minutes** and ignores NaJiki's `Retry-After`.
+- **`next_retry_at` is both the lock and the schedule.** A send that takes longer
+  than 60 s (only possible if `NAJIKI_TIMEOUT_MS` is raised above 60 s) would let
+  a second worker claim the same row. With the default 30 s it cannot happen, but
+  the two values are not linked in code.

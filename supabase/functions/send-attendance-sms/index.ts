@@ -58,6 +58,15 @@ const SMS_COST = Number(Deno.env.get("SMS_COST") || "0");
 const SCHOOL_SCHEMA = "school";
 const NOTIFS_TABLE = "notifications";
 const MAX_ATTEMPTS = 5;
+/** NaJiki's hard ceiling (6 segments). Longer text can never be delivered, so
+ * it must be rejected BEFORE the wallet is charged. */
+const MAX_MESSAGE_CHARS = 918;
+
+/** The id we can later match a delivery report on. */
+function ackIdOf(data: any): string | null {
+  const raw = data?.smsId ?? data?.id ?? data?.reference ?? null;
+  return raw === null || raw === undefined ? null : String(raw).trim() || null;
+}
 
 function jsonResponse(obj: unknown, status = 200) {
   return new Response(JSON.stringify(obj), {
@@ -75,15 +84,18 @@ function safeEqual(a: string, b: string): boolean {
 }
 
 function extractNotificationId(body: any): string | null {
-  return (
-    body?.notification_id ??
-      body?.record?.id ??
-      body?.new?.id ??
-      body?.record?.notification_id ??
-      body?.new?.notification_id ??
-      body?.id ??
-      null
-  )?.toString?.() ?? null;
+  const raw = body?.notification_id ??
+    body?.record?.id ??
+    body?.new?.id ??
+    body?.record?.notification_id ??
+    body?.new?.notification_id ??
+    body?.id ??
+    null;
+  // A filter object (`{ $ne: null }`) is not an id: coercing it produced
+  // "[object Object]" and a pointless round trip.
+  if (typeof raw === "number") return String(raw);
+  if (typeof raw !== "string") return null;
+  return raw.trim() || null;
 }
 
 /** NaJiki's `SmsInputSchema.to` pattern. A number that cannot match must not be
@@ -234,6 +246,24 @@ async function dispatchOne(
   const nextRetryCount = (notif.retry_count ?? 0) + 1;
   const isFinalAttempt = maxAttemptsReached(nextRetryCount);
 
+  const messageText = String(notif.message ?? "");
+  if (messageText.length < 1 || messageText.length > MAX_MESSAGE_CHARS) {
+    // NaJiki rejects this every time; charging for it just loses the school's
+    // money on five guaranteed failures.
+    await supabase
+      .schema(SCHOOL_SCHEMA)
+      .from(NOTIFS_TABLE)
+      .update({
+        status: "failed",
+        error: "invalid_message_length",
+        retry_count: nextRetryCount,
+        next_retry_at: null,
+      })
+      .eq("id", notificationId);
+
+    return jsonResponse({ error: "invalid message length" }, 200);
+  }
+
   const phone = toE164(notif.recipient_phone_snapshot || "");
   if (!phone || !MSISDN_RE.test(phone)) {
     await supabase
@@ -252,11 +282,23 @@ async function dispatchOne(
 
   const schoolIdText = String(notif.school_id);
 
-  const { data: wallet, error: walletErr } = await supabase
+  // Some wallets are keyed by tenant_id, others by school_id. Looking up only
+  // tenant_id left those schools stuck at wallet_missing forever.
+  let { data: wallet, error: walletErr } = await supabase
     .from("wallets")
     .select("id,balance")
     .eq("tenant_id", schoolIdText)
     .maybeSingle();
+
+  if (!walletErr && !wallet) {
+    const bySchool = await supabase
+      .from("wallets")
+      .select("id,balance")
+      .eq("school_id", schoolIdText)
+      .maybeSingle();
+    wallet = bySchool.data;
+    walletErr = bySchool.error;
+  }
 
   if (walletErr) {
     await markDispatchFailed(
@@ -354,7 +396,11 @@ async function dispatchOne(
     clearTimeout(timeout);
   }
 
-  if (najikiRes && najikiRes.ok) {
+  const ackId = ackIdOf(najikiData);
+  const payloadSaysFailed = !!najikiData &&
+    (najikiData.success === false || (!!najikiData.error && !ackId));
+
+  if (najikiRes && najikiRes.ok && !payloadSaysFailed && ackId) {
     await supabase
       .schema(SCHOOL_SCHEMA)
       .from(NOTIFS_TABLE)
@@ -370,6 +416,12 @@ async function dispatchOne(
     return jsonResponse({ success: true }, 200);
   }
 
+  // Everything below is a failure: non-2xx, a 2xx that admits failure, or a 2xx
+  // with no smsId (nothing to match a delivery report against later).
+  const reason = najikiRes && najikiRes.ok
+    ? (payloadSaysFailed ? "provider_rejected" : "provider_ack_without_id")
+    : "provider_failed";
+
   await supabase
     .schema(SCHOOL_SCHEMA)
     .from(NOTIFS_TABLE)
@@ -377,7 +429,7 @@ async function dispatchOne(
       status: isFinalAttempt ? "failed" : "pending",
       retry_count: nextRetryCount,
       provider_response: JSON.stringify(najikiData),
-      error: "provider_failed",
+      error: reason,
       next_retry_at: isFinalAttempt ? null : toIsoAfterMinutes(3),
     })
     .eq("id", notificationId);
